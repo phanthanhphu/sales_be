@@ -1,0 +1,28 @@
+# VCS
+.git
+.gitignore
+
+# Gradle build/cache
+.gradle
+build
+out
+target
+
+# IDE
+.idea
+*.iml
+.vscode
+
+# Logs
+logs
+*.log
+
+# Runtime upload folders
+files
+uploads
+preview-cache
+data_file
+
+# OS files
+.DS_Store
+Thumbs.db
