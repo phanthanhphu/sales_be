@@ -65,8 +65,12 @@ public class MprService {
 
     public MprDocument getByOrder(String orderId) {
         orderService.get(orderId);
-        return mprRepository.findByOrderId(orderId)
+        MprDocument mpr = mprRepository.findByOrderId(orderId)
                 .orElseThrow(() -> new OrderBomMprNotFoundException("MPR has not been created for this order"));
+        // Recalculate before returning so older saved MPR records also show the
+        // same formula values as the current Excel template.
+        recalculateMprCalculations(mpr);
+        return mpr;
     }
 
     /**
@@ -122,6 +126,7 @@ public class MprService {
             entity.setSampleQuantity(firstNonNull(entity.getSampleQuantity(), candidate.getSampleQuantity()));
             entity.setSelections(allSelections);
             entity.setLines(allLines);
+            recalculateMprCalculations(entity);
             entity.setUpdatedAt(now);
             entity.setUpdatedBy(RequestActor.current());
             candidate = mprRepository.save(entity);
@@ -131,6 +136,7 @@ public class MprService {
             candidate.setCreatedBy(RequestActor.current());
             candidate.setUpdatedBy(RequestActor.current());
             candidate.setStatus("DRAFT");
+            recalculateMprCalculations(candidate);
             candidate = mprRepository.save(candidate);
         }
 
@@ -160,6 +166,7 @@ public class MprService {
         candidate.setSampleQuantity(firstNonNull(existing.getSampleQuantity(), candidate.getSampleQuantity()));
         candidate.setSelections(selections);
         candidate.setLines(lines);
+        recalculateMprCalculations(candidate);
         return candidate;
     }
 
@@ -374,6 +381,7 @@ public class MprService {
         mpr.setLines(remainingLines);
         mpr.setSelections(remainingSelections);
         mpr.setPoQuantity(totalPoQuantity(remainingSelections));
+        recalculateMprCalculations(mpr);
         mpr.setUpdatedAt(LocalDateTime.now());
         mpr.setUpdatedBy(RequestActor.current());
 
@@ -467,6 +475,7 @@ public class MprService {
             line.setMatRequiredQuantity(multiply(line.getTotalYield(), poQty));
         }
 
+        recalculateMprCalculations(mpr);
         mpr.setPoQuantity(totalPoQuantity(mpr.getSelections()));
         mpr.setUpdatedAt(LocalDateTime.now());
         mpr.setUpdatedBy(RequestActor.current());
@@ -495,6 +504,7 @@ public class MprService {
         applyLineUpdate(line, request);
         // Sales changes to values sourced from BOM stay pending until BOM reviews them.
         bomReviewService.capturePendingReview(line);
+        recalculateMprCalculations(mpr);
         mpr.setUpdatedAt(LocalDateTime.now());
         mpr.setUpdatedBy(RequestActor.current());
         return mprRepository.save(mpr);
@@ -516,6 +526,7 @@ public class MprService {
         mpr.setLines(remaining);
         removeEmptyBatchSelections(mpr);
         mpr.setPoQuantity(totalPoQuantity(mpr.getSelections()));
+        recalculateMprCalculations(mpr);
         mpr.setUpdatedAt(LocalDateTime.now());
         mpr.setUpdatedBy(RequestActor.current());
         return mprRepository.save(mpr);
@@ -561,15 +572,14 @@ public class MprService {
         target.setPoQuantity(request.poQuantity());
 
         // Phase 1 calculation fields are controlled by the MPR system.
-        target.setTotalYield(multiply(target.getYield(), target.getLossFactor()));
-        target.setMatRequiredQuantity(multiply(target.getTotalYield(), target.getPoQuantity()));
 
         target.setCurrency(normalizeCurrency(request.currency()));
         target.setMatPriceWithoutTax(request.matPriceWithoutTax());
         target.setShortNameSupplier(trim(request.shortNameSupplier()));
-        target.setVendorCode(trim(request.vendorCode()));
+        target.setVendorCode(vendorCodeText(request.vendorCode()));
         target.setVendorName(trim(request.vendorName()));
         target.setMatCharger(trim(request.matCharger()));
+        recalculateLineCalculations(target);
     }
 
     private void validateLineUpdate(MprLineUpdateRequest request) {
@@ -751,6 +761,7 @@ public class MprService {
         mpr.setSelections(selections);
         mpr.setLines(generated);
         mpr.setStatus("DRAFT");
+        recalculateMprCalculations(mpr);
         return mpr;
     }
 
@@ -878,7 +889,7 @@ public class MprService {
         }
         VendorCode vendor = vendorByKey.get(normalize(line.getShortNameSupplier()));
         if (vendor != null) {
-            line.setVendorCode(vendor.getVendorCode());
+            line.setVendorCode(vendorCodeText(vendor.getVendorCode()));
             line.setVendorName(vendor.getVendorName());
             line.setMatCharger(vendor.getMatCharger());
         }
@@ -892,6 +903,14 @@ public class MprService {
         line.setTotalMatAmountPerStyle(null);
         line.setSourceRemark(source.getBomRemark());
         out.add(line);
+    }
+
+    private String vendorCodeText(String value) {
+        String text = trim(value);
+        if (text == null) {
+            return null;
+        }
+        return text.matches("^[0-9,]+$") ? text.replace(",", "") : text;
     }
 
     /**
@@ -1126,7 +1145,101 @@ public class MprService {
         return "";
     }
 
+    private void recalculateMprCalculations(MprDocument mpr) {
+        if (mpr == null) return;
+        List<MprLine> lines = safeList(mpr.getLines());
+        for (MprLine line : lines) {
+            recalculateLineCalculations(line);
+        }
+        recalculateTotalMatAmountPerStyle(lines);
+    }
+
+    /**
+     * Mirrors the MPR Excel formulas inside the application so the on-screen
+     * Sales MPR table and exported workbook show the same calculated values.
+     */
+    private void recalculateLineCalculations(MprLine line) {
+        if (line == null) return;
+        line.setTotalYield(multiply(line.getYield(), line.getLossFactor()));
+        line.setMatRequiredQuantity(multiply(line.getTotalYield(), line.getPoQuantity()));
+        line.setMatSampleQuantity(multiply(line.getSampleQuantity(), line.getYield()));
+        line.setSapStockQuantity(sumIfAny(line.getMcdStock(), line.getCmcdStock()));
+        line.setPurchaseQuantity(purchaseQuantity(line));
+        snapshotCurrency(line);
+        line.setMatAmountUsd(matAmountUsd(line));
+    }
+
+    private void recalculateTotalMatAmountPerStyle(List<MprLine> lines) {
+        Map<String, BigDecimal> amountByStyle = new LinkedHashMap<>();
+        for (MprLine line : safeList(lines)) {
+            if (line == null || blank(line.getStyleColorKey())) continue;
+            BigDecimal amount = line.getMatAmountUsd();
+            if (amount == null) continue;
+            String key = normalize(line.getStyleColorKey());
+            amountByStyle.merge(key, amount, BigDecimal::add);
+        }
+        for (MprLine line : safeList(lines)) {
+            if (line == null || blank(line.getStyleColorKey())) {
+                if (line != null) line.setTotalMatAmountPerStyle(null);
+                continue;
+            }
+            BigDecimal total = amountByStyle.get(normalize(line.getStyleColorKey()));
+            line.setTotalMatAmountPerStyle(total == null ? null : total.setScale(2, RoundingMode.HALF_UP));
+        }
+    }
+
+    private BigDecimal purchaseQuantity(MprLine line) {
+        if (line == null) return null;
+        if (allNull(
+                line.getMatRequiredQuantity(),
+                line.getMatSampleQuantity(),
+                line.getSapStockQuantity(),
+                line.getNonSapStockQuantity())) {
+            return null;
+        }
+        BigDecimal value = safe(line.getMatRequiredQuantity())
+                .add(safe(line.getMatSampleQuantity()))
+                .subtract(safe(line.getSapStockQuantity()))
+                .subtract(safe(line.getNonSapStockQuantity()));
+        if (value.signum() < 0) return BigDecimal.ZERO;
+        return value.setScale(6, RoundingMode.HALF_UP);
+    }
+
+    private BigDecimal matAmountUsd(MprLine line) {
+        if (line == null || line.getMatPriceUsd() == null) return null;
+        BigDecimal amount = safe(line.getPurchaseQuantity()).multiply(line.getMatPriceUsd())
+                .add(safe(line.getSapStockQuantity()).multiply(line.getMatPriceUsd()));
+        return amount.setScale(2, RoundingMode.HALF_UP);
+    }
+
+    private BigDecimal sumIfAny(BigDecimal... values) {
+        if (values == null || values.length == 0) return null;
+        boolean any = false;
+        BigDecimal total = BigDecimal.ZERO;
+        for (BigDecimal value : values) {
+            if (value == null) continue;
+            any = true;
+            total = total.add(value);
+        }
+        return any ? total.setScale(6, RoundingMode.HALF_UP) : null;
+    }
+
+    private boolean allNull(BigDecimal... values) {
+        if (values == null || values.length == 0) return true;
+        for (BigDecimal value : values) {
+            if (value != null) return false;
+        }
+        return true;
+    }
+
     private void snapshotCurrency(MprLine line) {
+        if (line == null) return;
+        line.setCurrencyMasterId(null);
+        line.setRateToVnd(null);
+        line.setMatPriceVnd(null);
+        line.setExchangeRate(null);
+        line.setMatPriceUsd(null);
+
         if (blank(line.getCurrency()) || line.getMatPriceWithoutTax() == null) return;
         try {
             CurrencyMaster currency = currencyMasterService.resolveCurrent(line.getCurrency());
@@ -1139,7 +1252,8 @@ public class MprService {
             line.setRateToVnd(currencyRate);
             line.setMatPriceVnd(line.getMatPriceWithoutTax().multiply(currencyRate).setScale(2, RoundingMode.HALF_UP));
 
-            // Exchange Rate is the divisor required by the MPR template to obtain USD.
+            // Same meaning as the Excel template: USD -> 1, VND -> current USD rate to VND.
+            // For other currencies: Exchange Rate = USD Rate To VND / Currency Rate To VND.
             BigDecimal exchangeRate = usdRate.divide(currencyRate, 8, RoundingMode.HALF_UP);
             line.setExchangeRate(exchangeRate);
             line.setMatPriceUsd(line.getMatPriceWithoutTax().divide(exchangeRate, 6, RoundingMode.HALF_UP));

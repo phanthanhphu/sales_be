@@ -176,7 +176,8 @@ public class BomService {
 
     /**
      * Adds a Product Color link to a BOM. Product Color Master remains the
-     * single source of truth for Color Name, Pattern Number, Season and image.
+     * single source of truth for Product / Style Color, Child Colors and image.
+     * Pattern Number and Season still belong to this BOM.
      */
     public BomDocument addProductColor(String bomId, BomProductColorRequest request) {
         BomDocument bom = get(bomId);
@@ -197,8 +198,8 @@ public class BomService {
         productColor.setId(UUID.randomUUID().toString());
         productColor.setProductColorMasterId(master.getId());
         productColor.setColorName(colorName);
-        productColor.setPatternNumber(required(master.getPatternNumber(), "Pattern Number is required"));
-        productColor.setSeason(required(master.getSeason(), "Season is required"));
+        productColor.setPatternNumber(firstNonBlank(request.patternNumber(), bom.getHeader() == null ? null : bom.getHeader().getPatternNumber()));
+        productColor.setSeason(firstNonBlank(request.season(), bom.getHeader() == null ? null : bom.getHeader().getSeason()));
         productColor.setSourceColumnIndex(null);
         ensureProductColorsList(bom).add(productColor);
         productColorMasterService.applyToBom(bom, productColor, master);
@@ -229,8 +230,8 @@ public class BomService {
 
         productColor.setColorName(newColorName);
         productColor.setProductColorMasterId(selectedMaster.getId());
-        productColor.setPatternNumber(required(selectedMaster.getPatternNumber(), "Pattern Number is required"));
-        productColor.setSeason(required(selectedMaster.getSeason(), "Season is required"));
+        productColor.setPatternNumber(firstNonBlank(request.patternNumber(), productColor.getPatternNumber(), bom.getHeader() == null ? null : bom.getHeader().getPatternNumber()));
+        productColor.setSeason(firstNonBlank(request.season(), productColor.getSeason(), bom.getHeader() == null ? null : bom.getHeader().getSeason()));
         productColorMasterService.applyToBom(bom, productColor, selectedMaster);
         forEachLine(bom, line -> synchronizeLineProductColorValues(bom, line, false));
 

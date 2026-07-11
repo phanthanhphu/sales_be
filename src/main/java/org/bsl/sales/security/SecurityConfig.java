@@ -100,7 +100,7 @@ public class SecurityConfig {
         configuration.setAllowedOrigins(List.of(
                 "http://localhost:3001", "http://127.0.0.1:3001", "http://127.0.0.1:8081",
                 "http://10.232.100.68:3001", "http://10.232.100.68:8081",
-                "http://10.232.132.84:3001", "http://10.232.132.84:8081",
+                "http://10.232.132.46:3001", "http://10.232.132.46:8081",
                 "http://10.232.132.48:3001", "http://10.232.132.48:8081",
                 "https://homepage.youngone.com.vn", "https://homepage.youngone.com.vn:3001", "https://homepage.youngone.com.vn:8081"
         ));

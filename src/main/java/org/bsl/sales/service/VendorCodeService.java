@@ -550,10 +550,18 @@ public class VendorCodeService {
         }
         target.setShortNameSupplier(shortName);
         target.setShortNameSupplierKey(MasterDataTextNormalizer.key(shortName));
-        target.setVendorCode(MasterDataTextNormalizer.trimToNull(request.getVendorCode()));
+        target.setVendorCode(vendorCodeText(request.getVendorCode()));
         target.setVendorName(MasterDataTextNormalizer.trimToNull(request.getVendorName()));
         target.setMatCharger(MasterDataTextNormalizer.trimToNull(request.getMatCharger()));
         target.setRemark(MasterDataTextNormalizer.trimToNull(request.getRemark()));
+    }
+
+    private String vendorCodeText(String value) {
+        String text = MasterDataTextNormalizer.trimToNull(value);
+        if (text == null) {
+            return null;
+        }
+        return text.matches("^[0-9,]+$") ? text.replace(",", "") : text;
     }
 
     private String requireSupplierKey(VendorCodeRequest request) {

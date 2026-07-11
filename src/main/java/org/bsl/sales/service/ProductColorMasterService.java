@@ -58,34 +58,28 @@ public class ProductColorMasterService {
 
     public Page<ProductColorMaster> list(
             String productColor,
-            String season,
-            String patternNumber,
-            String styleName,
             int page,
             int size
     ) {
         Pageable pageable = PageRequest.of(Math.max(0, page), Math.min(Math.max(1, size), 200));
-        Page<ProductColorMaster> result;
-        if (blank(productColor) && blank(season) && blank(patternNumber) && blank(styleName)) {
-            result = repository.findAll(pageable);
-        } else {
-            result = repository.findByProductColorContainingIgnoreCaseOrSeasonContainingIgnoreCaseOrPatternNumberContainingIgnoreCaseOrStyleNameContainingIgnoreCase(
-                    trim(productColor), trim(season), trim(patternNumber), trim(styleName), pageable
-            );
-        }
-        return result.map(item -> ensureImageFromLegacyBom(ensureSourceBomDetails(ensureChildColorIds(item))));
+        Page<ProductColorMaster> result = blank(productColor)
+                ? repository.findAll(pageable)
+                : repository.findByProductColorContainingIgnoreCase(trim(productColor), pageable);
+        return result.map(item -> ensureChildColorIds(item));
     }
 
     public ProductColorMaster get(String id) {
         ProductColorMaster entity = repository.findById(id)
                 .orElseThrow(() -> new MasterDataNotFoundException("Product Color Master not found"));
-        return ensureImageFromLegacyBom(ensureSourceBomDetails(ensureChildColorIds(entity)));
+        return ensureChildColorIds(entity);
     }
 
     public ProductColorMaster create(ProductColorMasterRequest request) {
         ProductColorMaster entity = fromRequest(new ProductColorMaster(), request);
-        if (repository.findByMasterKey(entity.getMasterKey()).isPresent()) {
-            throw new MasterDataConflictException("Product Color already exists for this Season / Pattern / Style");
+        if (repository.findByMasterKey(entity.getMasterKey())
+                .or(() -> repository.findFirstByProductColorIgnoreCase(entity.getProductColor()))
+                .isPresent()) {
+            throw new MasterDataConflictException("Product Color already exists.");
         }
         LocalDateTime now = LocalDateTime.now();
         entity.setCreatedAt(now);
@@ -97,9 +91,10 @@ public class ProductColorMasterService {
         ProductColorMaster entity = get(id);
         fromRequest(entity, request);
         repository.findByMasterKey(entity.getMasterKey())
+                .or(() -> repository.findFirstByProductColorIgnoreCase(entity.getProductColor()))
                 .filter(item -> !item.getId().equals(entity.getId()))
                 .ifPresent(item -> {
-                    throw new MasterDataConflictException("Product Color already exists for this Season / Pattern / Style");
+                    throw new MasterDataConflictException("Product Color already exists.");
                 });
         entity.setUpdatedAt(LocalDateTime.now());
         return repository.save(entity);
@@ -232,18 +227,9 @@ public class ProductColorMasterService {
 
     private ProductColorMaster candidateFromBom(BomDocument bom, BomProductColor productColor) {
         ProductColorMaster candidate = new ProductColorMaster();
-        candidate.setBuyer(trim(bom.getHeader() == null ? null : bom.getHeader().getBuyer()));
-        candidate.setSeason(firstNonBlank(productColor.getSeason(), bom.getHeader() == null ? null : bom.getHeader().getSeason()));
-        candidate.setPatternNumber(firstNonBlank(productColor.getPatternNumber(), bom.getHeader() == null ? null : bom.getHeader().getPatternNumber()));
-        candidate.setStyleNumber(trim(bom.getHeader() == null ? null : bom.getHeader().getStyleNumber()));
-        candidate.setStyleName(trim(bom.getHeader() == null ? null : bom.getHeader().getStyleName()));
         candidate.setProductColor(trim(productColor.getColorName()));
         candidate.setMasterKey(keyFor(candidate));
         candidate.setChildColors(childColorsFromBom(bom, productColor));
-        candidate.setSourceBomId(bom.getId());
-        candidate.setSourceOrderId(bom.getOrderId());
-        candidate.setSourceBomNo(trim(bom.getBomNo()));
-        candidate.setSourceBomName(trim(bom.getBomName()));
         candidate.setActive(true);
         return candidate;
     }
@@ -259,23 +245,18 @@ public class ProductColorMasterService {
             if (preferred.isPresent()) {
                 ProductColorMaster entity = ensureChildColorIds(preferred.get());
                 entity.setChildColors(mergeChildColors(entity.getChildColors(), candidate.getChildColors()));
-                applySourceBom(entity, candidate);
                 entity.setUpdatedAt(now);
                 return repository.save(entity);
             }
         }
 
-        Optional<ProductColorMaster> existing = repository.findByMasterKey(candidate.getMasterKey());
+        Optional<ProductColorMaster> existing = repository.findByMasterKey(candidate.getMasterKey())
+                .or(() -> repository.findFirstByProductColorIgnoreCase(candidate.getProductColor()));
         if (existing.isPresent()) {
             ProductColorMaster entity = ensureChildColorIds(existing.get());
-            entity.setBuyer(candidate.getBuyer());
-            entity.setSeason(candidate.getSeason());
-            entity.setPatternNumber(candidate.getPatternNumber());
-            entity.setStyleNumber(candidate.getStyleNumber());
-            entity.setStyleName(candidate.getStyleName());
             entity.setProductColor(candidate.getProductColor());
+            entity.setMasterKey(keyFor(entity));
             entity.setChildColors(mergeChildColors(entity.getChildColors(), candidate.getChildColors()));
-            applySourceBom(entity, candidate);
             entity.setUpdatedAt(now);
             return repository.save(entity);
         }
@@ -333,18 +314,6 @@ public class ProductColorMasterService {
         }
     }
 
-    /**
-     * Source BOM means the first BOM that introduced/linked this master.
-     * Do not replace it when the same Product Color is reused by another BOM;
-     * otherwise the Source BOM link would jump unpredictably between BOMs.
-     */
-    private void applySourceBom(ProductColorMaster target, ProductColorMaster source) {
-        if (target == null || source == null || !blank(target.getSourceBomId())) return;
-        target.setSourceBomId(source.getSourceBomId());
-        target.setSourceOrderId(source.getSourceOrderId());
-        target.setSourceBomNo(source.getSourceBomNo());
-        target.setSourceBomName(source.getSourceBomName());
-    }
 
     private String colorValue(BomLine line, BomProductColor productColor) {
         for (BomLineColorValue value : safe(line == null ? null : line.getProductColorValues())) {
@@ -362,13 +331,9 @@ public class ProductColorMasterService {
         return "";
     }
 
-    /** Backfills a Product Color Master image from older BOM COLOR attachments once. */
+    /** Legacy helper kept for older call sites. Without Source BOM on master, normal list/get does not backfill images. */
     private ProductColorMaster ensureImageFromLegacyBom(ProductColorMaster master) {
-        if (master == null || master.hasImage() || blank(master.getSourceBomId())) return master;
-        Optional<BomDocument> sourceBom = bomRepository.findById(master.getSourceBomId());
-        if (sourceBom.isEmpty()) return master;
-        BomProductColor productColor = findMatchingBomProductColor(sourceBom.get(), master, null);
-        return ensureLegacyImageFromBom(master, sourceBom.get(), productColor);
+        return master;
     }
 
     private ProductColorMaster ensureLegacyImageFromBom(
@@ -418,12 +383,7 @@ public class ProductColorMasterService {
 
     private boolean productColorMatchesMaster(BomProductColor productColor, ProductColorMaster master) {
         if (productColor == null || master == null) return false;
-        if (!normalize(productColor.getColorName()).equals(normalize(master.getProductColor()))) return false;
-        if (!blank(productColor.getSeason()) && !blank(master.getSeason())
-                && !normalize(productColor.getSeason()).equals(normalize(master.getSeason()))) return false;
-        if (!blank(productColor.getPatternNumber()) && !blank(master.getPatternNumber())
-                && !normalize(productColor.getPatternNumber()).equals(normalize(master.getPatternNumber()))) return false;
-        return true;
+        return normalize(productColor.getColorName()).equals(normalize(master.getProductColor()));
     }
 
     private BomAttachment findLegacyColorImage(
@@ -453,29 +413,9 @@ public class ProductColorMasterService {
         return contentType.startsWith("image/") || fileName.matches(".*\\.(png|jpe?g|gif|webp|bmp)$");
     }
 
-    /** Backfills source BOM name/order for Product Color documents created before this feature. */
-    private ProductColorMaster ensureSourceBomDetails(ProductColorMaster master) {
-        if (master == null || blank(master.getSourceBomId())) return master;
-        if (!blank(master.getSourceOrderId()) && !blank(master.getSourceBomName())) return master;
-
-        Optional<BomDocument> sourceBom = bomRepository.findById(master.getSourceBomId());
-        if (sourceBom.isEmpty()) return master;
-
-        BomDocument bom = sourceBom.get();
-        master.setSourceOrderId(bom.getOrderId());
-        master.setSourceBomNo(bom.getBomNo());
-        master.setSourceBomName(bom.getBomName());
-        master.setUpdatedAt(LocalDateTime.now());
-        return repository.save(master);
-    }
 
     private ProductColorMaster fromRequest(ProductColorMaster entity, ProductColorMasterRequest request) {
         if (request == null) throw new MasterDataValidationException("Product Color data is required");
-        entity.setBuyer(trim(request.buyer()));
-        entity.setSeason(required(request.season(), "Season is required"));
-        entity.setPatternNumber(required(request.patternNumber(), "Pattern Number is required"));
-        entity.setStyleNumber(trim(request.styleNumber()));
-        entity.setStyleName(trim(request.styleName()));
         entity.setProductColor(required(request.productColor(), "Product Color is required"));
         entity.setActive(request.active() == null || request.active());
         entity.setChildColors(toChildColors(request.childColors()));
@@ -548,9 +488,7 @@ public class ProductColorMasterService {
     }
 
     private String keyFor(ProductColorMaster item) {
-        return normalize(item.getBuyer()) + "|" + normalize(item.getSeason()) + "|"
-                + normalize(item.getPatternNumber()) + "|" + normalize(item.getStyleNumber())
-                + "|" + normalize(item.getProductColor());
+        return normalize(item == null ? null : item.getProductColor());
     }
 
     private void validateImage(MultipartFile file) {

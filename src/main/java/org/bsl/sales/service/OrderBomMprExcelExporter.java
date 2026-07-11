@@ -865,7 +865,7 @@ public class OrderBomMprExcelExporter {
         setCell(getOrCreateCell(row, MPR_CURRENCY_COL), line.getCurrency());
         setCell(getOrCreateCell(row, MPR_PRICE_COL), line.getMatPriceWithoutTax());
         setCell(getOrCreateCell(row, MPR_SHORT_SUPPLIER_COL), line.getShortNameSupplier());
-        setCell(getOrCreateCell(row, MPR_VENDOR_CODE_COL), line.getVendorCode());
+        setTextCell(getOrCreateCell(row, MPR_VENDOR_CODE_COL), vendorCodeText(line.getVendorCode()));
         setCell(getOrCreateCell(row, MPR_VENDOR_NAME_COL), line.getVendorName());
         setCell(getOrCreateCell(row, MPR_MAT_CHARGER_COL), line.getMatCharger());
 
@@ -935,6 +935,22 @@ public class OrderBomMprExcelExporter {
     private void writeRow(Sheet sheet, int rowNo, String... values) {
         Row row = sheet.createRow(rowNo);
         for (int i = 0; i < values.length; i++) row.createCell(i).setCellValue(values[i] == null ? "" : values[i]);
+    }
+
+    private void setTextCell(Cell cell, String value) {
+        if (value == null || value.isBlank()) {
+            cell.setBlank();
+        } else {
+            cell.setCellValue(value);
+        }
+    }
+
+    private String vendorCodeText(String value) {
+        if (value == null) {
+            return null;
+        }
+        String text = value.trim();
+        return text.matches("^[0-9,]+$") ? text.replace(",", "") : text;
     }
 
     private void setCell(Cell cell, Object value) {

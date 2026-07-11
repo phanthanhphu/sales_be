@@ -32,13 +32,10 @@ public class ProductColorMasterController {
     @GetMapping
     public ResponseEntity<Page<ProductColorMaster>> list(
             @RequestParam(required = false) String productColor,
-            @RequestParam(required = false) String season,
-            @RequestParam(required = false) String patternNumber,
-            @RequestParam(required = false) String styleName,
             @RequestParam(defaultValue = "0") int page,
             @RequestParam(defaultValue = "50") int size
     ) {
-        return ResponseEntity.ok(service.list(productColor, season, patternNumber, styleName, page, size));
+        return ResponseEntity.ok(service.list(productColor, page, size));
     }
 
     @GetMapping("/{id}")

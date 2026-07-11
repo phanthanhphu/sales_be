@@ -13,9 +13,15 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Reusable Product / Style Color definition imported from BOM Detail.
- * The master stores only reusable Child Colors. Each BOM material row keeps
- * the relationship to the selected Child Color through childColorId.
+ * Reusable Product / Style Color definition.
+ *
+ * Product Color Master stores only shared data:
+ * - Product / Style Color name
+ * - shared Child Color comments
+ * - one shared image
+ *
+ * Buyer, Season, Pattern Number, Style Number and Style Name belong to the BOM
+ * header/BOM product-color columns, so they are not stored here.
  */
 @Data
 @NoArgsConstructor
@@ -28,11 +34,6 @@ public class ProductColorMaster {
     @Indexed(unique = true)
     private String masterKey;
 
-    private String buyer;
-    private String season;
-    private String patternNumber;
-    private String styleNumber;
-    private String styleName;
     private String productColor;
     private boolean active = true;
     private List<ProductColorAttribute> childColors = new ArrayList<>();
@@ -45,11 +46,6 @@ public class ProductColorMaster {
     private long imageSize;
     private LocalDateTime imageUpdatedAt;
 
-    /** The source BOM is returned with enough data for the UI to open the exact BOM route. */
-    private String sourceBomId;
-    private String sourceOrderId;
-    private String sourceBomNo;
-    private String sourceBomName;
     private LocalDateTime createdAt;
     private LocalDateTime updatedAt;
 
