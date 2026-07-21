@@ -13,6 +13,7 @@ public class MasterDataImportResult {
     private int created;
     private int updated;
     private int skipped;
+    private int deleted;
     private List<ImportRowError> errors = new ArrayList<>();
 
     public static MasterDataImportResult rejected(
@@ -100,6 +101,10 @@ public class MasterDataImportResult {
     public void setSkipped(int skipped) {
         this.skipped = skipped;
     }
+
+    public int getDeleted() { return deleted; }
+
+    public void setDeleted(int deleted) { this.deleted = deleted; }
 
     public List<ImportRowError> getErrors() {
         return errors;

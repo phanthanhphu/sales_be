@@ -48,6 +48,30 @@ public class MongoIndexConfig {
                         .partialFilterExpression(new Document("departmentRequisitions.name", new Document("$exists", true)))
         );
 
+        MongoCollection<Document> bomLines = mongoTemplate.getCollection("bom_lines");
+        bomLines.createIndex(
+                Indexes.compoundIndex(Indexes.ascending("bomId"), Indexes.ascending("packingId"), Indexes.ascending("sortOrder")),
+                new IndexOptions().name("bom_scope_sort_idx")
+        );
+        bomLines.createIndex(
+                Indexes.compoundIndex(Indexes.ascending("bomId"), Indexes.ascending("line.sourceRowNumber")),
+                new IndexOptions().name("bom_source_row_idx")
+        );
+        bomLines.createIndex(
+                Indexes.compoundIndex(Indexes.ascending("bomId"), Indexes.ascending("line.sapCode")),
+                new IndexOptions().name("idx_bom_lines_sap_code")
+        );
+
+        MongoCollection<Document> boms = mongoTemplate.getCollection("boms");
+        boms.createIndex(
+                Indexes.compoundIndex(Indexes.ascending("orderId"), Indexes.descending("updatedAt")),
+                new IndexOptions().name("idx_boms_order_updated")
+        );
+        boms.createIndex(
+                Indexes.compoundIndex(Indexes.ascending("buyerKey"), Indexes.ascending("status"), Indexes.descending("updatedAt")),
+                new IndexOptions().name("idx_boms_buyer_status_updated")
+        );
+
         System.out.println("All indexes created successfully using Indexes class 100% operational!");
     }
 }

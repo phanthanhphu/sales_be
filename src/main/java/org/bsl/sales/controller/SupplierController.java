@@ -26,7 +26,7 @@ import org.springframework.web.multipart.MultipartFile;
  *
  * This controller intentionally reuses the existing VENDOR CODE service and
  * collection because the VENDOR CODE sheet is already the supplier source of
- * truth: Short name supplier, Vendor Code, Vendor name and MAT CHARGER.
+ * truth: Short name supplier, Vendor Code, Vendor Name and MAT CHARGER.
  * Keeping one collection prevents the Supplier and Vendor Code masters from
  * drifting apart while still giving the application a clear Supplier endpoint.
  */

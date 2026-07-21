@@ -20,6 +20,7 @@ public class UserDTO {
     private String departmentName;
     private String division;
     private List<String> accessPermissions = new ArrayList<>();
+    private List<String> buyerKeys = new ArrayList<>();
     private boolean canManageBom;
     private boolean canManageSales;
     private boolean viewOnly;
@@ -53,6 +54,8 @@ public class UserDTO {
     public void setDivision(String division) { this.division = clean(division); }
     public List<String> getAccessPermissions() { return List.copyOf(accessPermissions); }
     public void setAccessPermissions(List<String> accessPermissions) { this.accessPermissions = new ArrayList<>(User.normalizeAccessPermissions(accessPermissions, User.ROLE_ADMIN.equals(getRole()))); }
+    public List<String> getBuyerKeys() { return List.copyOf(buyerKeys); }
+    public void setBuyerKeys(List<String> buyerKeys) { this.buyerKeys = new ArrayList<>(User.normalizeBuyerKeys(buyerKeys, User.ROLE_ADMIN.equals(getRole()))); }
     public boolean isCanManageBom() { return canManageBom; }
     public boolean getCanManageBom() { return canManageBom; }
     public void setCanManageBom(boolean canManageBom) { this.canManageBom = canManageBom; }

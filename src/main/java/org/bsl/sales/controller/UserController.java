@@ -13,12 +13,15 @@ import org.bsl.sales.dto.ChangePasswordDTO;
 import org.bsl.sales.dto.LoginDTO;
 import org.bsl.sales.dto.UserDTO;
 import org.bsl.sales.model.User;
+import org.bsl.sales.exception.MasterDataValidationException;
+import org.bsl.sales.model.Buyer;
 import org.bsl.sales.repository.UserRepository;
 import org.bsl.sales.request.UserRequest;
 import org.bsl.sales.security.JwtUtil;
 import org.bsl.sales.security.AccessControl;
 import org.bsl.sales.service.DepartmentService;
 import org.bsl.sales.service.UserService;
+import org.bsl.sales.service.BuyerService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.core.io.Resource;
 import org.springframework.core.io.UrlResource;
@@ -71,6 +74,9 @@ public class UserController {
 
     @Autowired
     private AccessControl accessControl;
+
+    @Autowired
+    private BuyerService buyerService;
 
     // 🔥 SWAGGER TOKENS - IN-MEMORY MAP!
     private final Map<String, String> swaggerTokens = new ConcurrentHashMap<>();
@@ -136,6 +142,8 @@ public class UserController {
             user.setTokenVersion(1L);
             user.setDepartmentId(request.getDepartmentId());
             user.setAccessPermissions(request.getAccessPermissionList());
+            user.setBuyerKeys(request.getBuyerKeyList());
+            validateBuyerPermissions(user);
 
             Boolean isEnabled = request.getIsEnabled();
             user.setEnabled(isEnabled != null ? isEnabled : true);
@@ -172,6 +180,9 @@ public class UserController {
 
             return ResponseEntity.status(HttpStatus.CREATED).body(response);
 
+        } catch (MasterDataValidationException e) {
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                    .body(Map.of("message", e.getMessage()));
         } catch (IOException e) {
             logger.error("Error processing file: {}", e.getMessage());
             return ResponseEntity.status(HttpStatus.BAD_REQUEST)
@@ -317,7 +328,7 @@ public class UserController {
             }
 
             long tokenVersion = user.getTokenVersion();
-            String token = jwtUtil.generateToken(user.getEmail(), user.getRole(), tokenVersion, user.getAccessPermissions());
+            String token = jwtUtil.generateToken(user.getEmail(), user.getRole(), tokenVersion, user.getAccessPermissions(), user.getBuyerKeys());
 
             session.setAttribute("swaggerBearerToken", token);
             session.setAttribute("authenticatedSession", true);
@@ -450,14 +461,17 @@ public class UserController {
             if (adminEditing) {
                 user.setRole(request.getRole() == null || request.getRole().trim().isEmpty() ? existingUser.getRole() : request.getRole());
                 user.setAccessPermissions(request.getAccessPermissions() == null ? existingUser.getAccessPermissions() : request.getAccessPermissionList());
+                user.setBuyerKeys(request.getBuyerKeys() == null ? existingUser.getBuyerKeys() : request.getBuyerKeyList());
                 user.setDepartmentId(request.getDepartmentId() == null ? existingUser.getDepartmentId() : request.getDepartmentId());
                 user.setEnabled(request.getIsEnabled() == null ? existingUser.isEnabled() : request.getIsEnabled());
             } else {
                 user.setRole(existingUser.getRole());
                 user.setAccessPermissions(existingUser.getAccessPermissions());
+                user.setBuyerKeys(existingUser.getBuyerKeys());
                 user.setDepartmentId(existingUser.getDepartmentId());
                 user.setEnabled(existingUser.isEnabled());
             }
+            validateBuyerPermissions(user);
 
             MultipartFile profileImage = request.getProfileImage();
             if (profileImage != null && !profileImage.isEmpty()) {
@@ -473,6 +487,7 @@ public class UserController {
 
             boolean accessChanged = !Objects.equals(existingUser.getRole(), user.getRole())
                     || !Objects.equals(existingUser.getAccessPermissions(), user.getAccessPermissions())
+                    || !Objects.equals(existingUser.getBuyerKeys(), user.getBuyerKeys())
                     || existingUser.isEnabled() != user.isEnabled()
                     || !Objects.equals(existingUser.getEmail(), user.getEmail());
             if (accessChanged) {
@@ -486,6 +501,9 @@ public class UserController {
                     "message", "User updated successfully",
                     "data", buildUserResponse(updatedUser)
             ));
+        } catch (MasterDataValidationException exception) {
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                    .body(Map.of("message", exception.getMessage()));
         } catch (IOException exception) {
             return ResponseEntity.status(HttpStatus.BAD_REQUEST)
                     .body(Map.of("message", "Error processing file: " + exception.getMessage()));
@@ -759,6 +777,19 @@ public class UserController {
         }
     }
 
+    private void validateBuyerPermissions(User user) {
+        if (user == null || user.isAdminRole()) return;
+        if (user.getBuyerKeys().isEmpty()) {
+            throw new MasterDataValidationException("Select at least one Buyer for this user");
+        }
+        for (String buyerKey : user.getBuyerKeys()) {
+            Buyer buyer = buyerService.getByKey(buyerKey);
+            if (!buyer.isActive()) {
+                throw new MasterDataValidationException("Buyer is inactive: " + buyer.getBuyerName());
+            }
+        }
+    }
+
     private Map<String, Object> buildUserResponse(User user) {
         Map<String, Object> data = new LinkedHashMap<>();
 
@@ -780,6 +811,7 @@ public class UserController {
         data.put("phone", user.getPhone());
         data.put("role", user.getRole());
         data.put("accessPermissions", user.getAccessPermissions());
+        data.put("buyerKeys", user.getBuyerKeys());
         data.put("canManageBom", user.canManageBom());
         data.put("canManageSales", user.canManageSales());
         data.put("viewOnly", user.isViewOnly());

@@ -41,7 +41,6 @@ import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -63,6 +62,7 @@ public class LossService {
     private final LossRepository lossRepository;
     private final MatInfoRepository matInfoRepository;
     private final BomDocumentRepository bomDocumentRepository;
+    private final BomLineStore lineStore;
     private final MprDocumentRepository mprDocumentRepository;
     private final MasterDataBeanValidator beanValidator;
     private final MasterDataExcelSupport excelSupport;
@@ -71,6 +71,7 @@ public class LossService {
             LossRepository lossRepository,
             MatInfoRepository matInfoRepository,
             BomDocumentRepository bomDocumentRepository,
+            BomLineStore lineStore,
             MprDocumentRepository mprDocumentRepository,
             MasterDataBeanValidator beanValidator,
             MasterDataExcelSupport excelSupport
@@ -78,6 +79,7 @@ public class LossService {
         this.lossRepository = lossRepository;
         this.matInfoRepository = matInfoRepository;
         this.bomDocumentRepository = bomDocumentRepository;
+        this.lineStore = lineStore;
         this.mprDocumentRepository = mprDocumentRepository;
         this.beanValidator = beanValidator;
         this.excelSupport = excelSupport;
@@ -228,7 +230,7 @@ public class LossService {
                     new MasterDataExcelSupport.HeaderRequirement(4, ">=3001")
             );
 
-            Set<String> incomingKeys = new HashSet<>();
+            Map<String, String> incomingByMaterialGroup = new HashMap<>();
             for (int rowIndex = sheet.getFirstRowNum() + 1; rowIndex <= sheet.getLastRowNum(); rowIndex++) {
                 Row row = sheet.getRow(rowIndex);
                 if (excelSupport.isBlank(row, 13, evaluator)) {
@@ -242,8 +244,14 @@ public class LossService {
                     validateTierOrder(request);
 
                     String key = materialGroupKey(request);
-                    if (!incomingKeys.add(key)) {
-                        errors.add(new ImportRowError(excelRow, "materialGroup", "Duplicate material group inside uploaded file"));
+                    String fingerprint = lossDataKey(request);
+                    String previous = incomingByMaterialGroup.putIfAbsent(key, fingerprint);
+                    if (previous != null && !previous.equals(fingerprint)) {
+                        errors.add(new ImportRowError(
+                                excelRow,
+                                "materialGroup",
+                                "The same Material Group appears more than once with different Loss values"
+                        ));
                     }
                     rows.add(new ImportCandidate<>(excelRow, request));
                 } catch (RuntimeException ex) {
@@ -256,6 +264,13 @@ public class LossService {
             errors.add(new ImportRowError(1, "file", "Cannot import Loss: " + ex.getMessage()));
         }
 
+        int duplicateRows = deduplicateLossRows(rows);
+        Map<String, Loss> existingByMaterialKey = lossRepository.findAll().stream()
+                .filter(item -> item.getMaterialGroupKey() != null)
+                .collect(Collectors.toMap(Loss::getMaterialGroupKey, item -> item, (a, b) -> a));
+        int existingDuplicateRows = effectiveMode == ImportMode.REPLACE_ALL
+                ? 0
+                : removeExistingLossDuplicates(rows, existingByMaterialKey);
         validateBeforeApply(effectiveMode, rows, errors);
         if (!errors.isEmpty()) {
             return MasterDataImportResult.rejected(MASTER_DATA_NAME, effectiveMode, totalRows, errors);
@@ -266,21 +281,20 @@ public class LossService {
         result.setMode(effectiveMode);
         result.setApplied(true);
         result.setTotalRows(totalRows);
-        result.setValidRows(rows.size());
+        result.setValidRows(totalRows);
+        result.setSkipped(duplicateRows + existingDuplicateRows);
 
         if (effectiveMode == ImportMode.REPLACE_ALL) {
-            lossRepository.deleteAll();
-            for (ImportCandidate<LossRequest> row : rows) {
-                Loss entity = new Loss();
-                apply(entity, row.getValue());
-                assignMasterKeyIfMissing(entity);
-                LocalDateTime now = LocalDateTime.now();
-                entity.setCreatedAt(now);
-                entity.setUpdatedAt(now);
-                lossRepository.save(entity);
-                result.setCreated(result.getCreated() + 1);
+            Set<String> incomingKeys = rows.stream()
+                    .map(row -> materialGroupKey(row.getValue()))
+                    .collect(Collectors.toSet());
+            List<Loss> toDelete = lossRepository.findAll().stream()
+                    .filter(item -> !incomingKeys.contains(item.getMaterialGroupKey()))
+                    .collect(Collectors.toList());
+            if (!toDelete.isEmpty()) {
+                lossRepository.deleteAll(toDelete);
+                result.setDeleted(toDelete.size());
             }
-            return result;
         }
 
         for (ImportCandidate<LossRequest> row : rows) {
@@ -288,6 +302,10 @@ public class LossService {
             String key = materialGroupKey(request);
             Optional<Loss> existing = lossRepository.findByMaterialGroupKey(key);
             if (existing.isPresent()) {
+                if (sameLossData(existing.get(), request)) {
+                    result.setSkipped(result.getSkipped() + 1);
+                    continue;
+                }
                 apply(existing.get(), request);
                 assignMasterKeyIfMissing(existing.get());
                 existing.get().setUpdatedAt(LocalDateTime.now());
@@ -336,8 +354,8 @@ public class LossService {
                     new MasterDataExcelSupport.HeaderRequirement(5, ">=3001")
             );
 
-            Set<String> incomingMasterKeys = new HashSet<>();
-            Set<String> incomingMaterialKeys = new HashSet<>();
+            Map<String, String> fingerprintByMasterKey = new HashMap<>();
+            Map<String, String> fingerprintByMaterialKey = new HashMap<>();
             for (int rowIndex = sheet.getFirstRowNum() + 1; rowIndex <= sheet.getLastRowNum(); rowIndex++) {
                 Row row = sheet.getRow(rowIndex);
                 if (excelSupport.isBlank(row, 13, evaluator)) {
@@ -354,11 +372,24 @@ public class LossService {
                     validateTierOrder(keyed.request);
 
                     String materialKey = materialGroupKey(keyed.request);
-                    if (!incomingMaterialKeys.add(materialKey)) {
-                        errors.add(new ImportRowError(excelRow, "materialGroup", "Duplicate material group inside uploaded file"));
+                    String fingerprint = lossDataKey(keyed.request);
+                    String previousMaterial = fingerprintByMaterialKey.putIfAbsent(materialKey, fingerprint);
+                    if (previousMaterial != null && !previousMaterial.equals(fingerprint)) {
+                        errors.add(new ImportRowError(
+                                excelRow,
+                                "materialGroup",
+                                "The same Material Group appears more than once with different Loss values"
+                        ));
                     }
-                    if (keyed.masterKey != null && !incomingMasterKeys.add(keyed.masterKey)) {
-                        errors.add(new ImportRowError(excelRow, "masterKey", "Duplicate Key inside uploaded file"));
+                    if (keyed.masterKey != null) {
+                        String previousKey = fingerprintByMasterKey.putIfAbsent(keyed.masterKey, fingerprint);
+                        if (previousKey != null && !previousKey.equals(fingerprint)) {
+                            errors.add(new ImportRowError(
+                                    excelRow,
+                                    "masterKey",
+                                    "The same Key appears more than once with different Loss values"
+                            ));
+                        }
                     }
                     rows.add(new ImportCandidate<>(excelRow, keyed));
                 } catch (RuntimeException ex) {
@@ -371,6 +402,11 @@ public class LossService {
             errors.add(new ImportRowError(1, "file", "Cannot import edited Loss: " + ex.getMessage()));
         }
 
+        int duplicateRows = deduplicateEditedLossRows(rows);
+        Map<String, Loss> existingByMaterialKey = lossRepository.findAll().stream()
+                .filter(item -> item.getMaterialGroupKey() != null)
+                .collect(Collectors.toMap(Loss::getMaterialGroupKey, item -> item, (a, b) -> a));
+        int existingDuplicateRows = removeExistingEditedLossDuplicates(rows, existingByMaterialKey);
         validateEditedRows(rows, errors);
         if (!errors.isEmpty()) {
             return MasterDataImportResult.rejected(MASTER_DATA_NAME, ImportMode.UPSERT, totalRows, errors);
@@ -381,13 +417,19 @@ public class LossService {
         result.setMode(ImportMode.UPSERT);
         result.setApplied(true);
         result.setTotalRows(totalRows);
-        result.setValidRows(rows.size());
+        result.setValidRows(totalRows);
+        result.setSkipped(duplicateRows + existingDuplicateRows);
 
         for (ImportCandidate<KeyedLossRequest> row : rows) {
             KeyedLossRequest keyed = row.getValue();
             Optional<Loss> existing = keyed.masterKey == null
                     ? Optional.empty()
                     : lossRepository.findByMasterKey(keyed.masterKey);
+            Loss duplicate = existingByMaterialKey.get(materialGroupKey(keyed.request));
+            if (duplicate != null && sameLossData(duplicate, keyed.request)) {
+                result.setSkipped(result.getSkipped() + 1);
+                continue;
+            }
             if (existing.isPresent()) {
                 apply(existing.get(), keyed.request);
                 assignMasterKeyIfMissing(existing.get());
@@ -525,7 +567,9 @@ public class LossService {
 
             Loss target = keyed.masterKey == null ? null : existingByMasterKey.get(keyed.masterKey);
             Loss duplicate = existingByMaterialKey.get(materialKey);
-            if (duplicate != null && (target == null || !duplicate.getId().equals(target.getId()))) {
+            if (duplicate != null
+                    && (target == null || !duplicate.getId().equals(target.getId()))
+                    && !sameLossData(duplicate, keyed.request)) {
                 errors.add(new ImportRowError(
                         row.getRowNumber(),
                         "materialGroup",
@@ -566,7 +610,8 @@ public class LossService {
         if (mode == ImportMode.CREATE_ONLY) {
             for (ImportCandidate<LossRequest> row : rows) {
                 String key = materialGroupKey(row.getValue());
-                if (lossRepository.existsByMaterialGroupKey(key)) {
+                Optional<Loss> existing = lossRepository.findByMaterialGroupKey(key);
+                if (existing.isPresent() && !sameLossData(existing.get(), row.getValue())) {
                     errors.add(new ImportRowError(
                             row.getRowNumber(),
                             "materialGroup",
@@ -603,6 +648,92 @@ public class LossService {
         target.setLossLt1501(normalizeRate(request.getLossLt1501()));
         target.setLossLt3001(normalizeRate(request.getLossLt3001()));
         target.setLossGte3001(normalizeRate(request.getLossGte3001()));
+    }
+
+    /** Removes rows that are already identical in the database before validation/apply. */
+    private int removeExistingLossDuplicates(
+            List<ImportCandidate<LossRequest>> rows,
+            Map<String, Loss> existingByMaterialKey
+    ) {
+        int skipped = 0;
+        for (int index = rows.size() - 1; index >= 0; index--) {
+            LossRequest request = rows.get(index).getValue();
+            Loss existing = existingByMaterialKey.get(materialGroupKey(request));
+            if (existing != null && sameLossData(existing, request)) {
+                rows.remove(index);
+                skipped++;
+            }
+        }
+        return skipped;
+    }
+
+    /** Edited rows already identical to stored data skip before Key validation. */
+    private int removeExistingEditedLossDuplicates(
+            List<ImportCandidate<KeyedLossRequest>> rows,
+            Map<String, Loss> existingByMaterialKey
+    ) {
+        int skipped = 0;
+        for (int index = rows.size() - 1; index >= 0; index--) {
+            KeyedLossRequest keyed = rows.get(index).getValue();
+            if (keyed == null || keyed.request == null) continue;
+            Loss existing = existingByMaterialKey.get(materialGroupKey(keyed.request));
+            if (existing != null && sameLossData(existing, keyed.request)) {
+                rows.remove(index);
+                skipped++;
+            }
+        }
+        return skipped;
+    }
+
+    private int deduplicateLossRows(List<ImportCandidate<LossRequest>> rows) {
+        Map<String, ImportCandidate<LossRequest>> unique = new java.util.LinkedHashMap<>();
+        int skipped = 0;
+        for (ImportCandidate<LossRequest> row : rows) {
+            if (unique.putIfAbsent(lossDataKey(row.getValue()), row) != null) skipped++;
+        }
+        rows.clear();
+        rows.addAll(unique.values());
+        return skipped;
+    }
+
+    private int deduplicateEditedLossRows(List<ImportCandidate<KeyedLossRequest>> rows) {
+        Map<String, ImportCandidate<KeyedLossRequest>> unique = new java.util.LinkedHashMap<>();
+        int skipped = 0;
+        for (ImportCandidate<KeyedLossRequest> row : rows) {
+            KeyedLossRequest keyed = row.getValue();
+            String key = (keyed.masterKey == null ? "" : keyed.masterKey) + "|" + lossDataKey(keyed.request);
+            if (unique.putIfAbsent(key, row) != null) skipped++;
+        }
+        rows.clear();
+        rows.addAll(unique.values());
+        return skipped;
+    }
+
+    private boolean sameLossData(Loss existing, LossRequest request) {
+        if (existing == null || request == null) return false;
+        return materialGroupKey(request).equals(existing.getMaterialGroupKey())
+                && equalDecimal(existing.getLossLt501(), normalizeRate(request.getLossLt501()))
+                && equalDecimal(existing.getLossLt1501(), normalizeRate(request.getLossLt1501()))
+                && equalDecimal(existing.getLossLt3001(), normalizeRate(request.getLossLt3001()))
+                && equalDecimal(existing.getLossGte3001(), normalizeRate(request.getLossGte3001()));
+    }
+
+    private String lossDataKey(LossRequest request) {
+        return String.join("\u001F",
+                materialGroupKey(request),
+                decimalKey(normalizeRate(request.getLossLt501())),
+                decimalKey(normalizeRate(request.getLossLt1501())),
+                decimalKey(normalizeRate(request.getLossLt3001())),
+                decimalKey(normalizeRate(request.getLossGte3001()))
+        );
+    }
+
+    private boolean equalDecimal(BigDecimal left, BigDecimal right) {
+        return left == null ? right == null : right != null && left.compareTo(right) == 0;
+    }
+
+    private String decimalKey(BigDecimal value) {
+        return value == null ? "" : value.stripTrailingZeros().toPlainString();
     }
 
     private AtomicLong masterKeyCounter() {
@@ -672,7 +803,8 @@ public class LossService {
             return true;
         }
 
-        for (BomDocument bom : bomDocumentRepository.findAll()) {
+        for (BomDocument storedBom : bomDocumentRepository.findAll()) {
+            BomDocument bom = lineStore.hydrate(storedBom);
             if (containsMaterialType(bom.getCoreLines(), materialGroupKey)) {
                 return true;
             }

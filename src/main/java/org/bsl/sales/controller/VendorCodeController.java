@@ -22,6 +22,8 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.multipart.MultipartFile;
 
+import java.util.List;
+
 @RestController
 @Validated
 @RequestMapping("/api/master-data/vendor-codes")
@@ -59,6 +61,14 @@ public class VendorCodeController {
                         size
                 )
         );
+    }
+
+    @GetMapping("/options")
+    public ResponseEntity<List<VendorCode>> options(
+            @RequestParam(required = false) String keyword,
+            @RequestParam(defaultValue = "50") int limit
+    ) {
+        return ResponseEntity.ok(vendorCodeService.options(keyword, limit));
     }
 
     @GetMapping("/{id}")

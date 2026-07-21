@@ -25,17 +25,32 @@ public class ProductColorMasterController {
     }
 
     @PostMapping
-    public ResponseEntity<ProductColorMaster> create(@Valid @RequestBody ProductColorMasterRequest request) {
+    public ResponseEntity<ProductColorMaster> create(
+            @RequestParam(defaultValue = "LLBEAN") String buyerKey,
+            @Valid @RequestBody ProductColorMasterRequest request
+    ) {
+        request = new ProductColorMasterRequest(
+                buyerKey,
+                request.patternNumber(),
+                request.productColor(),
+                request.season(),
+                request.styleNumber(),
+                request.active(),
+                request.childColors()
+        );
         return ResponseEntity.ok(service.create(request));
     }
 
     @GetMapping
     public ResponseEntity<Page<ProductColorMaster>> list(
+            @RequestParam(defaultValue = "LLBEAN") String buyerKey,
             @RequestParam(required = false) String productColor,
             @RequestParam(defaultValue = "0") int page,
-            @RequestParam(defaultValue = "50") int size
+            @RequestParam(defaultValue = "20") int size,
+            @RequestParam(defaultValue = "updatedAt") String sortBy,
+            @RequestParam(defaultValue = "desc") String sortDir
     ) {
-        return ResponseEntity.ok(service.list(productColor, page, size));
+        return ResponseEntity.ok(service.list(buyerKey, productColor, page, size, sortBy, sortDir));
     }
 
     @GetMapping("/{id}")
@@ -44,7 +59,20 @@ public class ProductColorMasterController {
     }
 
     @PutMapping("/{id}")
-    public ResponseEntity<ProductColorMaster> update(@PathVariable String id, @Valid @RequestBody ProductColorMasterRequest request) {
+    public ResponseEntity<ProductColorMaster> update(
+            @PathVariable String id,
+            @RequestParam(defaultValue = "LLBEAN") String buyerKey,
+            @Valid @RequestBody ProductColorMasterRequest request
+    ) {
+        request = new ProductColorMasterRequest(
+                buyerKey,
+                request.patternNumber(),
+                request.productColor(),
+                request.season(),
+                request.styleNumber(),
+                request.active(),
+                request.childColors()
+        );
         return ResponseEntity.ok(service.update(id, request));
     }
 

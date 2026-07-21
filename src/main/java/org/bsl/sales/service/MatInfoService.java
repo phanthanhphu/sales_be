@@ -11,102 +11,121 @@ import org.bsl.sales.dto.MasterDataImportResult;
 import org.bsl.sales.exception.MasterDataConflictException;
 import org.bsl.sales.exception.MasterDataNotFoundException;
 import org.bsl.sales.exception.MasterDataValidationException;
+import org.bsl.sales.model.CurrencyMaster;
 import org.bsl.sales.model.MatInfo;
 import org.bsl.sales.model.VendorCode;
 import org.bsl.sales.repository.MatInfoRepository;
-import org.bsl.sales.repository.VendorCodeRepository;
+import org.bsl.sales.security.BuyerAccessService;
+import org.bsl.sales.support.BuyerKeys;
 import org.bsl.sales.support.ImportCandidate;
 import org.bsl.sales.support.MasterDataBeanValidator;
-import org.bsl.sales.support.MasterDataExcelSupport;
 import org.bsl.sales.support.MasterDataEditWorkbookExporter;
-import org.bsl.sales.support.MasterDataSequentialKey;
+import org.bsl.sales.support.MasterDataExcelSupport;
 import org.bsl.sales.support.MasterDataTextNormalizer;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
+import org.springframework.data.domain.Sort;
+import org.springframework.data.mongodb.core.MongoTemplate;
+import org.springframework.data.mongodb.core.query.Criteria;
+import org.springframework.data.mongodb.core.query.Query;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
-import java.util.Comparator;
+import java.util.Collection;
 import java.util.HashMap;
-import java.util.HashSet;
-import java.util.LinkedHashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
-/**
- * MAT_INFO service for the current MAT_INFO sheet:
- * Flex ID | Material type | Mat full description | Mat color | Mat unit |
- * Cur | Mat price (w/o tax) | Short name supplier | Remark | Updated date |
- * Updated pic | Style desc.
- *
- * Checking and DEV were removed from the business form. The legacy
- * checkingKey Mongo column is retained only as an internal unique key derived
- * from Mat Full Description + Mat Color, so old data remains compatible.
- */
 @Service
 public class MatInfoService {
 
     private static final String MASTER_DATA_NAME = "MAT_INFO";
     private static final String MASTER_KEY_PREFIX = "MI";
-    private static final String VENDOR_MASTER_KEY_PREFIX = "VC";
+    private static final String SEQUENCE_NAME = "mat_info";
+    private static final int MAX_PRICE_SCALE = 6;
+    private static final int MAX_PRICE_INTEGER_DIGITS = 18;
+    /** Excel stores numeric cells as binary doubles, which can turn 0.03552 into 0.035519999999999996. */
+    private static final BigDecimal EXCEL_FLOATING_POINT_EPSILON = new BigDecimal("0.000000000001");
 
     private final MatInfoRepository matInfoRepository;
-    private final VendorCodeRepository vendorCodeRepository;
+    private final VendorCodeService vendorCodeService;
     private final CurrencyMasterService currencyMasterService;
     private final MasterDataBeanValidator beanValidator;
     private final MasterDataExcelSupport excelSupport;
+    private final BuyerAccessService buyerAccess;
+    private final MongoTemplate mongoTemplate;
+    private final MasterDataSequenceService sequenceService;
+    private final Set<String> backfilledBuyers = ConcurrentHashMap.newKeySet();
+    private final Set<String> masterKeyBackfilledBuyers = ConcurrentHashMap.newKeySet();
 
     public MatInfoService(
             MatInfoRepository matInfoRepository,
-            VendorCodeRepository vendorCodeRepository,
+            VendorCodeService vendorCodeService,
             CurrencyMasterService currencyMasterService,
             MasterDataBeanValidator beanValidator,
-            MasterDataExcelSupport excelSupport
+            MasterDataExcelSupport excelSupport,
+            BuyerAccessService buyerAccess,
+            MongoTemplate mongoTemplate,
+            MasterDataSequenceService sequenceService
     ) {
         this.matInfoRepository = matInfoRepository;
-        this.vendorCodeRepository = vendorCodeRepository;
+        this.vendorCodeService = vendorCodeService;
         this.currencyMasterService = currencyMasterService;
         this.beanValidator = beanValidator;
         this.excelSupport = excelSupport;
+        this.buyerAccess = buyerAccess;
+        this.mongoTemplate = mongoTemplate;
+        this.sequenceService = sequenceService;
     }
 
     public MatInfo create(MatInfoRequest request) {
+        String buyer = buyerAccess.requireBuyer(request.getBuyerKey());
+        request.setBuyerKey(buyer);
         validateRequest(request);
+        VendorCode vendor = requireVendor(request.getShortNameSupplier());
+        CurrencyMaster currency = requireCurrency(request.getCurrency());
 
-        if (findExisting(request).isPresent()) {
-            throw new MasterDataConflictException(
-                    "MAT_INFO already exists for the same Mat Full Description and Mat Color"
-            );
+        Optional<MatInfo> duplicate = findExisting(request);
+        if (duplicate.isPresent()) {
+            MatInfo existing = duplicate.get();
+            if (!existing.isActive()) {
+                apply(existing, request, vendor, currency);
+                existing.setActive(true);
+                existing.setDeletedAt(null);
+                existing.setDeletedBy(null);
+                existing.setUpdatedAt(LocalDateTime.now());
+                return saveWithDuplicateProtection(existing);
+            }
+            throw new MasterDataConflictException("MAT_INFO already exists for the same 8 import fields");
         }
 
         MatInfo entity = new MatInfo();
-        apply(entity, request);
-        assignMasterKeyIfMissing(entity);
-
+        entity.setMasterKey(nextMasterKey());
+        apply(entity, request, vendor, currency);
         LocalDateTime now = LocalDateTime.now();
+        entity.setActive(true);
         entity.setCreatedAt(now);
         entity.setUpdatedAt(now);
-
         return saveWithDuplicateProtection(entity);
     }
 
-    /**
-     * Separate filters are used instead of one all-column keyword search.
-     * All non-blank filters are combined with AND logic.
-     */
     public Page<MatInfo> list(
+            String buyerKey,
             String masterKey,
             String flexId,
             String materialType,
@@ -116,657 +135,374 @@ public class MatInfoService {
             int page,
             int size
     ) {
-        backfillMissingMasterKeys();
+        String buyer = buyerAccess.requireBuyer(buyerKey);
+        backfillMissingMasterKeys(buyer);
+        backfillLegacyIdentityKeys(buyer);
         Pageable pageable = toPageable(page, size);
-
-        String masterKeySearch = MasterDataTextNormalizer.key(masterKey);
-        String flexIdSearch = MasterDataTextNormalizer.key(flexId);
-        String materialTypeSearch = MasterDataTextNormalizer.key(materialType);
-        String descriptionSearch = MasterDataTextNormalizer.key(matFullDescription);
-        String colorSearch = MasterDataTextNormalizer.key(matColor);
-        String supplierSearch = MasterDataTextNormalizer.key(shortNameSupplier);
-
-        List<MatInfo> filtered = matInfoRepository.findAll().stream()
-                .filter(item -> contains(item.getMasterKey(), masterKeySearch))
-                .filter(item -> contains(item.getFlexId(), flexIdSearch))
-                .filter(item -> contains(item.getMaterialType(), materialTypeSearch))
-                .filter(item -> contains(item.getMatFullDescription(), descriptionSearch))
-                .filter(item -> contains(item.getMatColor(), colorSearch))
-                .filter(item -> contains(item.getShortNameSupplier(), supplierSearch))
-                .sorted(
-                        Comparator.comparing(
-                                MatInfo::getUpdatedAt,
-                                Comparator.nullsLast(Comparator.reverseOrder())
-                        ).thenComparing(
-                                MatInfo::getMatFullDescription,
-                                Comparator.nullsLast(String.CASE_INSENSITIVE_ORDER)
-                        )
-                )
-                .collect(Collectors.toList());
-
-        return page(filtered, pageable);
+        Query query = Query.query(new Criteria().andOperator(
+                Criteria.where("buyerKey").is(buyer),
+                Criteria.where("active").ne(false)
+        ));
+        addContainsFilter(query, "masterKey", masterKey);
+        addContainsFilter(query, "flexId", flexId);
+        addContainsFilter(query, "materialType", materialType);
+        addContainsFilter(query, "matFullDescription", matFullDescription);
+        addContainsFilter(query, "matColor", matColor);
+        addContainsFilter(query, "shortNameSupplier", shortNameSupplier);
+        long total = mongoTemplate.count(query, MatInfo.class);
+        query.with(Sort.by(Sort.Order.desc("updatedAt"), Sort.Order.asc("matFullDescription")));
+        query.skip(pageable.getOffset()).limit(pageable.getPageSize());
+        return new PageImpl<>(mongoTemplate.find(query, MatInfo.class), pageable, total);
     }
 
     public MatInfo getById(String id) {
         MatInfo entity = matInfoRepository.findById(id)
                 .orElseThrow(() -> new MasterDataNotFoundException("MAT_INFO not found"));
+        buyerAccess.requireEntityAccess(entity.getBuyerKey());
+        if (!entity.isActive()) throw new MasterDataNotFoundException("MAT_INFO not found or inactive");
+        if (entity.getBuyerKey() == null || entity.getBuyerKey().isBlank()) entity.setBuyerKey(BuyerKeys.LL_BEAN);
         return ensureMasterKeyPersisted(entity);
     }
 
     public MatInfo update(String id, MatInfoRequest request) {
-        validateRequest(request);
-
         MatInfo existing = getById(id);
+        String currentBuyer = BuyerKeys.legacyDefault(existing.getBuyerKey());
+        String targetBuyer = request.getBuyerKey() == null || request.getBuyerKey().isBlank()
+                ? currentBuyer : buyerAccess.requireBuyer(request.getBuyerKey());
+        if (!currentBuyer.equals(targetBuyer)) throw new MasterDataValidationException("MAT_INFO cannot be moved to another Buyer");
+        request.setBuyerKey(currentBuyer);
+        validateRequest(request);
+        VendorCode vendor = requireVendor(request.getShortNameSupplier());
+        CurrencyMaster currency = requireCurrency(request.getCurrency());
+
         Optional<MatInfo> duplicate = findExisting(request);
-
         if (duplicate.isPresent() && !existing.getId().equals(duplicate.get().getId())) {
-            throw new MasterDataConflictException(
-                    "MAT_INFO already exists for the same Mat Full Description and Mat Color"
-            );
+            throw new MasterDataConflictException("MAT_INFO already exists for the same 8 import fields");
         }
-
-        apply(existing, request);
-        assignMasterKeyIfMissing(existing);
+        apply(existing, request, vendor, currency);
         existing.setUpdatedAt(LocalDateTime.now());
-
         return saveWithDuplicateProtection(existing);
     }
 
+    /** Soft delete keeps historical master data traceable and prevents orphaned snapshots. */
     public void delete(String id) {
-        matInfoRepository.delete(getById(id));
+        MatInfo entity = getById(id);
+        entity.setActive(false);
+        entity.setDeletedAt(LocalDateTime.now());
+        entity.setDeletedBy(RequestActor.current());
+        entity.setUpdatedAt(LocalDateTime.now());
+        matInfoRepository.save(entity);
     }
 
-    public MasterDataImportResult upload(MultipartFile file, ImportMode mode) {
+    public MasterDataImportResult upload(MultipartFile file, ImportMode mode, String buyerKey) {
+        String buyer = buyerAccess.requireBuyer(buyerKey);
         ImportMode effectiveMode = mode == null ? ImportMode.UPSERT : mode;
         List<ImportRowError> errors = new ArrayList<>();
-        List<ImportCandidate<MatInfoRequest>> rows = new ArrayList<>();
-        int totalRows = 0;
+        List<ImportCandidate<MatInfoRequest>> rows = parseStandardWorkbook(file, buyer, errors);
+        int totalRows = rows.size();
+        int duplicateRows = deduplicateStandardRows(rows);
 
+        Map<String, CurrencyMaster> currencies = currencyMasterService.currentCurrencyMap();
+        validateReferences(rows, currencies, errors);
+
+        Set<String> incomingIdentity = rows.stream().map(row -> identityKey(row.getValue())).collect(Collectors.toSet());
+        Map<String, MatInfo> existingByIdentity = existingByIdentityKey(
+                buyer, incomingIdentity, effectiveMode == ImportMode.REPLACE_ALL
+        );
+        if (!errors.isEmpty()) return MasterDataImportResult.rejected(MASTER_DATA_NAME, effectiveMode, totalRows, errors);
+
+        Map<String, VendorCode> vendors = vendorMap(rows.stream()
+                .map(row -> row.getValue().getShortNameSupplier()).collect(Collectors.toSet()));
+        MasterDataImportResult result = baseResult(effectiveMode, totalRows);
+        result.setSkipped(duplicateRows);
+        LocalDateTime now = LocalDateTime.now();
+        List<MatInfo> toSave = new ArrayList<>();
+
+        if (effectiveMode == ImportMode.REPLACE_ALL) {
+            for (MatInfo existing : uniqueEntities(existingByIdentity)) {
+                if (existing.isActive() && !incomingIdentity.contains(identityKey(existing))) {
+                    existing.setActive(false);
+                    existing.setDeletedAt(now);
+                    existing.setDeletedBy(RequestActor.current());
+                    existing.setUpdatedAt(now);
+                    toSave.add(existing);
+                    result.setDeleted(result.getDeleted() + 1);
+                }
+            }
+        }
+
+        int createCount = (int) rows.stream().filter(row -> !existingByIdentity.containsKey(identityKey(row.getValue()))).count();
+        List<String> newKeys = reserveMasterKeys(createCount);
+        int keyIndex = 0;
+        for (ImportCandidate<MatInfoRequest> row : rows) {
+            MatInfoRequest request = row.getValue();
+            String identity = identityKey(request);
+            MatInfo entity = existingByIdentity.get(identity);
+            if (entity != null) {
+                result.setSkipped(result.getSkipped() + 1);
+                continue;
+            }
+            entity = new MatInfo();
+            entity.setMasterKey(newKeys.get(keyIndex++));
+            entity.setCreatedAt(now);
+            result.setCreated(result.getCreated() + 1);
+            apply(entity, request,
+                    vendors.get(MasterDataTextNormalizer.key(request.getShortNameSupplier())),
+                    currencies.get(MasterDataTextNormalizer.upper(request.getCurrency())));
+            entity.setActive(true);
+            entity.setDeletedAt(null);
+            entity.setDeletedBy(null);
+            entity.setUpdatedAt(now);
+            toSave.add(entity);
+        }
+        saveAllWithDuplicateProtection(toSave);
+        return result;
+    }
+
+    public byte[] exportForEdit(String buyerKey) {
+        String buyer = buyerAccess.requireBuyer(buyerKey);
+        backfillMissingMasterKeys(buyer);
+        Query query = Query.query(new Criteria().andOperator(
+                Criteria.where("buyerKey").is(buyer),
+                Criteria.where("active").ne(false)
+        ));
+        query.with(Sort.by(Sort.Order.asc("masterKey")));
+        return MasterDataEditWorkbookExporter.matInfos(mongoTemplate.find(query, MatInfo.class));
+    }
+
+    public MasterDataImportResult uploadEdited(MultipartFile file, String buyerKey) {
+        String buyer = buyerAccess.requireBuyer(buyerKey);
+        List<ImportRowError> errors = new ArrayList<>();
+        List<ImportCandidate<KeyedMatInfoRequest>> rows = parseEditedWorkbook(file, buyer, errors);
+        int totalRows = rows.size();
+        int duplicateRows = deduplicateEditedRows(rows, errors);
+
+        Set<String> requestedKeys = rows.stream().map(row -> row.getValue().masterKey)
+                .filter(value -> value != null).collect(Collectors.toSet());
+        Map<String, MatInfo> allTargets = matInfoRepository.findAllByMasterKeyIn(requestedKeys).stream()
+                .collect(Collectors.toMap(item -> normalizeMasterKey(item.getMasterKey()), item -> item));
+        Set<String> editedIdentityKeys = rows.stream()
+                .filter(row -> row.getValue().request != null && !"DELETE".equals(row.getValue().action))
+                .map(row -> identityKey(row.getValue().request)).collect(Collectors.toSet());
+        Map<String, MatInfo> existingByIdentity = existingByIdentityKey(buyer, editedIdentityKeys, false);
+        Map<String, CurrencyMaster> currencies = currencyMasterService.currentCurrencyMap();
+
+        validateEditedRows(rows, buyer, allTargets, existingByIdentity, currencies, errors);
+        if (!errors.isEmpty()) return MasterDataImportResult.rejected(MASTER_DATA_NAME, ImportMode.UPSERT, totalRows, errors);
+
+        Map<String, VendorCode> vendors = vendorMap(rows.stream()
+                .filter(row -> row.getValue().request != null && !"DELETE".equals(row.getValue().action))
+                .map(row -> row.getValue().request.getShortNameSupplier())
+                .collect(Collectors.toSet()));
+        MasterDataImportResult result = baseResult(ImportMode.UPSERT, totalRows);
+        result.setSkipped(duplicateRows);
+        int createCount = (int) rows.stream()
+                .filter(row -> "CREATE".equals(row.getValue().action))
+                .filter(row -> !existingByIdentity.containsKey(identityKey(row.getValue().request)))
+                .count();
+        List<String> newKeys = reserveMasterKeys(createCount);
+        int keyIndex = 0;
+        LocalDateTime now = LocalDateTime.now();
+        List<MatInfo> toSave = new ArrayList<>();
+
+        for (ImportCandidate<KeyedMatInfoRequest> row : rows) {
+            KeyedMatInfoRequest keyed = row.getValue();
+            MatInfo entity;
+            if ("DELETE".equals(keyed.action)) {
+                entity = allTargets.get(keyed.masterKey);
+                entity.setActive(false);
+                entity.setDeletedAt(now);
+                entity.setDeletedBy(RequestActor.current());
+                entity.setUpdatedAt(now);
+                toSave.add(entity);
+                result.setDeleted(result.getDeleted() + 1);
+                continue;
+            }
+            MatInfo duplicate = existingByIdentity.get(identityKey(keyed.request));
+            if (duplicate != null) {
+                result.setSkipped(result.getSkipped() + 1);
+                continue;
+            }
+            if ("CREATE".equals(keyed.action)) {
+                entity = new MatInfo();
+                entity.setMasterKey(newKeys.get(keyIndex++));
+                entity.setCreatedAt(now);
+                result.setCreated(result.getCreated() + 1);
+            } else {
+                entity = allTargets.get(keyed.masterKey);
+                result.setUpdated(result.getUpdated() + 1);
+            }
+            apply(entity, keyed.request,
+                    vendors.get(MasterDataTextNormalizer.key(keyed.request.getShortNameSupplier())),
+                    currencies.get(MasterDataTextNormalizer.upper(keyed.request.getCurrency())));
+            entity.setActive(true);
+            entity.setDeletedAt(null);
+            entity.setDeletedBy(null);
+            entity.setUpdatedAt(now);
+            toSave.add(entity);
+        }
+        saveAllWithDuplicateProtection(toSave);
+        return result;
+    }
+
+    private List<ImportCandidate<MatInfoRequest>> parseStandardWorkbook(
+            MultipartFile file,
+            String buyer,
+            List<ImportRowError> errors
+    ) {
+        List<ImportCandidate<MatInfoRequest>> rows = new ArrayList<>();
         try (Workbook workbook = excelSupport.openWorkbook(file)) {
             Sheet sheet = excelSupport.requiredSheet(workbook, MASTER_DATA_NAME);
             FormulaEvaluator evaluator = excelSupport.evaluator(workbook);
-
-            excelSupport.requireHeaders(
-                    sheet,
-                    evaluator,
-                    new MasterDataExcelSupport.HeaderRequirement(0, "FLEX ID"),
-                    new MasterDataExcelSupport.HeaderRequirement(1, "Material type"),
-                    new MasterDataExcelSupport.HeaderRequirement(2, "MAT FULL DESCRIPTION"),
-                    new MasterDataExcelSupport.HeaderRequirement(3, "MAT COLOR"),
-                    new MasterDataExcelSupport.HeaderRequirement(4, "MAT UNIT"),
-                    new MasterDataExcelSupport.HeaderRequirement(5, "CUR"),
-                    new MasterDataExcelSupport.HeaderRequirement(6, "MAT PRICE (W/O TAX)"),
-                    new MasterDataExcelSupport.HeaderRequirement(7, "Short name supplier"),
-                    new MasterDataExcelSupport.HeaderRequirement(8, "Remark"),
-                    new MasterDataExcelSupport.HeaderRequirement(9, "Updated Date"),
-                    new MasterDataExcelSupport.HeaderRequirement(10, "Updated PIC"),
-                    new MasterDataExcelSupport.HeaderRequirement(11, "Style Desc")
-            );
-
-            Set<String> incomingIdentityKeys = new HashSet<>();
-
+            requireStandardHeaders(sheet, evaluator, 0);
             for (int rowIndex = sheet.getFirstRowNum() + 1; rowIndex <= sheet.getLastRowNum(); rowIndex++) {
                 Row row = sheet.getRow(rowIndex);
-
-                /*
-                 * Excel often contains formatted rows after the last material.
-                 * Stop at the first row where every required business field is
-                 * blank. A partially filled row remains an error.
-                 */
-                if (isEndOfMatInfoData(row, evaluator)) {
-                    break;
-                }
-
-                totalRows++;
+                if (excelSupport.isBlank(row, 12, evaluator)) continue;
                 int excelRow = rowIndex + 1;
-
                 try {
-                    MatInfoRequest request = toRequest(row, evaluator);
+                    MatInfoRequest request = toRequest(row, evaluator, 0);
+                    request.setBuyerKey(buyer);
                     List<String> beanErrors = beanValidator.validate(request);
                     addBeanErrors(errors, excelRow, beanErrors);
-
-                    if (beanErrors.isEmpty()) {
-                        validateRequest(request);
-                    }
-
-                    String identityKey = identityKey(request);
-                    if (!incomingIdentityKeys.add(identityKey)) {
-                        errors.add(new ImportRowError(
-                                excelRow,
-                                "matInfo",
-                                "Duplicate Mat Full Description and Mat Color inside uploaded file"
-                        ));
-                    }
-
+                    if (beanErrors.isEmpty()) validateRequest(request);
                     rows.add(new ImportCandidate<>(excelRow, request));
                 } catch (RuntimeException ex) {
                     errors.add(new ImportRowError(excelRow, "row", cleanMessage(ex)));
                 }
             }
-        } catch (MasterDataValidationException ex) {
-            errors.add(new ImportRowError(1, "file", cleanMessage(ex)));
         } catch (Exception ex) {
             errors.add(new ImportRowError(1, "file", "Cannot import MAT_INFO: " + cleanMessage(ex)));
         }
-
-        Map<String, MatInfo> existingByKey = existingByIdentityKey();
-        validateBeforeApply(effectiveMode, rows, existingByKey, errors);
-
-        if (!errors.isEmpty()) {
-            return MasterDataImportResult.rejected(MASTER_DATA_NAME, effectiveMode, totalRows, errors);
-        }
-
-        /*
-         * Only after every row is valid do we add missing Vendor Code names.
-         * This avoids creating a stray vendor if another MAT_INFO row is invalid.
-         */
-        ensureVendorCodesExist(rows);
-
-        MasterDataImportResult result = new MasterDataImportResult();
-        result.setMasterData(MASTER_DATA_NAME);
-        result.setMode(effectiveMode);
-        result.setApplied(true);
-        result.setTotalRows(totalRows);
-        result.setValidRows(rows.size());
-
-        if (effectiveMode == ImportMode.REPLACE_ALL) {
-            matInfoRepository.deleteAll();
-
-            for (ImportCandidate<MatInfoRequest> row : rows) {
-                MatInfo entity = new MatInfo();
-                apply(entity, row.getValue());
-                assignMasterKeyIfMissing(entity);
-
-                LocalDateTime now = LocalDateTime.now();
-                entity.setCreatedAt(now);
-                entity.setUpdatedAt(now);
-
-                saveWithDuplicateProtection(entity);
-                result.setCreated(result.getCreated() + 1);
-            }
-
-            return result;
-        }
-
-        for (ImportCandidate<MatInfoRequest> row : rows) {
-            MatInfoRequest request = row.getValue();
-            String key = identityKey(request);
-            MatInfo existing = existingByKey.get(key);
-
-            if (existing != null) {
-                apply(existing, request);
-                assignMasterKeyIfMissing(existing);
-                existing.setUpdatedAt(LocalDateTime.now());
-
-                saveWithDuplicateProtection(existing);
-                result.setUpdated(result.getUpdated() + 1);
-            } else {
-                MatInfo entity = new MatInfo();
-                apply(entity, request);
-                assignMasterKeyIfMissing(entity);
-
-                LocalDateTime now = LocalDateTime.now();
-                entity.setCreatedAt(now);
-                entity.setUpdatedAt(now);
-
-                MatInfo saved = saveWithDuplicateProtection(entity);
-                existingByKey.put(key, saved);
-                result.setCreated(result.getCreated() + 1);
-            }
-        }
-
-        return result;
+        return rows;
     }
 
-
-    public byte[] exportForEdit() {
-        backfillMissingMasterKeys();
-        return MasterDataEditWorkbookExporter.matInfos(matInfoRepository.findAll());
-    }
-
-    /**
-     * Edited-workbook upload. Existing MI key updates that exact row. Blank
-     * key creates a new MAT_INFO row and receives the next MI key.
-     */
-    public MasterDataImportResult uploadEdited(MultipartFile file) {
-        List<ImportRowError> errors = new ArrayList<>();
+    private List<ImportCandidate<KeyedMatInfoRequest>> parseEditedWorkbook(
+            MultipartFile file,
+            String buyer,
+            List<ImportRowError> errors
+    ) {
         List<ImportCandidate<KeyedMatInfoRequest>> rows = new ArrayList<>();
-        int totalRows = 0;
-
         try (Workbook workbook = excelSupport.openWorkbook(file)) {
             Sheet sheet = excelSupport.requiredSheet(workbook, MASTER_DATA_NAME);
             FormulaEvaluator evaluator = excelSupport.evaluator(workbook);
-            excelSupport.requireHeaders(
-                    sheet,
-                    evaluator,
+            excelSupport.requireHeaders(sheet, evaluator,
                     new MasterDataExcelSupport.HeaderRequirement(0, "Key"),
-                    new MasterDataExcelSupport.HeaderRequirement(1, "FLEX ID"),
-                    new MasterDataExcelSupport.HeaderRequirement(2, "Material type"),
-                    new MasterDataExcelSupport.HeaderRequirement(3, "MAT FULL DESCRIPTION"),
-                    new MasterDataExcelSupport.HeaderRequirement(4, "MAT COLOR"),
-                    new MasterDataExcelSupport.HeaderRequirement(5, "MAT UNIT"),
-                    new MasterDataExcelSupport.HeaderRequirement(6, "CUR"),
-                    new MasterDataExcelSupport.HeaderRequirement(7, "MAT PRICE (W/O TAX)"),
-                    new MasterDataExcelSupport.HeaderRequirement(8, "Short name supplier"),
-                    new MasterDataExcelSupport.HeaderRequirement(9, "Remark"),
-                    new MasterDataExcelSupport.HeaderRequirement(10, "Updated Date"),
-                    new MasterDataExcelSupport.HeaderRequirement(11, "Updated PIC"),
-                    new MasterDataExcelSupport.HeaderRequirement(12, "Style Desc")
-            );
-
-            Set<String> incomingMasterKeys = new HashSet<>();
-            Set<String> incomingIdentityKeys = new HashSet<>();
+                    new MasterDataExcelSupport.HeaderRequirement(1, "Row Version"),
+                    new MasterDataExcelSupport.HeaderRequirement(2, "Action"));
+            requireStandardHeaders(sheet, evaluator, 3);
             for (int rowIndex = sheet.getFirstRowNum() + 1; rowIndex <= sheet.getLastRowNum(); rowIndex++) {
                 Row row = sheet.getRow(rowIndex);
-                if (isEndOfMatInfoEditData(row, evaluator)) {
-                    break;
-                }
-
-                totalRows++;
+                if (excelSupport.isBlank(row, 15, evaluator)) continue;
                 int excelRow = rowIndex + 1;
                 try {
                     KeyedMatInfoRequest keyed = new KeyedMatInfoRequest();
                     keyed.masterKey = normalizeUploadedMasterKey(excelSupport.text(row, 0, evaluator));
-                    keyed.request = toEditedRequest(row, evaluator);
-
-                    List<String> beanErrors = beanValidator.validate(keyed.request);
-                    addBeanErrors(errors, excelRow, beanErrors);
-
-                    if (beanErrors.isEmpty()) {
-                        validateRequest(keyed.request);
+                    keyed.rowVersion = optionalLong(excelSupport.text(row, 1, evaluator));
+                    keyed.action = normalizeAction(excelSupport.text(row, 2, evaluator), keyed.masterKey);
+                    keyed.request = toRequest(row, evaluator, 3);
+                    keyed.request.setBuyerKey(buyer);
+                    if (!"DELETE".equals(keyed.action)) {
+                        List<String> beanErrors = beanValidator.validate(keyed.request);
+                        addBeanErrors(errors, excelRow, beanErrors);
+                        if (beanErrors.isEmpty()) validateRequest(keyed.request);
                     }
-
-                    String identityKey = identityKey(keyed.request);
-                    if (!incomingIdentityKeys.add(identityKey)) {
-                        errors.add(new ImportRowError(
-                                excelRow,
-                                "matInfo",
-                                "Duplicate Mat Full Description and Mat Color inside uploaded file"
-                        ));
-                    }
-
-                    if (keyed.masterKey != null && !incomingMasterKeys.add(keyed.masterKey)) {
-                        errors.add(new ImportRowError(excelRow, "masterKey", "Duplicate Key inside uploaded file"));
-                    }
-
                     rows.add(new ImportCandidate<>(excelRow, keyed));
                 } catch (RuntimeException ex) {
                     errors.add(new ImportRowError(excelRow, "row", cleanMessage(ex)));
                 }
             }
-        } catch (MasterDataValidationException ex) {
-            errors.add(new ImportRowError(1, "file", cleanMessage(ex)));
         } catch (Exception ex) {
             errors.add(new ImportRowError(1, "file", "Cannot import edited MAT_INFO: " + cleanMessage(ex)));
         }
+        return rows;
+    }
 
-        validateEditedRows(rows, errors);
-        if (!errors.isEmpty()) {
-            return MasterDataImportResult.rejected(MASTER_DATA_NAME, ImportMode.UPSERT, totalRows, errors);
-        }
+    private void requireStandardHeaders(Sheet sheet, FormulaEvaluator evaluator, int offset) {
+        excelSupport.requireHeaders(sheet, evaluator,
+                new MasterDataExcelSupport.HeaderRequirement(offset, "FLEX ID"),
+                new MasterDataExcelSupport.HeaderRequirement(offset + 1, "Material type"),
+                new MasterDataExcelSupport.HeaderRequirement(offset + 2, "MAT FULL DESCRIPTION"),
+                new MasterDataExcelSupport.HeaderRequirement(offset + 3, "MAT COLOR"),
+                new MasterDataExcelSupport.HeaderRequirement(offset + 4, "MAT UNIT"),
+                new MasterDataExcelSupport.HeaderRequirement(offset + 5, "CUR"),
+                new MasterDataExcelSupport.HeaderRequirement(offset + 6, "MAT PRICE (W/O TAX)"),
+                new MasterDataExcelSupport.HeaderRequirement(offset + 7, "Short name supplier"),
+                new MasterDataExcelSupport.HeaderRequirement(offset + 8, "Remark"),
+                new MasterDataExcelSupport.HeaderRequirement(offset + 9, "Updated Date"),
+                new MasterDataExcelSupport.HeaderRequirement(offset + 10, "Updated PIC"),
+                new MasterDataExcelSupport.HeaderRequirement(offset + 11, "Style Desc"));
+    }
 
-        ensureVendorCodesExistForEdited(rows);
+    private MatInfoRequest toRequest(Row row, FormulaEvaluator evaluator, int offset) {
+        MatInfoRequest request = new MatInfoRequest();
+        request.setFlexId(excelSupport.text(row, offset, evaluator));
+        request.setMaterialType(excelSupport.text(row, offset + 1, evaluator));
+        request.setMatFullDescription(excelSupport.text(row, offset + 2, evaluator));
+        request.setMatColor(excelSupport.text(row, offset + 3, evaluator));
+        request.setMatUnit(excelSupport.text(row, offset + 4, evaluator));
+        request.setCurrency(excelSupport.text(row, offset + 5, evaluator));
+        request.setMatPriceWithoutTax(excelSupport.decimal(row, offset + 6, evaluator, request.getCurrency()));
+        request.setShortNameSupplier(excelSupport.text(row, offset + 7, evaluator));
+        request.setRemark(excelSupport.text(row, offset + 8, evaluator));
+        request.setUpdatedDate(excelSupport.localDate(row, offset + 9, evaluator));
+        request.setUpdatedPic(excelSupport.text(row, offset + 10, evaluator));
+        request.setStyleDesc(excelSupport.text(row, offset + 11, evaluator));
+        return request;
+    }
 
-        MasterDataImportResult result = new MasterDataImportResult();
-        result.setMasterData(MASTER_DATA_NAME);
-        result.setMode(ImportMode.UPSERT);
-        result.setApplied(true);
-        result.setTotalRows(totalRows);
-        result.setValidRows(rows.size());
-
-        for (ImportCandidate<KeyedMatInfoRequest> row : rows) {
-            KeyedMatInfoRequest keyed = row.getValue();
-            Optional<MatInfo> existing = keyed.masterKey == null
-                    ? Optional.empty()
-                    : matInfoRepository.findByMasterKey(keyed.masterKey);
-
-            if (existing.isPresent()) {
-                apply(existing.get(), keyed.request);
-                assignMasterKeyIfMissing(existing.get());
-                existing.get().setUpdatedAt(LocalDateTime.now());
-                saveWithDuplicateProtection(existing.get());
-                result.setUpdated(result.getUpdated() + 1);
-            } else {
-                MatInfo entity = new MatInfo();
-                apply(entity, keyed.request);
-                entity.setMasterKey(keyed.masterKey);
-                assignMasterKeyIfMissing(entity);
-                LocalDateTime now = LocalDateTime.now();
-                entity.setCreatedAt(now);
-                entity.setUpdatedAt(now);
-                saveWithDuplicateProtection(entity);
-                result.setCreated(result.getCreated() + 1);
+    private void validateReferences(
+            List<ImportCandidate<MatInfoRequest>> rows,
+            Map<String, CurrencyMaster> currencies,
+            List<ImportRowError> errors
+    ) {
+        for (ImportCandidate<MatInfoRequest> row : rows) {
+            String currency = MasterDataTextNormalizer.upper(row.getValue().getCurrency());
+            if (currency != null && !currencies.containsKey(currency)) {
+                errors.add(new ImportRowError(row.getRowNumber(), "currency", "Currency does not exist in Currency Master: " + currency));
             }
         }
-
-        return result;
-    }
-
-    private MatInfoRequest toRequest(Row row, FormulaEvaluator evaluator) {
-        MatInfoRequest request = new MatInfoRequest();
-        request.setFlexId(excelSupport.text(row, 0, evaluator));
-        request.setMaterialType(excelSupport.text(row, 1, evaluator));
-        request.setMatFullDescription(excelSupport.text(row, 2, evaluator));
-        request.setMatColor(excelSupport.text(row, 3, evaluator));
-        request.setMatUnit(excelSupport.text(row, 4, evaluator));
-        request.setCurrency(excelSupport.text(row, 5, evaluator));
-        request.setMatPriceWithoutTax(excelSupport.decimal(row, 6, evaluator));
-        request.setShortNameSupplier(excelSupport.text(row, 7, evaluator));
-        request.setRemark(excelSupport.text(row, 8, evaluator));
-        request.setUpdatedDate(excelSupport.localDate(row, 9, evaluator));
-        request.setUpdatedPic(excelSupport.text(row, 10, evaluator));
-        request.setStyleDesc(excelSupport.text(row, 11, evaluator));
-        return request;
-    }
-
-
-    private MatInfoRequest toEditedRequest(Row row, FormulaEvaluator evaluator) {
-        MatInfoRequest request = new MatInfoRequest();
-        request.setFlexId(excelSupport.text(row, 1, evaluator));
-        request.setMaterialType(excelSupport.text(row, 2, evaluator));
-        request.setMatFullDescription(excelSupport.text(row, 3, evaluator));
-        request.setMatColor(excelSupport.text(row, 4, evaluator));
-        request.setMatUnit(excelSupport.text(row, 5, evaluator));
-        request.setCurrency(excelSupport.text(row, 6, evaluator));
-        request.setMatPriceWithoutTax(excelSupport.decimal(row, 7, evaluator));
-        request.setShortNameSupplier(excelSupport.text(row, 8, evaluator));
-        request.setRemark(excelSupport.text(row, 9, evaluator));
-        request.setUpdatedDate(excelSupport.localDate(row, 10, evaluator));
-        request.setUpdatedPic(excelSupport.text(row, 11, evaluator));
-        request.setStyleDesc(excelSupport.text(row, 12, evaluator));
-        return request;
     }
 
     private void validateEditedRows(
             List<ImportCandidate<KeyedMatInfoRequest>> rows,
+            String buyer,
+            Map<String, MatInfo> allTargets,
+            Map<String, MatInfo> existingByIdentity,
+            Map<String, CurrencyMaster> currencies,
             List<ImportRowError> errors
     ) {
-        Set<String> currencyKeys = currencyMasterService.currentCurrencyCodes();
-        Map<String, MatInfo> existingByMasterKey = new HashMap<>();
-        for (MatInfo item : matInfoRepository.findAll()) {
-            if (item.getMasterKey() != null && !item.getMasterKey().isBlank()) {
-                existingByMasterKey.put(item.getMasterKey().trim().toUpperCase(Locale.ROOT), item);
-            }
-        }
-        Map<String, MatInfo> existingByIdentityKey = existingByIdentityKey();
-
         for (ImportCandidate<KeyedMatInfoRequest> row : rows) {
             KeyedMatInfoRequest keyed = row.getValue();
-            if (keyed == null || keyed.request == null) {
-                continue;
+            MatInfo target = keyed.masterKey == null ? null : allTargets.get(keyed.masterKey);
+            if ("CREATE".equals(keyed.action)) {
+                if (keyed.masterKey != null) errors.add(new ImportRowError(row.getRowNumber(), "masterKey", "CREATE must have a blank Key"));
+                if (keyed.rowVersion != null) errors.add(new ImportRowError(row.getRowNumber(), "rowVersion", "CREATE must have a blank Row Version"));
+            } else {
+                if (keyed.masterKey == null) errors.add(new ImportRowError(row.getRowNumber(), "masterKey", keyed.action + " requires a Key"));
+                else if (target == null) errors.add(new ImportRowError(row.getRowNumber(), "masterKey", "Key does not exist: " + keyed.masterKey));
+                else if (!buyer.equals(BuyerKeys.legacyDefault(target.getBuyerKey()))) errors.add(new ImportRowError(row.getRowNumber(), "masterKey", "Key belongs to another Buyer"));
+                else if (!sameVersion(keyed.rowVersion, target.getVersion())) errors.add(new ImportRowError(row.getRowNumber(), "rowVersion", "Data has changed. Download a new edit file."));
             }
-
+            if ("DELETE".equals(keyed.action) || keyed.request == null) continue;
             String currency = MasterDataTextNormalizer.upper(keyed.request.getCurrency());
-            if (currency != null && !currencyKeys.contains(currency)) {
-                errors.add(new ImportRowError(
-                        row.getRowNumber(),
-                        "currency",
-                        "Currency does not exist in Currency Master: " + keyed.request.getCurrency()
-                ));
-            }
-
-            MatInfo target = keyed.masterKey == null ? null : existingByMasterKey.get(keyed.masterKey);
-            try {
-                MatInfo duplicate = existingByIdentityKey.get(identityKey(keyed.request));
-                if (duplicate != null && (target == null || !duplicate.getId().equals(target.getId()))) {
-                    errors.add(new ImportRowError(
-                            row.getRowNumber(),
-                            "matInfo",
-                            "MAT_INFO already exists. Keep its Key to update the existing row, or change Mat Full Description / Mat Color."
-                    ));
-                }
-            } catch (RuntimeException ignored) {
-                // Required field errors are already collected per row.
-            }
+            if (currency != null && !currencies.containsKey(currency)) errors.add(new ImportRowError(row.getRowNumber(), "currency", "Currency does not exist in Currency Master: " + currency));
         }
     }
 
-    private void ensureVendorCodesExistForEdited(List<ImportCandidate<KeyedMatInfoRequest>> rows) {
-        Set<String> supplierNames = new LinkedHashSet<>();
-        for (ImportCandidate<KeyedMatInfoRequest> row : rows) {
-            String supplier = MasterDataTextNormalizer.trimToNull(row.getValue().request.getShortNameSupplier());
-            if (supplier != null) {
-                supplierNames.add(supplier);
-            }
-        }
-        for (String supplier : supplierNames) {
-            ensureVendorCodeExists(supplier);
-        }
-    }
-
-    private String normalizeUploadedMasterKey(String raw) {
-        String value = MasterDataTextNormalizer.trimToNull(raw);
-        if (value == null) {
-            return null;
-        }
-        String normalized = value.toUpperCase(Locale.ROOT);
-        if (!normalized.matches("^" + MASTER_KEY_PREFIX + "\\d+$")) {
-            throw new MasterDataValidationException("Invalid Key format: " + value + ". Expected " + MASTER_KEY_PREFIX + "000001 style.");
-        }
-        return normalized;
-    }
-
-    private void validateBeforeApply(
-            ImportMode mode,
-            List<ImportCandidate<MatInfoRequest>> rows,
-            Map<String, MatInfo> existingByKey,
-            List<ImportRowError> errors
-    ) {
-        Set<String> currencyKeys = currencyMasterService.currentCurrencyCodes();
-
-        for (ImportCandidate<MatInfoRequest> row : rows) {
-            MatInfoRequest request = row.getValue();
-
-            String currency = MasterDataTextNormalizer.upper(request.getCurrency());
-            if (currency != null && !currencyKeys.contains(currency)) {
-                errors.add(new ImportRowError(
-                        row.getRowNumber(),
-                        "currency",
-                        "Currency does not exist in Currency Master: " + request.getCurrency()
-                ));
-            }
-
-            if (mode == ImportMode.CREATE_ONLY && existingByKey.containsKey(identityKey(request))) {
-                errors.add(new ImportRowError(
-                        row.getRowNumber(),
-                        "matInfo",
-                        "MAT_INFO already exists; CREATE_ONLY does not allow updates"
-                ));
-            }
-        }
-    }
-
-    private void ensureVendorCodesExist(List<ImportCandidate<MatInfoRequest>> rows) {
-        Set<String> supplierNames = new LinkedHashSet<>();
-
-        for (ImportCandidate<MatInfoRequest> row : rows) {
-            String supplier = MasterDataTextNormalizer.trimToNull(row.getValue().getShortNameSupplier());
-            if (supplier != null) {
-                supplierNames.add(supplier);
-            }
-        }
-
-        for (String supplier : supplierNames) {
-            ensureVendorCodeExists(supplier);
-        }
-    }
-
-    /**
-     * MAT_INFO can introduce a supplier. If Vendor Code does not exist, a
-     * minimal Vendor Code record is created with its Short Name Supplier only.
-     */
-    private VendorCode ensureVendorCodeExists(String rawSupplierName) {
-        String supplierName = required(rawSupplierName, "Short name supplier is required");
-        String supplierKey = MasterDataTextNormalizer.key(supplierName);
-
-        Optional<VendorCode> existing = vendorCodeRepository.findByShortNameSupplierKey(supplierKey);
-        if (existing.isPresent()) {
-            VendorCode vendor = existing.get();
-            if (vendor.getMasterKey() == null || vendor.getMasterKey().isBlank()) {
-                vendor.setMasterKey(nextVendorMasterKey());
-                return vendorCodeRepository.save(vendor);
-            }
-            return vendor;
-        }
-
-        LocalDateTime now = LocalDateTime.now();
-        VendorCode created = new VendorCode();
-        created.setMasterKey(nextVendorMasterKey());
-        created.setShortNameSupplier(supplierName);
-        created.setShortNameSupplierKey(supplierKey);
-        created.setCreatedAt(now);
-        created.setUpdatedAt(now);
-
-        try {
-            return vendorCodeRepository.save(created);
-        } catch (DuplicateKeyException ex) {
-            return vendorCodeRepository.findByShortNameSupplierKey(supplierKey)
-                    .orElseThrow(() -> ex);
-        }
-    }
-
-    private AtomicLong masterKeyCounter() {
-        return MasterDataSequentialKey.counter(
-                matInfoRepository.findAll().stream()
-                        .map(MatInfo::getMasterKey)
-                        .collect(Collectors.toSet()),
-                MASTER_KEY_PREFIX
-        );
-    }
-
-    private void assignMasterKeyIfMissing(MatInfo entity) {
-        if (entity == null) {
-            return;
-        }
-        MasterDataSequentialKey.ensure(
-                entity::getMasterKey,
-                entity::setMasterKey,
-                masterKeyCounter(),
-                MASTER_KEY_PREFIX
-        );
-    }
-
-    private MatInfo ensureMasterKeyPersisted(MatInfo entity) {
-        if (entity == null || (entity.getMasterKey() != null && !entity.getMasterKey().isBlank())) {
-            return entity;
-        }
-        assignMasterKeyIfMissing(entity);
-        return saveWithDuplicateProtection(entity);
-    }
-
-    private void backfillMissingMasterKeys() {
-        AtomicLong counter = masterKeyCounter();
-        for (MatInfo entity : matInfoRepository.findAll()) {
-            if (entity.getMasterKey() == null || entity.getMasterKey().isBlank()) {
-                MasterDataSequentialKey.ensure(entity::getMasterKey, entity::setMasterKey, counter, MASTER_KEY_PREFIX);
-                saveWithDuplicateProtection(entity);
-            }
-        }
-    }
-
-    private String nextVendorMasterKey() {
-        AtomicLong counter = MasterDataSequentialKey.counter(
-                vendorCodeRepository.findAll().stream()
-                        .map(VendorCode::getMasterKey)
-                        .collect(Collectors.toSet()),
-                VENDOR_MASTER_KEY_PREFIX
-        );
-        return MasterDataSequentialKey.next(counter, VENDOR_MASTER_KEY_PREFIX);
-    }
-
-
-    /**
-     * End-of-data rule for the edited MAT_INFO workbook.
-     * Column 0 is the optional Key. If only formatting remains after the last
-     * data row, the Key and required business fields are all blank, so import
-     * stops. If a user leaves a Key but deletes required data, the row is still
-     * processed and validation will report the missing fields.
-     */
-    private boolean isEndOfMatInfoEditData(Row row, FormulaEvaluator evaluator) {
-        if (row == null) {
-            return true;
-        }
-
-        int[] importantColumns = {
-                0,  // Key
-                2,  // Material type
-                3,  // Mat full description
-                4,  // Mat color
-                5,  // Mat unit
-                6,  // Cur
-                8,  // Short name supplier
-                11  // Updated pic
-        };
-
-        for (int column : importantColumns) {
-            if (MasterDataTextNormalizer.trimToNull(excelSupport.text(row, column, evaluator)) != null) {
-                return false;
-            }
-        }
-
-        return true;
-    }
-
-    /**
-     * End-of-data rule for the current 12-column MAT_INFO sheet.
-     * Required columns: Material Type, Mat Full Description, Mat Color,
-     * Mat Unit, Cur, Short Name Supplier and Updated Pic.
-     */
-    private boolean isEndOfMatInfoData(Row row, FormulaEvaluator evaluator) {
-        if (row == null) {
-            return true;
-        }
-
-        int[] requiredColumns = {
-                1,  // Material type
-                2,  // Mat full description
-                3,  // Mat color
-                4,  // Mat unit
-                5,  // Cur
-                7,  // Short name supplier
-                10  // Updated pic
-        };
-
-        for (int column : requiredColumns) {
-            if (MasterDataTextNormalizer.trimToNull(excelSupport.text(row, column, evaluator)) != null) {
-                return false;
-            }
-        }
-
-        return true;
-    }
-
-    private void apply(MatInfo target, MatInfoRequest request) {
+    private void apply(MatInfo target, MatInfoRequest request, VendorCode vendor, CurrencyMaster currency) {
         validateRequest(request);
+        if (vendor == null) throw new MasterDataValidationException("Vendor Code does not exist: " + request.getShortNameSupplier());
+        if (currency == null) throw new MasterDataValidationException("Currency does not exist in Currency Master: " + request.getCurrency());
 
         String materialType = required(request.getMaterialType(), "Material type is required");
         String fullDescription = required(request.getMatFullDescription(), "MAT FULL DESCRIPTION is required");
         String matColor = required(request.getMatColor(), "MAT COLOR is required");
         String matUnit = required(request.getMatUnit(), "MAT UNIT is required").toUpperCase(Locale.ROOT);
-        String currency = required(request.getCurrency(), "Currency is required").toUpperCase(Locale.ROOT);
-        String supplier = required(request.getShortNameSupplier(), "Short name supplier is required");
+        String currencyCode = required(request.getCurrency(), "Currency is required").toUpperCase(Locale.ROOT);
         String updatedPic = required(request.getUpdatedPic(), "Updated PIC is required");
+        BigDecimal price = normalizePrice(request.getMatPriceWithoutTax());
 
-        org.bsl.sales.model.CurrencyMaster currentCurrency;
-        try {
-            currentCurrency = currencyMasterService.resolveCurrent(currency);
-        } catch (RuntimeException ex) {
-            throw new MasterDataValidationException(
-                    "Currency does not exist in Currency Master: " + currency
-            );
-        }
-
-        if (!matUnit.matches("^[A-Z0-9._/\\-]{1,20}$")) {
-            throw new MasterDataValidationException("MAT UNIT contains invalid characters");
-        }
-
-        BigDecimal price = request.getMatPriceWithoutTax();
-        if (price != null && price.signum() < 0) {
-            throw new MasterDataValidationException("MAT PRICE (W/O TAX) must not be negative");
-        }
-
-        ensureVendorCodeExists(supplier);
-
+        target.setBuyerKey(BuyerKeys.normalize(request.getBuyerKey()));
         target.setCheckingKey(identityKey(request));
         target.setFlexId(MasterDataTextNormalizer.trimToNull(request.getFlexId()));
         target.setMaterialType(materialType);
@@ -774,11 +510,11 @@ public class MatInfoService {
         target.setMatFullDescription(fullDescription);
         target.setMatColor(matColor);
         target.setMatUnit(matUnit);
-        target.setCurrencyMasterId(currentCurrency.getId());
-        target.setCurrency(currency);
-        target.setMatPriceWithoutTax(MasterDataTextNormalizer.normalizeMoney(price));
-        target.setShortNameSupplier(supplier);
-        target.setShortNameSupplierKey(MasterDataTextNormalizer.key(supplier));
+        target.setCurrencyMasterId(currency.getId());
+        target.setCurrency(currencyCode);
+        target.setMatPriceWithoutTax(price);
+        target.setShortNameSupplier(vendor.getShortNameSupplier());
+        target.setShortNameSupplierKey(vendor.getShortNameSupplierKey());
         target.setRemark(MasterDataTextNormalizer.trimToNull(request.getRemark()));
         target.setUpdatedDate(request.getUpdatedDate() == null ? LocalDate.now() : request.getUpdatedDate());
         target.setUpdatedPic(updatedPic);
@@ -786,149 +522,316 @@ public class MatInfoService {
     }
 
     private void validateRequest(MatInfoRequest request) {
-        if (request == null) {
-            throw new MasterDataValidationException("MAT_INFO request is required");
-        }
-
+        if (request == null) throw new MasterDataValidationException("MAT_INFO request is required");
         String materialType = required(request.getMaterialType(), "Material type is required");
         required(request.getMatFullDescription(), "MAT FULL DESCRIPTION is required");
         required(request.getMatColor(), "MAT COLOR is required");
-
         String unit = required(request.getMatUnit(), "MAT UNIT is required").toUpperCase(Locale.ROOT);
-        if (!unit.matches("^[A-Z0-9._/\\-]{1,20}$")) {
-            throw new MasterDataValidationException("MAT UNIT contains invalid characters");
-        }
-
+        if (!unit.matches("^[A-Z0-9._/\\-]{1,20}$")) throw new MasterDataValidationException("MAT UNIT contains invalid characters");
         String currency = required(request.getCurrency(), "Currency is required").toUpperCase(Locale.ROOT);
-        if (!currency.matches("^[A-Z]{3}$")) {
-            throw new MasterDataValidationException("Currency must be a 3-letter code");
-        }
-
+        if (!currency.matches("^[A-Z]{3}$")) throw new MasterDataValidationException("Currency must be a 3-letter code");
         required(request.getShortNameSupplier(), "Short name supplier is required");
         required(request.getUpdatedPic(), "Updated PIC is required");
-
-        if (request.getMatPriceWithoutTax() != null && request.getMatPriceWithoutTax().signum() < 0) {
-            throw new MasterDataValidationException("MAT PRICE (W/O TAX) must not be negative");
-        }
-
-        if (MasterDataTextNormalizer.materialGroupKey(materialType) == null) {
-            throw new MasterDataValidationException("Material type is required");
-        }
+        normalizePrice(request.getMatPriceWithoutTax());
+        if (MasterDataTextNormalizer.materialGroupKey(materialType) == null) throw new MasterDataValidationException("Material type is required");
     }
 
-    /**
-     * Business identity after Checking was removed.
-     * The same description + color represents the same MAT_INFO record, which
-     * matches the former Checking fallback behavior.
-     */
-    private String identityKey(MatInfoRequest request) {
-        String description = required(
-                request == null ? null : request.getMatFullDescription(),
-                "MAT FULL DESCRIPTION is required"
-        );
-        String color = required(
-                request == null ? null : request.getMatColor(),
-                "MAT COLOR is required"
-        );
+    private BigDecimal normalizePrice(BigDecimal price) {
+        if (price == null) return null;
+        if (price.signum() < 0) throw new MasterDataValidationException("MAT PRICE (W/O TAX) must not be negative");
 
-        return MasterDataTextNormalizer.key(description + " " + color);
+        // Apache POI reads numeric Excel cells as double. Remove only microscopic binary floating-point
+        // noise, while keeping the validation strict for values that genuinely contain > 6 decimals.
+        BigDecimal roundedToAllowedScale = price.setScale(MAX_PRICE_SCALE, RoundingMode.HALF_UP);
+        if (price.subtract(roundedToAllowedScale).abs().compareTo(EXCEL_FLOATING_POINT_EPSILON) <= 0) {
+            price = roundedToAllowedScale;
+        }
+
+        BigDecimal normalized = price.stripTrailingZeros();
+        int scale = Math.max(0, normalized.scale());
+        int integerDigits = Math.max(0, normalized.precision() - normalized.scale());
+        if (scale > MAX_PRICE_SCALE) throw new MasterDataValidationException("MAT PRICE (W/O TAX) supports at most 6 decimal places");
+        if (integerDigits > MAX_PRICE_INTEGER_DIGITS) throw new MasterDataValidationException("MAT PRICE (W/O TAX) is too large");
+        return MasterDataTextNormalizer.normalizeMoney(price);
+    }
+
+    private VendorCode requireVendor(String supplierName) {
+        return vendorCodeService.resolveOrCreateFromMatInfo(supplierName);
+    }
+
+    private CurrencyMaster requireCurrency(String currencyCode) {
+        try { return currencyMasterService.resolveCurrent(currencyCode); }
+        catch (RuntimeException ex) { throw new MasterDataValidationException("Currency does not exist in Currency Master: " + currencyCode); }
+    }
+
+    private Map<String, VendorCode> vendorMap(Set<String> supplierNames) {
+        return vendorCodeService.resolveOrCreateFromMatInfo(supplierNames);
+    }
+
+    private String identityKey(MatInfoRequest request) {
+        if (request == null) throw new MasterDataValidationException("MAT_INFO request is required");
+        return String.join("\u001F",
+                identityText(request.getFlexId()),
+                identityText(required(request.getMaterialType(), "Material type is required")),
+                identityText(required(request.getMatFullDescription(), "MAT FULL DESCRIPTION is required")),
+                identityText(required(request.getMatColor(), "MAT COLOR is required")),
+                identityText(required(request.getMatUnit(), "MAT UNIT is required")),
+                identityText(required(request.getCurrency(), "Currency is required")),
+                identityDecimal(normalizePrice(request.getMatPriceWithoutTax())),
+                identityText(required(request.getShortNameSupplier(), "Short name supplier is required"))
+        );
     }
 
     private String identityKey(MatInfo item) {
-        if (item == null) {
-            return null;
-        }
-
-        String description = MasterDataTextNormalizer.trimToNull(item.getMatFullDescription());
-        String color = MasterDataTextNormalizer.trimToNull(item.getMatColor());
-
-        if (description == null || color == null) {
+        if (item == null) return null;
+        if (MasterDataTextNormalizer.trimToNull(item.getMaterialType()) == null
+                || MasterDataTextNormalizer.trimToNull(item.getMatFullDescription()) == null
+                || MasterDataTextNormalizer.trimToNull(item.getMatColor()) == null
+                || MasterDataTextNormalizer.trimToNull(item.getMatUnit()) == null
+                || MasterDataTextNormalizer.trimToNull(item.getCurrency()) == null
+                || MasterDataTextNormalizer.trimToNull(item.getShortNameSupplier()) == null) {
             return MasterDataTextNormalizer.key(item.getCheckingKey());
         }
-
-        return MasterDataTextNormalizer.key(description + " " + color);
+        return String.join("\u001F",
+                identityText(item.getFlexId()),
+                identityText(item.getMaterialType()),
+                identityText(item.getMatFullDescription()),
+                identityText(item.getMatColor()),
+                identityText(item.getMatUnit()),
+                identityText(item.getCurrency()),
+                identityDecimal(item.getMatPriceWithoutTax()),
+                identityText(item.getShortNameSupplier())
+        );
     }
 
-    private Map<String, MatInfo> existingByIdentityKey() {
-        Map<String, MatInfo> result = new HashMap<>();
-
-        for (MatInfo item : matInfoRepository.findAll()) {
-            String derivedKey = identityKey(item);
-            if (derivedKey != null) {
-                result.putIfAbsent(derivedKey, item);
-            }
-
-            String storedKey = MasterDataTextNormalizer.key(item.getCheckingKey());
-            if (storedKey != null) {
-                result.putIfAbsent(storedKey, item);
-            }
+    private int deduplicateStandardRows(List<ImportCandidate<MatInfoRequest>> rows) {
+        LinkedHashMap<String, ImportCandidate<MatInfoRequest>> unique = new LinkedHashMap<>();
+        int skipped = 0;
+        for (ImportCandidate<MatInfoRequest> row : rows) {
+            String key = identityKey(row.getValue());
+            if (unique.putIfAbsent(key, row) != null) skipped++;
         }
+        rows.clear();
+        rows.addAll(unique.values());
+        return skipped;
+    }
 
+    private int deduplicateEditedRows(
+            List<ImportCandidate<KeyedMatInfoRequest>> rows,
+            List<ImportRowError> errors
+    ) {
+        LinkedHashMap<String, ImportCandidate<KeyedMatInfoRequest>> unique = new LinkedHashMap<>();
+        Map<String, String> fingerprintByMasterKey = new HashMap<>();
+        int skipped = 0;
+        for (ImportCandidate<KeyedMatInfoRequest> row : rows) {
+            KeyedMatInfoRequest keyed = row.getValue();
+            String dataIdentity = "DELETE".equals(keyed.action) || keyed.request == null
+                    ? ""
+                    : identityKey(keyed.request);
+            String fingerprint = keyed.action + "|" + dataIdentity;
+            if (keyed.masterKey != null) {
+                String previous = fingerprintByMasterKey.putIfAbsent(keyed.masterKey, fingerprint);
+                if (previous != null && !previous.equals(fingerprint)) {
+                    errors.add(new ImportRowError(
+                            row.getRowNumber(),
+                            "masterKey",
+                            "The same Key appears more than once with different data"
+                    ));
+                }
+            }
+            String rowIdentity = (keyed.masterKey == null ? "" : keyed.masterKey) + "|" + fingerprint;
+            if (unique.putIfAbsent(rowIdentity, row) != null) skipped++;
+        }
+        rows.clear();
+        rows.addAll(unique.values());
+        return skipped;
+    }
+
+    private String identityText(String value) {
+        String normalized = MasterDataTextNormalizer.key(value);
+        return normalized == null ? "" : normalized;
+    }
+
+    private String identityDecimal(BigDecimal value) {
+        if (value == null) return "";
+        return value.stripTrailingZeros().toPlainString();
+    }
+
+    private Map<String, MatInfo> existingByIdentityKey(String buyer, Set<String> identities, boolean includeAll) {
+        backfillLegacyIdentityKeys(buyer);
+        List<MatInfo> rows = includeAll
+                ? matInfoRepository.findByBuyerKey(buyer)
+                : (identities == null || identities.isEmpty()
+                    ? List.of()
+                    : matInfoRepository.findAllByBuyerKeyAndCheckingKeyIn(buyer, identities));
+        Map<String, MatInfo> result = new LinkedHashMap<>();
+        for (MatInfo item : rows) {
+            String derived = identityKey(item);
+            if (derived != null) result.putIfAbsent(derived, item);
+            String stored = MasterDataTextNormalizer.key(item.getCheckingKey());
+            if (stored != null) result.putIfAbsent(stored, item);
+        }
         return result;
+    }
+
+    private Collection<MatInfo> uniqueEntities(Map<String, MatInfo> values) {
+        LinkedHashMap<String, MatInfo> unique = new LinkedHashMap<>();
+        for (MatInfo item : values.values()) {
+            if (item != null) unique.putIfAbsent(item.getId(), item);
+        }
+        return unique.values();
+    }
+
+    private void backfillLegacyIdentityKeys(String buyer) {
+        if (!backfilledBuyers.add(buyer)) return;
+        List<MatInfo> rows = matInfoRepository.findByBuyerKey(buyer);
+        Set<String> occupied = rows.stream()
+                .map(MatInfo::getCheckingKey).map(MasterDataTextNormalizer::key)
+                .filter(value -> value != null).collect(Collectors.toSet());
+        List<MatInfo> changed = new ArrayList<>();
+        for (MatInfo item : rows) {
+            String expected = identityKey(item);
+            String current = MasterDataTextNormalizer.key(item.getCheckingKey());
+            if (expected == null || expected.equals(current)) continue;
+            if (occupied.contains(expected)) continue;
+            if (current != null) occupied.remove(current);
+            item.setCheckingKey(expected);
+            occupied.add(expected);
+            changed.add(item);
+        }
+        if (!changed.isEmpty()) saveAllWithDuplicateProtection(changed);
     }
 
     private Optional<MatInfo> findExisting(MatInfoRequest request) {
+        String buyer = BuyerKeys.normalize(request.getBuyerKey());
         String key = identityKey(request);
-
-        Optional<MatInfo> byStoredKey = matInfoRepository.findByCheckingKey(key);
-        if (byStoredKey.isPresent()) {
-            return byStoredKey;
-        }
-
-        return matInfoRepository.findAll().stream()
-                .filter(item -> key.equals(identityKey(item)))
-                .findFirst();
+        Optional<MatInfo> stored = matInfoRepository.findByBuyerKeyAndCheckingKey(buyer, key);
+        if (stored.isPresent()) return stored;
+        Query query = Query.query(Criteria.where("buyerKey").is(buyer));
+        return mongoTemplate.find(query, MatInfo.class).stream().filter(item -> key.equals(identityKey(item))).findFirst();
     }
 
     private MatInfo saveWithDuplicateProtection(MatInfo entity) {
-        try {
-            return matInfoRepository.save(entity);
-        } catch (DuplicateKeyException ex) {
-            throw new MasterDataConflictException(
-                    "MAT_INFO already exists for the same Mat Full Description and Mat Color"
-            );
+        try { return matInfoRepository.save(entity); }
+        catch (DuplicateKeyException ex) { throw new MasterDataConflictException("MAT_INFO already exists or has a duplicate Key"); }
+    }
+
+    private void saveAllWithDuplicateProtection(List<MatInfo> rows) {
+        if (rows.isEmpty()) return;
+        try { matInfoRepository.saveAll(rows); }
+        catch (DuplicateKeyException ex) { throw new MasterDataConflictException("MAT_INFO contains a duplicate business identity or Key"); }
+    }
+
+    private void backfillMissingMasterKeys(String buyer) {
+        if (!masterKeyBackfilledBuyers.add(buyer)) return;
+        Query query = new Query(new Criteria().andOperator(
+                Criteria.where("buyerKey").is(buyer),
+                new Criteria().orOperator(
+                        Criteria.where("masterKey").exists(false),
+                        Criteria.where("masterKey").is(null),
+                        Criteria.where("masterKey").is("")
+                )
+        ));
+        List<MatInfo> missing = mongoTemplate.find(query, MatInfo.class);
+        if (missing.isEmpty()) return;
+        List<String> keys = reserveMasterKeys(missing.size());
+        for (int i = 0; i < missing.size(); i++) missing.get(i).setMasterKey(keys.get(i));
+        saveAllWithDuplicateProtection(missing);
+    }
+
+    private MatInfo ensureMasterKeyPersisted(MatInfo entity) {
+        if (entity.getMasterKey() == null || entity.getMasterKey().isBlank()) {
+            entity.setMasterKey(nextMasterKey());
+            return saveWithDuplicateProtection(entity);
         }
+        return entity;
+    }
+
+    private String nextMasterKey() {
+        return sequenceService.next(SEQUENCE_NAME, MASTER_KEY_PREFIX, this::maxExistingSequence);
+    }
+
+    private List<String> reserveMasterKeys(int count) {
+        return sequenceService.reserve(SEQUENCE_NAME, MASTER_KEY_PREFIX, count, this::maxExistingSequence);
+    }
+
+    private long maxExistingSequence() {
+        Query query = new Query(Criteria.where("masterKey").regex("^" + MASTER_KEY_PREFIX + "\\d+$"));
+        query.with(Sort.by(Sort.Direction.DESC, "masterKey")).limit(1);
+        query.fields().include("masterKey");
+        MatInfo latest = mongoTemplate.findOne(query, MatInfo.class);
+        return parseSequence(latest == null ? null : latest.getMasterKey());
+    }
+
+    private long parseSequence(String key) {
+        if (key == null || !key.matches("^" + MASTER_KEY_PREFIX + "\\d+$")) return 0;
+        try { return Long.parseLong(key.substring(MASTER_KEY_PREFIX.length())); }
+        catch (NumberFormatException ex) { return 0; }
+    }
+
+    private String normalizeUploadedMasterKey(String raw) {
+        String value = MasterDataTextNormalizer.trimToNull(raw);
+        if (value == null) return null;
+        String normalized = value.toUpperCase(Locale.ROOT);
+        if (!normalized.matches("^" + MASTER_KEY_PREFIX + "\\d+$")) {
+            throw new MasterDataValidationException("Invalid Key format: " + value + ". Expected " + MASTER_KEY_PREFIX + "000001 style.");
+        }
+        return normalized;
+    }
+
+    private String normalizeMasterKey(String value) {
+        return value == null ? null : value.trim().toUpperCase(Locale.ROOT);
+    }
+
+    private String normalizeAction(String raw, String masterKey) {
+        String value = MasterDataTextNormalizer.upper(raw);
+        if (value == null) return masterKey == null ? "CREATE" : "UPDATE";
+        if (!Set.of("CREATE", "UPDATE", "DELETE").contains(value)) throw new MasterDataValidationException("Action must be CREATE, UPDATE or DELETE");
+        return value;
+    }
+
+    private Long optionalLong(String raw) {
+        String clean = MasterDataTextNormalizer.trimToNull(raw);
+        if (clean == null) return null;
+        try { return new BigDecimal(clean.replace(",", "")).longValueExact(); }
+        catch (RuntimeException ex) { throw new MasterDataValidationException("Row Version must be a whole number"); }
+    }
+
+    private boolean sameVersion(Long uploaded, Long current) {
+        return uploaded == null ? current == null : uploaded.equals(current);
+    }
+
+    private void addContainsFilter(Query query, String field, String value) {
+        String clean = MasterDataTextNormalizer.trimToNull(value);
+        if (clean != null) query.addCriteria(Criteria.where(field).regex(Pattern.compile(Pattern.quote(clean), Pattern.CASE_INSENSITIVE)));
     }
 
     private String required(String value, String message) {
-        String result = MasterDataTextNormalizer.trimToNull(value);
-        if (result == null) {
-            throw new MasterDataValidationException(message);
-        }
-        return result;
-    }
-
-    private boolean contains(String value, String normalizedSearch) {
-        if (normalizedSearch == null) {
-            return true;
-        }
-        return value != null && value.toUpperCase(Locale.ROOT).contains(normalizedSearch);
+        String clean = MasterDataTextNormalizer.trimToNull(value);
+        if (clean == null) throw new MasterDataValidationException(message);
+        return clean;
     }
 
     private Pageable toPageable(int page, int size) {
-        if (page < 0) {
-            throw new MasterDataValidationException("page must be >= 0");
-        }
-        if (size < 1 || size > 200) {
-            throw new MasterDataValidationException("size must be between 1 and 200");
-        }
+        if (page < 0) throw new MasterDataValidationException("page must be >= 0");
+        if (size < 1 || size > 200) throw new MasterDataValidationException("size must be between 1 and 200");
         return PageRequest.of(page, size);
     }
 
-    private <T> Page<T> page(List<T> items, Pageable pageable) {
-        int from = Math.min((int) pageable.getOffset(), items.size());
-        int to = Math.min(from + pageable.getPageSize(), items.size());
-        return new PageImpl<>(items.subList(from, to), pageable, items.size());
+    private MasterDataImportResult baseResult(ImportMode mode, int totalRows) {
+        MasterDataImportResult result = new MasterDataImportResult();
+        result.setMasterData(MASTER_DATA_NAME);
+        result.setMode(mode);
+        result.setApplied(true);
+        result.setTotalRows(totalRows);
+        result.setValidRows(totalRows);
+        return result;
     }
 
-    private void addBeanErrors(List<ImportRowError> errors, int row, List<String> messages) {
+    private void addBeanErrors(List<ImportRowError> errors, int row, Collection<String> messages) {
         for (String message : messages) {
             String[] parts = message.split(": ", 2);
-            errors.add(new ImportRowError(
-                    row,
-                    parts.length == 2 ? parts[0] : "row",
-                    parts.length == 2 ? parts[1] : message
-            ));
+            errors.add(new ImportRowError(row, parts.length == 2 ? parts[0] : "row", parts.length == 2 ? parts[1] : message));
         }
     }
 
@@ -937,10 +840,10 @@ public class MatInfoService {
         return message == null ? ex.getClass().getSimpleName() : message;
     }
 
-
     private static class KeyedMatInfoRequest {
         private String masterKey;
+        private Long rowVersion;
+        private String action;
         private MatInfoRequest request;
     }
-
 }

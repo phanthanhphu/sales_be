@@ -17,15 +17,19 @@ public class OrderController {
 
     @GetMapping
     public Page<SalesOrder> list(
+            @RequestParam(defaultValue = "LLBEAN") String buyerKey,
             @RequestParam(required = false) String keyword,
             @RequestParam(required = false) String season,
             @RequestParam(required = false) String status,
             @RequestParam(defaultValue = "0") int page,
             @RequestParam(defaultValue = "25") int size
-    ) { return orderService.list(keyword, season, status, page, size); }
+    ) { return orderService.list(buyerKey, keyword, season, status, page, size); }
 
     @GetMapping("/{id}")
-    public SalesOrder get(@PathVariable String id) { return orderService.get(id); }
+    public SalesOrder get(
+            @PathVariable String id,
+            @RequestParam(required = false) String buyerKey
+    ) { return orderService.get(id, buyerKey); }
 
     @PostMapping
     public ResponseEntity<SalesOrder> create(@Valid @RequestBody OrderRequest request) {

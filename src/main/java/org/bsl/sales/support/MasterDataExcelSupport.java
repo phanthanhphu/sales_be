@@ -61,14 +61,27 @@ public class MasterDataExcelSupport {
         }
     }
 
-    public Sheet requiredSheet(Workbook workbook, String expectedSheetName) {
+    public Sheet requiredSheet(Workbook workbook, String expectedSheetName, String... acceptedLegacyNames) {
+        List<String> acceptedNames = new java.util.ArrayList<>();
+        acceptedNames.add(expectedSheetName);
+        if (acceptedLegacyNames != null) {
+            acceptedNames.addAll(Arrays.asList(acceptedLegacyNames));
+        }
+
         for (int index = 0; index < workbook.getNumberOfSheets(); index++) {
             Sheet sheet = workbook.getSheetAt(index);
-            if (sheet.getSheetName().trim().equalsIgnoreCase(expectedSheetName)) {
+            String actualName = sheet.getSheetName().trim();
+            boolean matched = acceptedNames.stream()
+                    .filter(name -> name != null && !name.isBlank())
+                    .anyMatch(actualName::equalsIgnoreCase);
+            if (matched) {
                 return sheet;
             }
         }
-        throw new MasterDataValidationException("Excel does not contain required sheet: " + expectedSheetName);
+        throw new MasterDataValidationException(
+                "Excel does not contain required sheet: " + expectedSheetName
+                        + (acceptedNames.size() > 1 ? " (legacy " + String.join(" / ", acceptedNames.subList(1, acceptedNames.size())) + " is also accepted)" : "")
+        );
     }
 
     public FormulaEvaluator evaluator(Workbook workbook) {
@@ -145,6 +158,20 @@ public class MasterDataExcelSupport {
         return parseDecimal(text(row, columnIndex, evaluator), excelColumn(columnIndex));
     }
 
+    /** Reads a currency amount using the currency's common visible grouping rules. */
+    public BigDecimal decimal(Row row, int columnIndex, FormulaEvaluator evaluator, String currencyCode) {
+        Cell cell = cell(row, columnIndex);
+        if (cell == null) return null;
+        if (cell.getCellType() == CellType.NUMERIC) return BigDecimal.valueOf(cell.getNumericCellValue());
+        if (cell.getCellType() == CellType.FORMULA) {
+            CellValue result = evaluator.evaluate(cell);
+            if (result == null || result.getCellType() == CellType.BLANK) return null;
+            if (result.getCellType() == CellType.NUMERIC) return BigDecimal.valueOf(result.getNumberValue());
+            return parseCurrencyDecimal(result.getStringValue(), excelColumn(columnIndex), currencyCode);
+        }
+        return parseCurrencyDecimal(text(row, columnIndex, evaluator), excelColumn(columnIndex), currencyCode);
+    }
+
     public LocalDate localDate(Row row, int columnIndex, FormulaEvaluator evaluator) {
         Cell cell = cell(row, columnIndex);
         if (cell == null) {
@@ -195,6 +222,31 @@ public class MasterDataExcelSupport {
 
     private Cell cell(Row row, int columnIndex) {
         return row == null ? null : row.getCell(columnIndex, Row.MissingCellPolicy.RETURN_BLANK_AS_NULL);
+    }
+
+    private BigDecimal parseCurrencyDecimal(String raw, String column, String currencyCode) {
+        String value = MasterDataTextNormalizer.trimToNull(raw);
+        if (value == null) return null;
+        String code = MasterDataTextNormalizer.upper(currencyCode);
+        String normalized = value.replace(" ", "");
+        try {
+            if ("VND".equals(code)) {
+                // VND has no minor unit in this system. Accept 12.000 / 12,000 as twelve thousand.
+                normalized = normalized.replace(".", "").replace(",", "");
+            } else if (normalized.contains(",") && normalized.contains(".")) {
+                int comma = normalized.lastIndexOf(',');
+                int dot = normalized.lastIndexOf('.');
+                normalized = comma > dot
+                        ? normalized.replace(".", "").replace(',', '.')
+                        : normalized.replace(",", "");
+            } else if (normalized.contains(",")) {
+                int decimals = normalized.length() - normalized.lastIndexOf(',') - 1;
+                normalized = decimals == 3 ? normalized.replace(",", "") : normalized.replace(',', '.');
+            }
+            return new BigDecimal(normalized);
+        } catch (NumberFormatException ex) {
+            throw new MasterDataValidationException("Invalid number '" + raw + "' in column " + column);
+        }
     }
 
     private BigDecimal parseDecimal(String raw, String column) {

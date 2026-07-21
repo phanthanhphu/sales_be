@@ -23,9 +23,11 @@ public record BomLineRequest(
         String direction,
         BigDecimal costing,
         String costingUnit,
+        BigDecimal detailConsumption,
         BigDecimal consumptionNet,
         String consumptionUnit,
         String bomRemark,
+        String additionalRemark,
         List<BomLineColorValueRequest> productColorValues,
         /** Legacy compatibility only. New FE sends productColorValues. */
         Map<String, String> colorValues,
@@ -47,9 +49,11 @@ public record BomLineRequest(
         line.setDirection(direction);
         line.setCosting(costing);
         line.setCostingUnit(costingUnit);
+        line.setDetailConsumption(detailConsumption);
         line.setConsumptionNet(consumptionNet);
         line.setConsumptionUnit(consumptionUnit);
         line.setBomRemark(bomRemark);
+        line.setAdditionalRemark(additionalRemark);
         line.setProductColorValues(productColorValues == null
                 ? new ArrayList<>()
                 : productColorValues.stream().filter(item -> item != null).map(BomLineColorValueRequest::toModel).toList());

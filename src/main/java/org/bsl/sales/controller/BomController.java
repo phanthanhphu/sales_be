@@ -3,9 +3,11 @@ package org.bsl.sales.controller;
 import jakarta.validation.Valid;
 import org.bsl.sales.dto.BomCreateRequest;
 import org.bsl.sales.dto.BomLineRequest;
+import org.bsl.sales.dto.BomLinePageResponse;
 import org.bsl.sales.dto.BomPackingRequest;
 import org.bsl.sales.dto.BomProductColorRequest;
 import org.bsl.sales.model.BomDocument;
+import org.bsl.sales.model.BomLine;
 import org.bsl.sales.service.BomService;
 import org.bsl.sales.service.OrderBomMprExcelExporter;
 import org.springframework.core.io.Resource;
@@ -35,16 +37,11 @@ public class BomController {
     @PostMapping("/orders/{orderId}/boms")
     public BomDocument create(@PathVariable String orderId, @Valid @RequestBody BomCreateRequest request) { return bomService.create(orderId, request); }
 
-    @PostMapping(value = "/orders/{orderId}/boms/upload", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
-    public BomDocument upload(
-            @PathVariable String orderId,
-            @RequestParam(required = false) String bomNo,
-            @RequestParam(required = false) String bomName,
-            @RequestPart("file") MultipartFile file
-    ) { return bomService.upload(orderId, bomNo, bomName, file); }
-
     @GetMapping("/boms/{id}")
-    public BomDocument get(@PathVariable String id) { return bomService.get(id); }
+    public BomDocument get(
+            @PathVariable String id,
+            @RequestParam(required = false) String buyerKey
+    ) { return bomService.getSummary(id, buyerKey); }
 
     @PutMapping("/boms/{id}")
     public BomDocument update(@PathVariable String id, @Valid @RequestBody BomCreateRequest request) { return bomService.update(id, request); }
@@ -86,6 +83,14 @@ public class BomController {
     @DeleteMapping("/boms/{id}/packings/{packingId}")
     public BomDocument deletePacking(@PathVariable String id, @PathVariable String packingId) { return bomService.deletePacking(id, packingId); }
 
+    @GetMapping("/boms/{id}/lines")
+    public BomLinePageResponse listLines(
+            @PathVariable String id,
+            @RequestParam(required = false) String packingId,
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "100") int size
+    ) { return bomService.getLines(id, packingId, page, size); }
+
     @PostMapping("/boms/{id}/lines")
     public BomDocument addLine(@PathVariable String id, @RequestParam(required = false) String packingId, @Valid @RequestBody BomLineRequest request) { return bomService.addLine(id, packingId, request); }
 
@@ -94,6 +99,34 @@ public class BomController {
 
     @DeleteMapping("/boms/{id}/lines/{lineId}")
     public BomDocument deleteLine(@PathVariable String id, @PathVariable String lineId) { return bomService.deleteLine(id, lineId); }
+
+    @PutMapping(value = "/boms/{id}/lines/{lineId}/image", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    public BomLine uploadLineImage(
+            @PathVariable String id,
+            @PathVariable String lineId,
+            @RequestPart("file") MultipartFile file
+    ) { return bomService.uploadLineImage(id, lineId, file); }
+
+    @DeleteMapping("/boms/{id}/lines/{lineId}/image")
+    public BomLine deleteLineImage(@PathVariable String id, @PathVariable String lineId) {
+        return bomService.deleteLineImage(id, lineId);
+    }
+
+    @GetMapping("/boms/{id}/lines/{lineId}/image/{variant}")
+    public ResponseEntity<Resource> downloadLineImage(
+            @PathVariable String id,
+            @PathVariable String lineId,
+            @PathVariable String variant
+    ) {
+        BomService.LineImageResource file = bomService.downloadLineImage(id, lineId, variant);
+        String contentType = file.contentType() == null || file.contentType().isBlank()
+                ? MediaType.APPLICATION_OCTET_STREAM_VALUE : file.contentType();
+        return ResponseEntity.ok()
+                .contentType(MediaType.parseMediaType(contentType))
+                .header(HttpHeaders.CACHE_CONTROL, "private, max-age=86400")
+                .header(HttpHeaders.CONTENT_DISPOSITION, "inline; filename*=UTF-8''" + java.net.URLEncoder.encode(file.fileName(), StandardCharsets.UTF_8))
+                .body(file.resource());
+    }
 
     @PostMapping(value = "/boms/{id}/attachments", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     public BomDocument addAttachment(

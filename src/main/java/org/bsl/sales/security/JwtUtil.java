@@ -22,27 +22,33 @@ public class JwtUtil {
     private final int jwtExpirationMs = 24 * 60 * 60 * 1000;
     private final Key key = Keys.hmacShaKeyFor(jwtSecret.getBytes(StandardCharsets.UTF_8));
 
-    public String generateToken(String email, String role, long tokenVersion, Collection<String> accessPermissions) {
+    public String generateToken(String email, String role, long tokenVersion, Collection<String> accessPermissions, Collection<String> buyerKeys) {
         String normalizedRole = User.normalizeRole(role);
         List<String> normalizedPermissions = User.normalizeAccessPermissions(accessPermissions, User.ROLE_ADMIN.equals(normalizedRole));
+        List<String> normalizedBuyerKeys = User.normalizeBuyerKeys(buyerKeys, User.ROLE_ADMIN.equals(normalizedRole));
 
         return Jwts.builder()
                 .setSubject(email)
                 .claim("role", normalizedRole)
                 .claim("tokenVersion", tokenVersion)
                 .claim("accessPermissions", normalizedPermissions)
+                .claim("buyerKeys", normalizedBuyerKeys)
                 .setIssuedAt(new Date())
                 .setExpiration(new Date(System.currentTimeMillis() + jwtExpirationMs))
                 .signWith(key, SignatureAlgorithm.HS256)
                 .compact();
     }
 
+    public String generateToken(String email, String role, long tokenVersion, Collection<String> accessPermissions) {
+        return generateToken(email, role, tokenVersion, accessPermissions, List.of());
+    }
+
     public String generateToken(String email, String role, long tokenVersion) {
-        return generateToken(email, role, tokenVersion, List.of(User.ACCESS_VIEW_SYSTEM));
+        return generateToken(email, role, tokenVersion, List.of(User.ACCESS_VIEW_SYSTEM), List.of());
     }
 
     public String generateToken(String email, String role) {
-        return generateToken(email, role, 1L, List.of(User.ACCESS_VIEW_SYSTEM));
+        return generateToken(email, role, 1L, List.of(User.ACCESS_VIEW_SYSTEM), List.of());
     }
 
     public boolean validateToken(String token) {
@@ -91,6 +97,22 @@ public class JwtUtil {
     public List<String> getAccessPermissionsFromToken(String token) {
         try {
             Object raw = parse(token).getBody().get("accessPermissions");
+            if (raw instanceof Collection<?> collection) {
+                List<String> values = new ArrayList<>();
+                for (Object value : collection) values.add(String.valueOf(value));
+                return values;
+            }
+            return List.of();
+        } catch (JwtException | IllegalArgumentException exception) {
+            return List.of();
+        }
+    }
+
+
+    @SuppressWarnings("unchecked")
+    public List<String> getBuyerKeysFromToken(String token) {
+        try {
+            Object raw = parse(token).getBody().get("buyerKeys");
             if (raw instanceof Collection<?> collection) {
                 List<String> values = new ArrayList<>();
                 for (Object value : collection) values.add(String.valueOf(value));

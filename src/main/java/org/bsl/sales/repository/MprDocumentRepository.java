@@ -8,4 +8,7 @@ import java.util.Optional;
 public interface MprDocumentRepository extends MongoRepository<MprDocument, String> {
     Optional<MprDocument> findByOrderId(String orderId);
     boolean existsByOrderId(String orderId);
+    boolean existsBySelectionsBomId(String bomId);
+    boolean existsByLinesShortNameSupplierIgnoreCase(String shortNameSupplier);
+    boolean existsByLinesShipToIdsContaining(String shipToId);
 }

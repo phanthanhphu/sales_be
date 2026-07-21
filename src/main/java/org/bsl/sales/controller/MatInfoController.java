@@ -34,7 +34,11 @@ public class MatInfoController {
     }
 
     @PostMapping
-    public ResponseEntity<MatInfo> create(@Valid @RequestBody MatInfoRequest request) {
+    public ResponseEntity<MatInfo> create(
+            @RequestParam(defaultValue = "LLBEAN") String buyerKey,
+            @Valid @RequestBody MatInfoRequest request
+    ) {
+        request.setBuyerKey(buyerKey);
         return ResponseEntity.ok(matInfoService.create(request));
     }
 
@@ -45,6 +49,7 @@ public class MatInfoController {
      */
     @GetMapping
     public ResponseEntity<Page<MatInfo>> list(
+            @RequestParam(defaultValue = "LLBEAN") String buyerKey,
             @RequestParam(required = false) String masterKey,
             @RequestParam(required = false) String flexId,
             @RequestParam(required = false) String materialType,
@@ -56,6 +61,7 @@ public class MatInfoController {
     ) {
         return ResponseEntity.ok(
                 matInfoService.list(
+                        buyerKey,
                         masterKey,
                         flexId,
                         materialType,
@@ -82,8 +88,10 @@ public class MatInfoController {
     @PutMapping("/{id}")
     public ResponseEntity<MatInfo> update(
             @PathVariable String id,
+            @RequestParam(defaultValue = "LLBEAN") String buyerKey,
             @Valid @RequestBody MatInfoRequest request
     ) {
+        request.setBuyerKey(buyerKey);
         return ResponseEntity.ok(matInfoService.update(id, request));
     }
 
@@ -96,22 +104,26 @@ public class MatInfoController {
     @PostMapping(value = "/upload", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     public ResponseEntity<MasterDataImportResult> upload(
             @RequestParam("file") MultipartFile file,
-            @RequestParam(defaultValue = "CREATE_ONLY") ImportMode mode
+            @RequestParam(defaultValue = "CREATE_ONLY") ImportMode mode,
+            @RequestParam(defaultValue = "LLBEAN") String buyerKey
     ) {
-        MasterDataImportResult result = matInfoService.upload(file, mode);
+        MasterDataImportResult result = matInfoService.upload(file, mode, buyerKey);
         return result.isApplied()
                 ? ResponseEntity.ok(result)
                 : ResponseEntity.badRequest().body(result);
     }
 
     @GetMapping("/export-edit")
-    public ResponseEntity<byte[]> exportForEdit() {
-        return excelResponse("mat-info-master-edit.xlsx", matInfoService.exportForEdit());
+    public ResponseEntity<byte[]> exportForEdit(@RequestParam(defaultValue = "LLBEAN") String buyerKey) {
+        return excelResponse("mat-info-" + buyerKey + "-edit.xlsx", matInfoService.exportForEdit(buyerKey));
     }
 
     @PostMapping(value = "/upload-edited", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
-    public ResponseEntity<MasterDataImportResult> uploadEdited(@RequestParam("file") MultipartFile file) {
-        MasterDataImportResult result = matInfoService.uploadEdited(file);
+    public ResponseEntity<MasterDataImportResult> uploadEdited(
+            @RequestParam("file") MultipartFile file,
+            @RequestParam(defaultValue = "LLBEAN") String buyerKey
+    ) {
+        MasterDataImportResult result = matInfoService.uploadEdited(file, buyerKey);
         return result.isApplied()
                 ? ResponseEntity.ok(result)
                 : ResponseEntity.badRequest().body(result);

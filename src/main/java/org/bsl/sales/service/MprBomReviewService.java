@@ -42,15 +42,18 @@ public class MprBomReviewService {
 
     private final MprDocumentRepository mprRepository;
     private final BomDocumentRepository bomRepository;
+    private final BomLineStore lineStore;
     private final ProductColorMasterService productColorMasterService;
 
     public MprBomReviewService(
             MprDocumentRepository mprRepository,
             BomDocumentRepository bomRepository,
+            BomLineStore lineStore,
             ProductColorMasterService productColorMasterService
     ) {
         this.mprRepository = mprRepository;
         this.bomRepository = bomRepository;
+        this.lineStore = lineStore;
         this.productColorMasterService = productColorMasterService;
     }
 
@@ -62,7 +65,7 @@ public class MprBomReviewService {
     public void capturePendingReview(MprLine mprLine) {
         if (mprLine == null || blank(mprLine.getBomId()) || blank(mprLine.getSourceLineId())) return;
 
-        BomDocument bom = bomRepository.findById(mprLine.getBomId()).orElse(null);
+        BomDocument bom = bomRepository.findById(mprLine.getBomId()).map(lineStore::hydrate).orElse(null);
         if (bom == null) return;
         BomLine source = findSourceLine(bom, mprLine.getSourceLineId());
         if (source == null) return;
@@ -105,7 +108,9 @@ public class MprBomReviewService {
 
     /** Lists all current and historical review items for one BOM, newest first. */
     public List<MprBomReview> listForBom(String bomId) {
-        BomDocument bom = getBom(bomId);
+        // Listing review metadata only needs the lightweight BOM header; do not hydrate material lines.
+        BomDocument bom = bomRepository.findById(bomId)
+                .orElseThrow(() -> new OrderBomMprNotFoundException("BOM not found"));
         MprDocument mpr = mprRepository.findByOrderId(bom.getOrderId()).orElse(null);
         if (mpr == null) return List.of();
 
@@ -152,6 +157,8 @@ public class MprBomReviewService {
         context.bom().setUpdatedBy(RequestActor.current());
         // Keep Product Color / Child Color master links canonical after a MAT COLOR approval.
         productColorMasterService.synchronizeFromBom(context.bom());
+        lineStore.replaceAll(context.bom());
+        lineStore.compactForStorage(context.bom());
         BomDocument savedBom = bomRepository.save(context.bom());
 
         review.setStatus(APPLIED);
@@ -204,6 +211,7 @@ public class MprBomReviewService {
 
     private BomDocument getBom(String bomId) {
         return bomRepository.findById(bomId)
+                .map(lineStore::hydrate)
                 .orElseThrow(() -> new OrderBomMprNotFoundException("BOM not found"));
     }
 

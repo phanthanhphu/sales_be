@@ -9,6 +9,7 @@ import org.bsl.sales.exception.OrderBomMprNotFoundException;
 import org.bsl.sales.exception.OrderBomMprValidationException;
 import org.bsl.sales.model.*;
 import org.bsl.sales.repository.*;
+import org.bsl.sales.support.BuyerKeys;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
@@ -22,7 +23,7 @@ import java.util.stream.Collectors;
  *
  * It creates the full MPR table structure (without POUCH) and populates the
  * fields that are deterministically available from BOM, MAT_INFO, LOSS,
- * Vendor Code, and Currency Master. Stock, Ship To, Sales Comment, Sample,
+ * Vender Code, and Currency Master. Stock, Ship To, Sales Comment, Sample,
  * Due Date, and purchase calculations are intentionally left for the next
  * phase because their input sources have not been finalised.
  */
@@ -37,6 +38,7 @@ public class MprService {
     private final ShipToRepository shipToRepository;
     private final CurrencyMasterService currencyMasterService;
     private final OrderService orderService;
+    private final BomLineStore lineStore;
     private final MprBomReviewService bomReviewService;
 
     public MprService(
@@ -49,6 +51,7 @@ public class MprService {
             ShipToRepository shipToRepository,
             CurrencyMasterService currencyMasterService,
             OrderService orderService,
+            BomLineStore lineStore,
             MprBomReviewService bomReviewService
     ) {
         this.mprRepository = mprRepository;
@@ -60,13 +63,20 @@ public class MprService {
         this.shipToRepository = shipToRepository;
         this.currencyMasterService = currencyMasterService;
         this.orderService = orderService;
+        this.lineStore = lineStore;
         this.bomReviewService = bomReviewService;
     }
 
     public MprDocument getByOrder(String orderId) {
-        orderService.get(orderId);
+        SalesOrder order = orderService.get(orderId);
         MprDocument mpr = mprRepository.findByOrderId(orderId)
                 .orElseThrow(() -> new OrderBomMprNotFoundException("MPR has not been created for this order"));
+        String orderBuyer = BuyerKeys.legacyDefault(order.getBuyerKey());
+        if (mpr.getBuyerKey() == null || mpr.getBuyerKey().isBlank()) {
+            mpr.setBuyerKey(orderBuyer);
+        } else if (!orderBuyer.equals(BuyerKeys.legacyDefault(mpr.getBuyerKey()))) {
+            throw new OrderBomMprValidationException("MPR belongs to another Buyer");
+        }
         // Recalculate before returning so older saved MPR records also show the
         // same formula values as the current Excel template.
         recalculateMprCalculations(mpr);
@@ -86,10 +96,10 @@ public class MprService {
     /**
      * Create MPR is cumulative.
      *
-     * The first action creates the MPR. Every later action adds only genuinely
-     * new material rows for the selected BOM + Product Color. Core BOM rows are
-     * always included; selected Packing rows are added after Core rows. It never
-     * replaces or removes rows created in an earlier action.
+     * The first action creates the MPR. Every later action adds source BOM rows
+     * that have not already been generated for the same BOM + Product Color +
+     * Core/Packing source. Rows with identical material values are still kept
+     * when they come from different BOM rows or different Packings.
      */
     public MprDocument generate(String orderId, MprGenerateRequest request) {
         MprDocument candidate = build(orderId, request);
@@ -171,21 +181,21 @@ public class MprService {
     }
 
     /**
-     * Keeps the existing MPR item when Core and/or a later Packing points to the
-     * same material for the same Product Color. This also prevents a later Add
-     * To MPR action from adding the same procurement item a second time.
+     * Prevents only the exact same source BOM row from being added twice for the
+     * same Product Color and Core/Packing source. It intentionally does not
+     * compare material descriptions or commercial values, because two distinct
+     * BOM rows may legitimately contain identical material data.
      */
     private List<MprLine> onlyNewLines(List<MprLine> existing, List<MprLine> incoming) {
-        Map<String, BomDocument> bomCache = new HashMap<>();
         Set<String> existingKeys = safeList(existing).stream()
                 .filter(Objects::nonNull)
-                .map(line -> mprMaterialKeyForComparison(line, bomCache))
+                .map(this::mprSourceKeyForComparison)
                 .collect(Collectors.toCollection(LinkedHashSet::new));
 
         List<MprLine> result = new ArrayList<>();
         for (MprLine line : safeList(incoming)) {
             if (line == null) continue;
-            if (existingKeys.add(mprMaterialKeyForComparison(line, bomCache))) {
+            if (existingKeys.add(mprSourceKeyForComparison(line))) {
                 result.add(line);
             }
         }
@@ -193,64 +203,37 @@ public class MprService {
     }
 
     /**
-     * Supports MPR records created before sourceBomDedupKey was introduced.
-     * When their original BOM line still exists, reconstruct the same full BOM
-     * key so an Add To MPR action will not re-add an identical old Core/Packing
-     * row. If the source no longer exists, safely fall back to the legacy MPR key.
+     * New MPR rows persist a source-specific key. Older saved rows fall back to
+     * their traceability fields so upgrading does not cause the same Core or
+     * Packing source line to be added again.
      */
-    private String mprMaterialKeyForComparison(MprLine line, Map<String, BomDocument> bomCache) {
+    private String mprSourceKeyForComparison(MprLine line) {
         if (line == null) return "";
+
+        // Use traceability fields first so old and new saved MPR records produce
+        // the same key even though older sourceBomDedupKey values used a different format.
+        String color = firstNonBlank(line.getStyleColor(), line.getProductColorId());
+        if (hasText(line.getBomId()) && hasText(line.getSourceLineId())) {
+            return normalize(line.getBomId())
+                    + "|" + normalize(color)
+                    + "|" + normalize(line.getSection())
+                    + "|" + normalize(line.getPackingId())
+                    + "|" + normalize(line.getSourceLineId());
+        }
         if (hasText(line.getSourceBomDedupKey())) return line.getSourceBomDedupKey();
 
-        String bomId = trim(line.getBomId());
-        String sourceLineId = trim(line.getSourceLineId());
-        if (hasText(bomId) && hasText(sourceLineId)) {
-            BomDocument bom = bomCache.computeIfAbsent(bomId, this::findBomForDeduplication);
-            BomLine source = findBomLineById(bom, sourceLineId);
-            if (bom != null && source != null) {
-                String selectedColor = firstNonBlank(line.getStyleColor(), resolveProductColorName(bom, line.getProductColorId()));
-                String materialColor = firstNonBlank(line.getMatColor(), materialColorFor(source, bom, selectedColor));
-                return bomDuplicateKey(bom, source, selectedColor, materialColor);
-            }
-        }
+        // Legacy fallback only when old data has no source row identity.
         return mprMaterialKey(line);
     }
 
-    private BomDocument findBomForDeduplication(String bomId) {
-        return bomRepository.findById(bomId).orElse(null);
-    }
-
-    private BomLine findBomLineById(BomDocument bom, String lineId) {
-        if (bom == null || blank(lineId)) return null;
-        for (BomLine line : safeList(bom.getCoreLines())) {
-            if (line != null && lineId.equals(line.getId())) return line;
-        }
-        for (BomPacking packing : safeList(bom.getPackings())) {
-            for (BomLine line : safeList(packing == null ? null : packing.getLines())) {
-                if (line != null && lineId.equals(line.getId())) return line;
-            }
-        }
-        return null;
-    }
-
-    /**
-     * Duplicate identity is based on the full set of BOM fields that define a
-     * material row. Packing and source row are intentionally excluded: when a
-     * Core row and a selected Packing row have the same BOM data, Core wins
-     * because it is appended first. Product Color (and its resolved Child/MAT
-     * Color) are included, so rows for different colors are never merged.
-     *
-     * New MPR lines persist sourceBomDedupKey. Older saved MPRs do not have that
-     * field, so their legacy MPR fields are used as a safe fallback.
-     */
+    /** Legacy fallback key for MPR records created without source traceability. */
     private String mprMaterialKey(MprLine line) {
-        if (line != null && hasText(line.getSourceBomDedupKey())) {
-            return line.getSourceBomDedupKey();
-        }
         String color = firstNonBlank(line == null ? null : line.getProductColorId(),
                 line == null ? null : line.getStyleColor());
         return normalize(line == null ? null : line.getBomId())
                 + "|" + normalize(color)
+                + "|" + normalize(line == null ? null : line.getSection())
+                + "|" + normalize(line == null ? null : line.getPackingId())
                 + "|" + normalize(line == null ? null : line.getMaterialType())
                 + "|" + normalize(line == null ? null : line.getSapCode())
                 + "|" + normalize(line == null ? null : line.getMatFullDescription())
@@ -259,30 +242,38 @@ public class MprService {
                 + "|" + decimalKey(line == null ? null : line.getYield());
     }
 
-    /** Builds the stable duplicate key directly from the source BOM row. */
-    private String bomDuplicateKey(BomDocument bom, BomLine source, String selectedColor, String materialColor) {
+    /**
+     * Stable source identity for one selected Product Color. Packing is part of
+     * the key, so identical rows from Core, US, JAPAN, or another Packing remain
+     * separate MPR rows.
+     */
+    private String bomSourceSelectionKey(
+            BomDocument bom,
+            BomPacking packing,
+            BomLine source,
+            String selectedColor
+    ) {
+        String sourceId = source == null ? null : source.getId();
+        if (!hasText(sourceId)) {
+            sourceId = normalize(source == null || source.getMaterialGroupNo() == null
+                            ? null
+                            : String.valueOf(source.getMaterialGroupNo()))
+                    + "|" + normalize(source == null ? null : source.getDetailNo())
+                    + "|" + normalize(source == null ? null : source.getMaterialType())
+                    + "|" + normalize(source == null ? null : source.getSapCode())
+                    + "|" + normalize(source == null ? null : source.getPosition())
+                    + "|" + normalize(source == null ? null : source.getPositionDescription())
+                    + "|" + decimalKey(source == null ? null : source.getConsumptionNet())
+                    + "|" + normalize(source == null ? null : source.getConsumptionUnit());
+        }
         return normalize(bom == null ? null : bom.getId())
-                + "|" + normalize(selectedColor)                         // Product Colors / selected Style Color
-                + "|" + normalize(materialColor)                          // resolved Child Color / MAT Color
-                + "|" + normalize(source == null ? null : source.getMaterialType())
-                + "|" + normalize(source == null ? null : source.getSapCode())
-                + "|" + normalize(source == null ? null : source.getDetailNo())
-                + "|" + normalize(source == null ? null : source.getPosition())
-                + "|" + normalize(source == null ? null : source.getPositionDescription())
-                + "|" + normalize(source == null ? null : source.getPositionDescriptionExtra())
-                + "|" + normalize(source == null ? null : source.getPieceCode())
-                + "|" + decimalKey(source == null ? null : source.getDimensionX())
-                + "|" + decimalKey(source == null ? null : source.getDimensionY())
-                + "|" + decimalKey(source == null ? null : source.getQuantity())
-                + "|" + normalize(source == null ? null : source.getDirection())
-                + "|" + decimalKey(source == null ? null : source.getCosting())
-                + "|" + normalize(source == null ? null : source.getCostingUnit())
-                + "|" + decimalKey(source == null ? null : source.getConsumptionNet())
-                + "|" + normalize(source == null ? null : source.getConsumptionUnit())
-                + "|" + normalize(source == null ? null : source.getBomRemark());
+                + "|" + normalize(selectedColor)
+                + "|" + (packing == null ? "core" : "packing")
+                + "|" + normalize(packing == null ? null : packing.getId())
+                + "|" + normalize(sourceId);
     }
 
-    /** Makes 1, 1.0 and 1.000 equivalent for duplicate comparison. */
+    /** Makes 1, 1.0 and 1.000 equivalent for legacy duplicate comparison. */
     private String decimalKey(BigDecimal value) {
         return value == null ? "" : value.stripTrailingZeros().toPlainString();
     }
@@ -599,6 +590,16 @@ public class MprService {
         requireNonNegative(request.matPriceWithoutTax(), "MAT Price (W/O Tax)");
     }
 
+    private void requireLlBeanImplementation(String buyerKey, String feature) {
+        String normalizedBuyerKey = BuyerKeys.legacyDefault(buyerKey);
+        if (!BuyerKeys.LL_BEAN.equals(normalizedBuyerKey)) {
+            throw new OrderBomMprValidationException(
+                    feature + " is currently configured for L.L.BEAN only. "
+                            + "Buyer strategy has not been configured for " + normalizedBuyerKey
+            );
+        }
+    }
+
     private void requireNonNegative(BigDecimal value, String field) {
         if (value != null && value.signum() < 0) {
             throw new OrderBomMprValidationException(field + " cannot be negative");
@@ -616,10 +617,11 @@ public class MprService {
             throw new OrderBomMprValidationException("Select at least one submitted BOM");
         }
 
-        SalesOrder order = orderRepository.findById(orderId)
-                .orElseThrow(() -> new OrderBomMprNotFoundException("Order not found"));
+        SalesOrder order = orderService.get(orderId);
+        String buyerKey = BuyerKeys.legacyDefault(order.getBuyerKey());
+        requireLlBeanImplementation(buyerKey, "MPR generation");
 
-        Map<String, MatInfo> matByKey = buildMatInfoCache();
+        Map<String, MatInfo> matByKey = buildMatInfoCache(buyerKey);
         Map<String, Loss> lossByKey = lossRepository.findAll().stream()
                 .filter(Objects::nonNull)
                 .collect(Collectors.toMap(
@@ -653,7 +655,11 @@ public class MprService {
             }
 
             BomDocument bom = bomRepository.findById(selectionRequest.bomId())
+                    .map(lineStore::hydrate)
                     .orElseThrow(() -> new OrderBomMprNotFoundException("Selected BOM not found"));
+            if (!buyerKey.equals(BuyerKeys.legacyDefault(bom.getBuyerKey()))) {
+                throw new OrderBomMprValidationException("Selected BOM belongs to another Buyer");
+            }
             if (!orderId.equals(bom.getOrderId())) {
                 throw new OrderBomMprValidationException("Selected BOM does not belong to this order");
             }
@@ -696,17 +702,15 @@ public class MprService {
             selections.add(selection);
 
             /*
-             * Core (non-Packing) BOM rows are the base data for every selected
-             * Product Color. Packing is optional: selected Packing rows are added
-             * after Core rows for the same color. A duplicated procurement item
-             * (all requested BOM fields + Product Color are identical) is retained once,
-             * with the Core row winning because it is added first.
+             * Every selected Product Color receives the complete selected source
+             * structure independently:
              *
-             * Examples:
-             *   - RED, no Packing: 10 Core rows => 10 MPR rows.
-             *   - RED + US Packing: 10 Core + 20 US rows => 30 rows when unique.
-             *   - GREEN + Packing B, PURPLE + Packing K: each color stays in its
-             *     own consecutive group and is deduplicated only within that color.
+             *   Core BOM rows + every selected Packing's rows.
+             *
+             * Packing applicability metadata is not used here. For example, when
+             * Core has 15 rows and US/JAPAN have 15/20 rows, each selected color
+             * receives all 50 source rows. Identical material values are not
+             * collapsed because every BOM source row must remain traceable.
              */
             List<BomPacking> selectedPackings = new ArrayList<>();
             for (String packingId : safeList(selection.getPackingIds())) {
@@ -720,15 +724,14 @@ public class MprService {
                 selectedPackings.add(packing);
             }
 
-            // Color is the outer loop so MPR remains clearly separated by color.
+            // Color is the outer loop so every color owns one complete, consecutive block.
             for (String colorName : colors) {
                 List<MprLine> rowsForColor = new ArrayList<>();
-                Set<String> materialKeysForColor = new LinkedHashSet<>();
 
-                // 1) Always start from original BOM data without a Packing.
+                // 1) Copy every original BOM row without Packing into this color.
                 for (BomLine coreLine : safeList(bom.getCoreLines())) {
-                    appendForColorDeduplicated(
-                            rowsForColor, materialKeysForColor,
+                    appendForColor(
+                            rowsForColor,
                             bom, null, coreLine, "CORE", colorName,
                             poQtyByColor.get(colorName), sampleQuantity, selection.getBatchId(),
                             shipToIdsByColor.get(colorName), shipToByColor.get(colorName),
@@ -736,12 +739,11 @@ public class MprService {
                     );
                 }
 
-                // 2) Add only the selected Packing data that applies to this color.
+                // 2) Copy every row from every selected Packing into this same color.
                 for (BomPacking packing : selectedPackings) {
-                    if (!packingAppliesToColor(packing, bom, colorName)) continue;
                     for (BomLine packingLine : safeList(packing.getLines())) {
-                        appendForColorDeduplicated(
-                                rowsForColor, materialKeysForColor,
+                        appendForColor(
+                                rowsForColor,
                                 bom, packing, packingLine, "PACKING", colorName,
                                 poQtyByColor.get(colorName), sampleQuantity, selection.getBatchId(),
                                 shipToIdsByColor.get(colorName), shipToByColor.get(colorName),
@@ -755,6 +757,7 @@ public class MprService {
 
         MprDocument mpr = new MprDocument();
         mpr.setOrderId(order.getId());
+        mpr.setBuyerKey(buyerKey);
         mpr.setMprNo(blank(request.mprNo()) ? "MPR-" + order.getOrderNo() : request.mprNo().trim());
         mpr.setPoQuantity(totalPoQuantity);
         mpr.setSampleQuantity(sampleQuantity);
@@ -763,42 +766,6 @@ public class MprService {
         mpr.setStatus("DRAFT");
         recalculateMprCalculations(mpr);
         return mpr;
-    }
-
-    /**
-     * Appends one generated line only when its MPR procurement identity has not
-     * appeared already for the current Product Color. Core is invoked before
-     * Packing, so a Core/Packing duplicate keeps the Core source row.
-     */
-    private void appendForColorDeduplicated(
-            List<MprLine> out,
-            Set<String> materialKeys,
-            BomDocument bom,
-            BomPacking packing,
-            BomLine source,
-            String section,
-            String selectedColor,
-            BigDecimal poQuantity,
-            BigDecimal sampleQuantity,
-            String generationBatchId,
-            List<String> shipToIds,
-            String shipTo,
-            Map<String, MatInfo> matByKey,
-            Map<String, Loss> lossByKey,
-            Map<String, VendorCode> vendorByKey
-    ) {
-        int startSize = out.size();
-        appendForColor(
-                out, bom, packing, source, section, selectedColor,
-                poQuantity, sampleQuantity, generationBatchId, shipToIds, shipTo,
-                matByKey, lossByKey, vendorByKey
-        );
-        if (out.size() == startSize) return;
-
-        MprLine generatedLine = out.get(out.size() - 1);
-        if (!materialKeys.add(mprMaterialKey(generatedLine))) {
-            out.remove(out.size() - 1);
-        }
     }
 
     /** Creates one MPR row for one BOM material line and one selected Product Color. */
@@ -841,9 +808,9 @@ public class MprService {
         line.setSection(section);
         line.setProductColorId(productColorIdFor(bom, selectedColor));
         line.setGenerationBatchId(generationBatchId);
-        // Persist the full BOM-based key so Core/Packing rows are deduplicated
-        // only when every requested BOM field and Product Color are identical.
-        line.setSourceBomDedupKey(bomDuplicateKey(bom, source, selectedColor, materialColor));
+        // Persist source identity only to prevent re-adding the exact same
+        // Core/Packing source row in a later Add To MPR action.
+        line.setSourceBomDedupKey(bomSourceSelectionKey(bom, packing, source, selectedColor));
 
         // A-C are created from BOM Header and the chosen Product Color.
         String styleDescription = firstNonBlank(
@@ -923,9 +890,9 @@ public class MprService {
                 && !blank(source.getConsumptionUnit());
     }
 
-    private Map<String, MatInfo> buildMatInfoCache() {
+    private Map<String, MatInfo> buildMatInfoCache(String buyerKey) {
         Map<String, MatInfo> result = new LinkedHashMap<>();
-        for (MatInfo item : matInfoRepository.findAll()) {
+        for (MatInfo item : matInfoRepository.findByBuyerKey(buyerKey)) {
             if (item == null) continue;
             String fullKey = materialKey(item.getMaterialType(), item.getMatFullDescription(), item.getMatColor());
             result.putIfAbsent(fullKey, item);
@@ -1087,18 +1054,6 @@ public class MprService {
         return joinNonBlank(styleDescription, styleColor);
     }
 
-    private boolean packingAppliesToColor(BomPacking packing, BomDocument bom, String colorName) {
-        if (packing == null) return false;
-        String productColorId = productColorIdFor(bom, colorName);
-        List<String> productColorIds = safeList(packing.getApplicableProductColorIds());
-        if (!productColorIds.isEmpty()) {
-            return hasText(productColorId) && productColorIds.contains(productColorId);
-        }
-        List<String> legacyColors = safeList(packing.getApplicableColors());
-        if (legacyColors.isEmpty()) return true;
-        return legacyColors.stream().anyMatch(value -> normalize(value).equals(normalize(colorName)));
-    }
-
     /** Returns the Material Color written in the selected Product Color column. */
     private String materialColorFor(BomLine source, BomDocument bom, String selectedColor) {
         String colorName = resolveProductColorName(bom, selectedColor);
@@ -1207,8 +1162,10 @@ public class MprService {
 
     private BigDecimal matAmountUsd(MprLine line) {
         if (line == null || line.getMatPriceUsd() == null) return null;
-        BigDecimal amount = safe(line.getPurchaseQuantity()).multiply(line.getMatPriceUsd())
-                .add(safe(line.getSapStockQuantity()).multiply(line.getMatPriceUsd()));
+        if (line.getPurchaseQuantity() == null && line.getSapStockQuantity() == null) return null;
+        BigDecimal amount = safe(line.getPurchaseQuantity())
+                .add(safe(line.getSapStockQuantity()))
+                .multiply(line.getMatPriceUsd());
         return amount.setScale(2, RoundingMode.HALF_UP);
     }
 

@@ -14,5 +14,8 @@ public record BomProductColorRequest(
         String patternNumber,
         @NotBlank(message = "Season is required")
         @Size(max = 50, message = "Season must not exceed 50 characters")
-        String season
+        String season,
+        @Size(max = 100, message = "Style Number must not exceed 100 characters")
+        String styleNumber,
+        Integer sequence
 ) { }

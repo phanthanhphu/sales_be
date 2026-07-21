@@ -3,7 +3,9 @@ package org.bsl.sales.model;
 import com.fasterxml.jackson.annotation.JsonFormat;
 import com.fasterxml.jackson.annotation.JsonIgnore;
 import org.springframework.data.annotation.Id;
+import org.springframework.data.annotation.Version;
 import org.springframework.data.mongodb.core.index.Indexed;
+import org.springframework.data.mongodb.core.index.CompoundIndex;
 import org.springframework.data.mongodb.core.mapping.Document;
 
 import java.math.BigDecimal;
@@ -11,6 +13,7 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 
 @Document(collection = "mat_info")
+@CompoundIndex(name = "uk_mat_info_buyer_identity", def = "{'buyerKey': 1, 'checkingKey': 1}", unique = true)
 public class MatInfo {
 
     @Id
@@ -22,7 +25,7 @@ public class MatInfo {
      * exposed or entered by users.
      */
     @JsonIgnore
-    @Indexed(unique = true)
+    @Indexed
     private String checkingKey;
 
     @JsonIgnore
@@ -35,6 +38,9 @@ public class MatInfo {
 
     @Indexed(unique = true, sparse = true)
     private String masterKey;
+
+    @Indexed
+    private String buyerKey;
 
     private String flexId;
     private String materialType;
@@ -53,8 +59,14 @@ public class MatInfo {
 
     private String updatedPic;
     private String styleDesc;
+    private Boolean active = true;
+    private LocalDateTime deletedAt;
+    private String deletedBy;
     private LocalDateTime createdAt;
     private LocalDateTime updatedAt;
+
+    @Version
+    private Long version;
 
     public String getId() {
         return id;
@@ -96,6 +108,9 @@ public class MatInfo {
     public void setMasterKey(String masterKey) {
         this.masterKey = masterKey;
     }
+
+    public String getBuyerKey() { return buyerKey; }
+    public void setBuyerKey(String buyerKey) { this.buyerKey = buyerKey; }
 
     public String getFlexId() {
         return flexId;
@@ -201,6 +216,13 @@ public class MatInfo {
         this.styleDesc = styleDesc;
     }
 
+    public boolean isActive() { return !Boolean.FALSE.equals(active); }
+    public void setActive(boolean active) { this.active = active; }
+    public LocalDateTime getDeletedAt() { return deletedAt; }
+    public void setDeletedAt(LocalDateTime deletedAt) { this.deletedAt = deletedAt; }
+    public String getDeletedBy() { return deletedBy; }
+    public void setDeletedBy(String deletedBy) { this.deletedBy = deletedBy; }
+
     public LocalDateTime getCreatedAt() {
         return createdAt;
     }
@@ -216,4 +238,7 @@ public class MatInfo {
     public void setUpdatedAt(LocalDateTime updatedAt) {
         this.updatedAt = updatedAt;
     }
+
+    public Long getVersion() { return version; }
+    public void setVersion(Long version) { this.version = version; }
 }

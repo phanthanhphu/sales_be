@@ -22,15 +22,18 @@ import java.util.List;
 @EnableMethodSecurity
 public class SecurityConfig {
     private final JwtAuthenticationFilter jwtAuthenticationFilter;
+    private final AuditLogFilter auditLogFilter;
     private final RestAuthEntryPoint restAuthEntryPoint;
     private final RestAccessDeniedHandler restAccessDeniedHandler;
 
     public SecurityConfig(
             JwtAuthenticationFilter jwtAuthenticationFilter,
+            AuditLogFilter auditLogFilter,
             RestAuthEntryPoint restAuthEntryPoint,
             RestAccessDeniedHandler restAccessDeniedHandler
     ) {
         this.jwtAuthenticationFilter = jwtAuthenticationFilter;
+        this.auditLogFilter = auditLogFilter;
         this.restAuthEntryPoint = restAuthEntryPoint;
         this.restAccessDeniedHandler = restAccessDeniedHandler;
     }
@@ -51,6 +54,9 @@ public class SecurityConfig {
                         .requestMatchers("/v3/api-docs/**", "/swagger-ui/**", "/swagger-ui.html", "/swagger-resources/**", "/webjars/**").permitAll()
                         .requestMatchers("/actuator/**", "/health", "/info", "/ws/**").permitAll()
                         .requestMatchers(HttpMethod.GET, "/files/**", "/uploads/**").permitAll()
+
+                        // Audit history contains system-wide activity and is ADMIN-only.
+                        .requestMatchers("/api/audit-logs/**").hasRole("ADMIN")
 
                         // Only ADMIN may manage system users and departments.
                         .requestMatchers("/api/departments/**").hasRole("ADMIN")
@@ -74,7 +80,7 @@ public class SecurityConfig {
 
                         /*
                          * Sales workspace mutations: orders, MPR, and all Sales master data.
-                         * This covers Vendor Code, MAT Info, Ship To, Loss, Currency, Supplier,
+                         * This covers Vender Code, MAT Info, Ship To, Loss, Currency, Supplier,
                          * and Product Color. BOM-only users can still GET/read these screens.
                          */
                         .requestMatchers(HttpMethod.POST, "/api/orders/*/mpr", "/api/orders/*/mpr/**", "/api/orders", "/api/orders/*", "/api/master-data/**")
@@ -90,7 +96,8 @@ public class SecurityConfig {
                         .requestMatchers("/api/**").authenticated()
                         .anyRequest().authenticated()
                 )
-                .addFilterBefore(jwtAuthenticationFilter, UsernamePasswordAuthenticationFilter.class);
+                .addFilterBefore(jwtAuthenticationFilter, UsernamePasswordAuthenticationFilter.class)
+                .addFilterAfter(auditLogFilter, JwtAuthenticationFilter.class);
         return http.build();
     }
 
@@ -99,10 +106,7 @@ public class SecurityConfig {
         CorsConfiguration configuration = new CorsConfiguration();
         configuration.setAllowedOrigins(List.of(
                 "http://localhost:3001", "http://127.0.0.1:3001", "http://127.0.0.1:8081",
-                "http://10.232.100.68:3001", "http://10.232.100.68:8081",
-                "http://10.232.132.46:3001", "http://10.232.132.46:8081",
-                "http://10.232.132.48:3001", "http://10.232.132.48:8081",
-                "https://homepage.youngone.com.vn", "https://homepage.youngone.com.vn:3001", "https://homepage.youngone.com.vn:8081"
+                "http://10.232.132.101:3001", "https://10.232.132.101:8081"
         ));
         configuration.setAllowedMethods(List.of("GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"));
         configuration.setAllowedHeaders(List.of("*"));

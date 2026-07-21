@@ -23,6 +23,9 @@ public class MprDocument {
     @Indexed(unique = true)
     private String orderId;
 
+    @Indexed
+    private String buyerKey;
+
     private String mprNo;
     /** DRAFT | COMPLETED */
     private String status;

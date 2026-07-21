@@ -21,9 +21,9 @@ public class BomLine {
     private Integer materialGroupNo;
     /** Column B - MTR (Material Type). */
     private String materialType;
-    /** Column C - SAP CODE. */
+    /** SAP CODE: legacy column C, Image-format column D. */
     private String sapCode;
-    /** Column D - Detail No. */
+    /** Detail No.: legacy column D, Image-format column E. */
     private String detailNo;
     /** Column E - POSITION. */
     private String position;
@@ -33,24 +33,28 @@ public class BomLine {
     private String positionDescriptionExtra;
     /** Column H - P. */
     private String pieceCode;
-    /** Column I - X. */
+    /** Dimension X: legacy column I, new format column J. */
     private BigDecimal dimensionX;
-    /** Column J - Y. */
+    /** Dimension Y: legacy column J, new format column I. */
     private BigDecimal dimensionY;
     /** Column K - Q.TY. */
     private BigDecimal quantity;
     /** Column L - ><. */
     private String direction;
-    /** Column M - COSTING / MK. */
+    /** Legacy format column M - COSTING / MK. */
     private BigDecimal costing;
-    /** Column N - COSTING / UNIT. */
+    /** Legacy format column N - COSTING / UNIT. */
     private String costingUnit;
-    /** Column O - CONSUMPTION / NET. */
+    /** New format column M - detail CONS. used to calculate the MPR consumption. */
+    private BigDecimal detailConsumption;
+    /** Consumption used by MPR: legacy O/NET, new N/CONSUMPTION MPR. */
     private BigDecimal consumptionNet;
-    /** Column P - CONSUMPTION / UNIT. */
+    /** Consumption unit: legacy P, new O. */
     private String consumptionUnit;
-    /** Column Q - B.O.M REMARKS. */
+    /** Remarks on BOM: legacy Q, new P. */
     private String bomRemark;
+    /** New format trailing REMARKS column (Y in the current template). */
+    private String additionalRemark;
 
     /**
      * Product Color values linked to BomDocument.productColors[].id.
@@ -64,8 +68,14 @@ public class BomLine {
      */
     private Map<String, String> colorValues = new LinkedHashMap<>();
 
-    /** Images/files specifically attached to this material/detail line. */
+    /** Main image displayed in the dedicated Excel/UI Image column. Binary data is stored outside MongoDB. */
+    private BomImage primaryImage;
+
+    /** Other images/files specifically attached to this material/detail line. */
     private List<BomAttachment> attachments = new ArrayList<>();
+
+    /** Small denormalized count so table GET does not need another query. */
+    private int attachmentCount;
 
     /** False for a material-group line, true for a subordinate construction/detail row. */
     private boolean detailLine;

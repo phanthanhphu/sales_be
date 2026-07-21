@@ -7,6 +7,8 @@ plugins {
 group = 'org.example'
 version = '0.0.1-SNAPSHOT'
 
+layout.buildDirectory.set(file("build-local"))
+
 java {
     toolchain {
         languageVersion = JavaLanguageVersion.of(17)
@@ -47,4 +49,8 @@ dependencies {
 
 tasks.named('test') {
     useJUnitPlatform()
+}
+
+tasks.named('processResources') {
+    exclude 'keystore/**'
 }

@@ -2,6 +2,8 @@ package org.bsl.sales.config;
 
 import org.bsl.sales.exception.OrderBomMprNotFoundException;
 import org.bsl.sales.exception.OrderBomMprValidationException;
+import org.springframework.dao.DuplicateKeyException;
+import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.MethodArgumentNotValidException;
@@ -26,6 +28,11 @@ public class OrderBomMprExceptionHandler {
     @ExceptionHandler(OrderBomMprValidationException.class)
     public ResponseEntity<Map<String, Object>> validation(OrderBomMprValidationException ex) {
         return response(HttpStatus.BAD_REQUEST, ex.getMessage());
+    }
+
+    @ExceptionHandler({OptimisticLockingFailureException.class, DuplicateKeyException.class})
+    public ResponseEntity<Map<String, Object>> conflict(RuntimeException ex) {
+        return response(HttpStatus.CONFLICT, "Data was changed by another user or violates a unique constraint. Refresh and try again.");
     }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)

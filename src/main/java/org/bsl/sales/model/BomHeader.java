@@ -17,6 +17,10 @@ public class BomHeader {
     private String patternNumber;
     private String patternMaker;
     private String styleName;
+    /** New BOM format: Marker Date. */
+    private String markerDate;
+    /** New BOM format: Marker Maker. */
+    private String markerMaker;
     private String factoryProduct;
     private String bomMaker;
     private String size;

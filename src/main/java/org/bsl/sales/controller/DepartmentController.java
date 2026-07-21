@@ -6,12 +6,16 @@ import org.bsl.sales.model.User;
 import org.bsl.sales.service.DepartmentService;
 import org.bsl.sales.service.UserService;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageImpl;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
 import java.time.LocalDateTime;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -145,17 +149,20 @@ public class DepartmentController {
             @RequestParam(required = false) String userId,
             @RequestParam(required = false) String division,
             @RequestParam(required = false) String departmentName,
-            @RequestParam(defaultValue = "false") boolean skipDepartmentFilter
+            @RequestParam(defaultValue = "false") boolean skipDepartmentFilter,
+            @RequestParam(defaultValue = "false") boolean paged,
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "25") int size,
+            @RequestParam(defaultValue = "updatedAt") String sortBy,
+            @RequestParam(defaultValue = "desc") String sortDir
     ) {
         try {
             if (userId == null || userId.trim().isEmpty()) {
-                List<Department> departments = service.getAll(division, departmentName);
-
-                return ResponseEntity.ok(Map.of(
-                        "isAdmin", false,
-                        "skipDepartmentFilter", skipDepartmentFilter,
-                        "disableDepartmentSearch", true,
-                        "departments", sortDepartmentsByUpdatedAtDesc(departments)
+                Page<Department> departments = departmentPage(
+                        division, departmentName, paged, page, size, sortBy, sortDir
+                );
+                return ResponseEntity.ok(pageResponse(
+                        false, skipDepartmentFilter, true, departments
                 ));
             }
 
@@ -172,24 +179,20 @@ public class DepartmentController {
             User user = userOpt.get();
 
             if (isAdmin(user)) {
-                List<Department> departments = service.getAll(division, departmentName);
-
-                return ResponseEntity.ok(Map.of(
-                        "isAdmin", true,
-                        "skipDepartmentFilter", true,
-                        "disableDepartmentSearch", false,
-                        "departments", sortDepartmentsByUpdatedAtDesc(departments)
+                Page<Department> departments = departmentPage(
+                        division, departmentName, paged, page, size, sortBy, sortDir
+                );
+                return ResponseEntity.ok(pageResponse(
+                        true, true, false, departments
                 ));
             }
 
             if (skipDepartmentFilter) {
-                List<Department> departments = service.getAll(division, departmentName);
-
-                return ResponseEntity.ok(Map.of(
-                        "isAdmin", false,
-                        "skipDepartmentFilter", true,
-                        "disableDepartmentSearch", false,
-                        "departments", sortDepartmentsByUpdatedAtDesc(departments)
+                Page<Department> departments = departmentPage(
+                        division, departmentName, paged, page, size, sortBy, sortDir
+                );
+                return ResponseEntity.ok(pageResponse(
+                        false, true, false, departments
                 ));
             }
 
@@ -210,11 +213,16 @@ public class DepartmentController {
                         .body(Map.of("status", 404, "message", "Department not found"));
             }
 
-            return ResponseEntity.ok(Map.of(
-                    "isAdmin", false,
-                    "skipDepartmentFilter", false,
-                    "disableDepartmentSearch", true,
-                    "departments", List.of(department)
+            int safePage = Math.max(0, page);
+            int safeSize = Math.max(1, Math.min(size, 200));
+            List<Department> content = safePage == 0 ? List.of(department) : List.of();
+            Page<Department> departments = new PageImpl<>(
+                    content,
+                    PageRequest.of(safePage, safeSize),
+                    1
+            );
+            return ResponseEntity.ok(pageResponse(
+                    false, false, true, departments
             ));
 
         } catch (Exception ex) {
@@ -224,6 +232,46 @@ public class DepartmentController {
                             "message", "Failed to search departments: " + ex.getMessage()
                     ));
         }
+    }
+
+    private Page<Department> departmentPage(
+            String division,
+            String departmentName,
+            boolean paged,
+            int page,
+            int size,
+            String sortBy,
+            String sortDir
+    ) {
+        if (paged) {
+            return service.searchPage(division, departmentName, page, size, sortBy, sortDir);
+        }
+
+        List<Department> departments = sortDepartmentsByUpdatedAtDesc(
+                service.getAll(division, departmentName)
+        );
+        int legacySize = Math.max(1, departments.size());
+        return new PageImpl<>(departments, PageRequest.of(0, legacySize), departments.size());
+    }
+
+    private Map<String, Object> pageResponse(
+            boolean isAdmin,
+            boolean skipDepartmentFilter,
+            boolean disableDepartmentSearch,
+            Page<Department> page
+    ) {
+        Map<String, Object> response = new LinkedHashMap<>();
+        response.put("isAdmin", isAdmin);
+        response.put("skipDepartmentFilter", skipDepartmentFilter);
+        response.put("disableDepartmentSearch", disableDepartmentSearch);
+        response.put("departments", page.getContent());
+        response.put("page", page.getNumber());
+        response.put("size", page.getSize());
+        response.put("totalElements", page.getTotalElements());
+        response.put("totalPages", page.getTotalPages());
+        response.put("first", page.isFirst());
+        response.put("last", page.isLast());
+        return response;
     }
 
     private List<Department> sortDepartmentsByUpdatedAtDesc(List<Department> departments) {

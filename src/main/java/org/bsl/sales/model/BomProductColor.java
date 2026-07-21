@@ -16,10 +16,14 @@ public class BomProductColor {
     private String colorName;
     /** Optional Product Color Master selected for a manually created BOM color. */
     private String productColorMasterId;
-    /** Excel row directly below the color header, for example LLB 352 A. */
+    /** Pattern Number for this Product Color column. */
     private String patternNumber;
-    /** Excel row below Pattern Number, for example F26. */
+    /** Season for this Product Color column. */
     private String season;
+    /** New BOM format: Style Number stored for this Product Color column. */
+    private String styleNumber;
+    /** New BOM format: business display order (1, 2, 3...). */
+    private Integer sequence;
     /** Zero-based original Excel column, retained to patch the source template on export. */
     private Integer sourceColumnIndex;
 }

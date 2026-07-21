@@ -11,6 +11,8 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Set;
 
+import org.bsl.sales.support.BuyerKeys;
+
 @Document(collection = "users")
 public class User {
     public static final String ROLE_ADMIN = "ADMIN";
@@ -39,6 +41,9 @@ public class User {
      * VIEW_SYSTEM is read-only and intentionally exclusive.
      */
     private List<String> accessPermissions = new ArrayList<>();
+
+    /** Buyers this USER may access. ADMIN always receives all active Buyers. */
+    private List<String> buyerKeys = new ArrayList<>();
 
     public static String normalizeRole(String value) {
         if (value == null || value.trim().isEmpty()) {
@@ -80,6 +85,19 @@ public class User {
             return List.of(ACCESS_VIEW_SYSTEM);
         }
 
+        return new ArrayList<>(normalized);
+    }
+
+
+    public static List<String> normalizeBuyerKeys(Collection<String> values, boolean admin) {
+        if (admin) return new ArrayList<>(BuyerKeys.DEFAULT_KEYS);
+        Set<String> normalized = new LinkedHashSet<>();
+        if (values != null) {
+            for (String value : values) {
+                if (value == null || value.trim().isEmpty()) continue;
+                normalized.add(BuyerKeys.normalize(value));
+            }
+        }
         return new ArrayList<>(normalized);
     }
 
@@ -143,5 +161,17 @@ public class User {
 
     public void setAccessPermissions(List<String> accessPermissions) {
         this.accessPermissions = new ArrayList<>(normalizeAccessPermissions(accessPermissions, isAdminRole()));
+    }
+
+    public List<String> getBuyerKeys() {
+        return normalizeBuyerKeys(buyerKeys, isAdminRole());
+    }
+
+    public void setBuyerKeys(List<String> buyerKeys) {
+        this.buyerKeys = new ArrayList<>(normalizeBuyerKeys(buyerKeys, isAdminRole()));
+    }
+
+    public boolean canAccessBuyer(String buyerKey) {
+        return isAdminRole() || getBuyerKeys().contains(BuyerKeys.normalize(buyerKey));
     }
 }

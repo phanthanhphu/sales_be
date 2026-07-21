@@ -4,6 +4,7 @@ import com.fasterxml.jackson.annotation.JsonIgnore;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 import org.springframework.data.annotation.Id;
+import org.springframework.data.annotation.Version;
 import org.springframework.data.mongodb.core.index.Indexed;
 import org.springframework.data.mongodb.core.mapping.Document;
 
@@ -17,15 +18,26 @@ public class ShipTo {
     @Id
     private String id;
 
+    @Indexed(unique = true, sparse = true)
+    private String masterKey;
+
     /** Normalised unique value so duplicated Ship To names cannot be created. */
     @JsonIgnore
     @Indexed(unique = true)
     private String shipToNameKey;
 
+    @JsonIgnore
+    @Indexed(unique = true, sparse = true)
+    private String shipToCodeKey;
+
+    @Indexed
     private String shipToCode;
     private String shipToName;
     private boolean active = true;
     private String remark;
     private LocalDateTime createdAt;
     private LocalDateTime updatedAt;
+
+    @Version
+    private Long version;
 }

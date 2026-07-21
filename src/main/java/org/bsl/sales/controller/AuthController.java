@@ -39,7 +39,7 @@ public class AuthController {
             return ResponseEntity.status(401).body(Map.of("message", "Email or password is incorrect"));
         }
 
-        String token = jwtUtil.generateToken(user.getEmail(), user.getRole(), user.getTokenVersion(), user.getAccessPermissions());
+        String token = jwtUtil.generateToken(user.getEmail(), user.getRole(), user.getTokenVersion(), user.getAccessPermissions(), user.getBuyerKeys());
         Map<String, Object> response = new LinkedHashMap<>();
         response.put("token", token);
         response.put("user", userService.toUserDTO(user));

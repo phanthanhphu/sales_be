@@ -3,18 +3,31 @@ package org.bsl.sales.service;
 import org.bsl.sales.model.Department;
 import org.bsl.sales.repository.DepartmentRepository;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageImpl;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.domain.Sort;
+import org.springframework.data.mongodb.core.MongoTemplate;
+import org.springframework.data.mongodb.core.query.Criteria;
+import org.springframework.data.mongodb.core.query.Query;
 import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
+import java.util.regex.Pattern;
 
 @Service
 public class DepartmentService {
 
     @Autowired
     private DepartmentRepository repository;
+
+    @Autowired
+    private MongoTemplate mongoTemplate;
 
     public Department create(String division, String departmentName) {
         division = division != null ? division.trim() : "";
@@ -97,6 +110,45 @@ public class DepartmentService {
         int toIndex = Math.min(fromIndex + size, result.size());
 
         return result.subList(fromIndex, toIndex);
+    }
+
+    public Page<Department> searchPage(
+            String division,
+            String departmentName,
+            int page,
+            int size,
+            String sortBy,
+            String sortDir
+    ) {
+        int safePage = Math.max(0, page);
+        int safeSize = Math.max(1, Math.min(size, 200));
+        String requestedSortBy = sortBy == null ? "" : sortBy.trim();
+        String safeSortBy = Set.of("division", "departmentName", "createdAt", "updatedAt")
+                .contains(requestedSortBy) ? requestedSortBy : "updatedAt";
+        Sort.Direction direction = "asc".equalsIgnoreCase(sortDir)
+                ? Sort.Direction.ASC
+                : Sort.Direction.DESC;
+        Pageable pageable = PageRequest.of(safePage, safeSize, Sort.by(direction, safeSortBy));
+
+        Query query = new Query();
+        String cleanDivision = division == null ? "" : division.trim();
+        String cleanDepartmentName = departmentName == null ? "" : departmentName.trim();
+
+        if (!cleanDivision.isEmpty()) {
+            query.addCriteria(Criteria.where("division").regex(
+                    Pattern.compile(Pattern.quote(cleanDivision), Pattern.CASE_INSENSITIVE)
+            ));
+        }
+        if (!cleanDepartmentName.isEmpty()) {
+            query.addCriteria(Criteria.where("departmentName").regex(
+                    Pattern.compile(Pattern.quote(cleanDepartmentName), Pattern.CASE_INSENSITIVE)
+            ));
+        }
+
+        long total = mongoTemplate.count(query, Department.class);
+        query.with(pageable);
+        List<Department> content = mongoTemplate.find(query, Department.class);
+        return new PageImpl<>(content, pageable, total);
     }
 
     public Department getById(String id) {

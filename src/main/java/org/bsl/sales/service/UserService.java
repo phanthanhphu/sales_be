@@ -34,6 +34,7 @@ public class UserService {
         }
         user.setRole(user.getRole());
         user.setAccessPermissions(user.getAccessPermissions());
+        user.setBuyerKeys(user.getBuyerKeys());
         return userRepository.save(user);
     }
 
@@ -52,6 +53,7 @@ public class UserService {
         existing.setPhone(data.getPhone());
         existing.setRole(data.getRole());
         existing.setAccessPermissions(data.getAccessPermissions());
+        existing.setBuyerKeys(data.getBuyerKeys());
         existing.setDepartmentId(data.getDepartmentId());
         existing.setEnabled(data.isEnabled());
         existing.setTokenVersion(data.getTokenVersion() > 0 ? data.getTokenVersion() : existing.getTokenVersion());
@@ -137,6 +139,7 @@ public class UserService {
         dto.setEnabled(user.isEnabled());
         dto.setDepartmentId(user.getDepartmentId());
         dto.setAccessPermissions(user.getAccessPermissions());
+        dto.setBuyerKeys(user.getBuyerKeys());
         dto.setCanManageBom(user.canManageBom());
         dto.setCanManageSales(user.canManageSales());
         dto.setViewOnly(user.isViewOnly());

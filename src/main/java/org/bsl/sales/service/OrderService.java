@@ -7,6 +7,8 @@ import org.bsl.sales.model.SalesOrder;
 import org.bsl.sales.repository.BomDocumentRepository;
 import org.bsl.sales.repository.MprDocumentRepository;
 import org.bsl.sales.repository.SalesOrderRepository;
+import org.bsl.sales.security.BuyerAccessService;
+import org.bsl.sales.support.BuyerKeys;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.PageRequest;
@@ -24,24 +26,28 @@ public class OrderService {
     private final SalesOrderRepository orderRepository;
     private final BomDocumentRepository bomRepository;
     private final MprDocumentRepository mprRepository;
+    private final BuyerAccessService buyerAccess;
 
     public OrderService(
             SalesOrderRepository orderRepository,
             BomDocumentRepository bomRepository,
-            MprDocumentRepository mprRepository
+            MprDocumentRepository mprRepository,
+            BuyerAccessService buyerAccess
     ) {
         this.orderRepository = orderRepository;
         this.bomRepository = bomRepository;
         this.mprRepository = mprRepository;
+        this.buyerAccess = buyerAccess;
     }
 
-    public Page<SalesOrder> list(String keyword, String season, String status, int page, int size) {
+    public Page<SalesOrder> list(String buyerKey, String keyword, String season, String status, int page, int size) {
+        String allowedBuyer = buyerAccess.requireBuyer(buyerKey);
         Pageable pageable = PageRequest.of(Math.max(0, page), Math.max(1, Math.min(size, 200)));
         String keywordKey = key(keyword);
         String seasonKey = key(season);
         String statusKey = key(status);
 
-        List<SalesOrder> rows = orderRepository.findAll().stream()
+        List<SalesOrder> rows = orderRepository.findByBuyerKey(allowedBuyer).stream()
                 .filter(order -> keywordKey == null || contains(order.getOrderNo(), keywordKey)
                         || contains(order.getStyle(), keywordKey)
                         || contains(order.getCustomer(), keywordKey))
@@ -56,18 +62,36 @@ public class OrderService {
     }
 
     public SalesOrder get(String id) {
-        return orderRepository.findById(id)
+        SalesOrder order = orderRepository.findById(id)
                 .orElseThrow(() -> new OrderBomMprNotFoundException("Order not found"));
+        buyerAccess.requireEntityAccess(order.getBuyerKey());
+        if (order.getBuyerKey() == null || order.getBuyerKey().isBlank()) {
+            order.setBuyerKey(BuyerKeys.LL_BEAN);
+        }
+        return order;
+    }
+
+    public SalesOrder get(String id, String expectedBuyerKey) {
+        SalesOrder order = get(id);
+        if (expectedBuyerKey != null && !expectedBuyerKey.isBlank()) {
+            String expected = buyerAccess.requireBuyer(expectedBuyerKey);
+            if (!expected.equals(BuyerKeys.legacyDefault(order.getBuyerKey()))) {
+                throw new OrderBomMprNotFoundException("Order not found for Buyer " + expected);
+            }
+        }
+        return order;
     }
 
     public SalesOrder create(OrderRequest request) {
+        String buyerKey = buyerAccess.requireBuyer(request.buyerKey());
         String orderNo = required(request.orderNo(), "Order No is required");
         String orderNoKey = key(orderNo);
-        if (orderRepository.existsByOrderNoKey(orderNoKey)) {
-            throw new OrderBomMprValidationException("Order No already exists: " + orderNo);
+        if (existsOrderNo(buyerKey, orderNoKey, null)) {
+            throw new OrderBomMprValidationException("Order No already exists for this Buyer: " + orderNo);
         }
         LocalDateTime now = LocalDateTime.now();
         SalesOrder entity = new SalesOrder();
+        entity.setBuyerKey(buyerKey);
         entity.setOrderNo(orderNo);
         entity.setOrderNoKey(orderNoKey);
         apply(entity, request);
@@ -81,10 +105,21 @@ public class OrderService {
 
     public SalesOrder update(String id, OrderRequest request) {
         SalesOrder entity = get(id);
+        String requestedBuyer = request.buyerKey() == null || request.buyerKey().isBlank()
+                ? BuyerKeys.legacyDefault(entity.getBuyerKey())
+                : buyerAccess.requireBuyer(request.buyerKey());
         String newKey = key(required(request.orderNo(), "Order No is required"));
-        if (!newKey.equals(entity.getOrderNoKey()) && orderRepository.existsByOrderNoKey(newKey)) {
-            throw new OrderBomMprValidationException("Order No already exists: " + request.orderNo());
+        if (existsOrderNo(requestedBuyer, newKey, id)) {
+            throw new OrderBomMprValidationException("Order No already exists for this Buyer: " + request.orderNo());
         }
+        String currentBuyer = BuyerKeys.legacyDefault(entity.getBuyerKey());
+        if (!currentBuyer.equals(requestedBuyer)
+                && (bomRepository.countByOrderId(id) > 0 || mprRepository.existsByOrderId(id))) {
+            throw new OrderBomMprValidationException(
+                    "Cannot move an Order to another Buyer while BOM or MPR data exists"
+            );
+        }
+        entity.setBuyerKey(requestedBuyer);
         entity.setOrderNo(required(request.orderNo(), "Order No is required"));
         entity.setOrderNoKey(newKey);
         apply(entity, request);
@@ -107,9 +142,7 @@ public class OrderService {
         SalesOrder order = get(orderId);
         if (!"MPR_COMPLETED".equals(order.getStatus())) {
             order.setStatus("BOM_IN_PROGRESS");
-            order.setUpdatedAt(LocalDateTime.now());
-            order.setUpdatedBy(RequestActor.current());
-            orderRepository.save(order);
+            touch(order);
         }
     }
 
@@ -117,18 +150,26 @@ public class OrderService {
         SalesOrder order = get(orderId);
         if (!"MPR_COMPLETED".equals(order.getStatus())) {
             order.setStatus("BOM_SUBMITTED");
-            order.setUpdatedAt(LocalDateTime.now());
-            order.setUpdatedBy(RequestActor.current());
-            orderRepository.save(order);
+            touch(order);
         }
     }
 
     public void markMprDraft(String orderId) {
         SalesOrder order = get(orderId);
         order.setStatus("MPR_DRAFT");
+        touch(order);
+    }
+
+    private void touch(SalesOrder order) {
         order.setUpdatedAt(LocalDateTime.now());
         order.setUpdatedBy(RequestActor.current());
         orderRepository.save(order);
+    }
+
+    private boolean existsOrderNo(String buyerKey, String orderNoKey, String excludedId) {
+        return orderRepository.findByBuyerKeyAndOrderNoKey(buyerKey, orderNoKey)
+                .filter(item -> !String.valueOf(item.getId()).equals(String.valueOf(excludedId)))
+                .isPresent();
     }
 
     private void apply(SalesOrder entity, OrderRequest request) {

@@ -15,6 +15,9 @@ import java.time.LocalDate;
  */
 public class MatInfoRequest {
 
+    @Size(max = 40, message = "Buyer Key must not exceed 40 characters")
+    private String buyerKey;
+
     @Size(max = 100, message = "Flex ID must not exceed 100 characters")
     private String flexId;
 
@@ -58,6 +61,9 @@ public class MatInfoRequest {
 
     @Size(max = 500, message = "Style Desc must not exceed 500 characters")
     private String styleDesc;
+
+    public String getBuyerKey() { return buyerKey; }
+    public void setBuyerKey(String buyerKey) { this.buyerKey = buyerKey; }
 
     public String getFlexId() {
         return flexId;

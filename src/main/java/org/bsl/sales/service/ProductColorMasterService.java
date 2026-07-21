@@ -15,10 +15,13 @@ import org.bsl.sales.model.ProductColorAttribute;
 import org.bsl.sales.model.ProductColorMaster;
 import org.bsl.sales.repository.BomDocumentRepository;
 import org.bsl.sales.repository.ProductColorMasterRepository;
+import org.bsl.sales.security.BuyerAccessService;
+import org.bsl.sales.support.BuyerKeys;
 import org.springframework.core.io.Resource;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
+import org.springframework.data.domain.Sort;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
@@ -45,41 +48,64 @@ public class ProductColorMasterService {
     private final ProductColorMasterRepository repository;
     private final BomDocumentRepository bomRepository;
     private final BomFileStorageService fileStorage;
+    private final BuyerAccessService buyerAccess;
 
     public ProductColorMasterService(
             ProductColorMasterRepository repository,
             BomDocumentRepository bomRepository,
-            BomFileStorageService fileStorage
+            BomFileStorageService fileStorage,
+            BuyerAccessService buyerAccess
     ) {
         this.repository = repository;
         this.bomRepository = bomRepository;
         this.fileStorage = fileStorage;
+        this.buyerAccess = buyerAccess;
     }
 
     public Page<ProductColorMaster> list(
+            String buyerKey,
             String productColor,
             int page,
-            int size
+            int size,
+            String sortBy,
+            String sortDir
     ) {
-        Pageable pageable = PageRequest.of(Math.max(0, page), Math.min(Math.max(1, size), 200));
+        String allowedBuyer = buyerAccess.requireBuyer(buyerKey);
+        int safePage = Math.max(0, page);
+        int safeSize = Math.min(Math.max(1, size), 200);
+        String safeSortBy = normalizeProductColorSortField(sortBy);
+        Sort.Direction direction = "asc".equalsIgnoreCase(trim(sortDir))
+                ? Sort.Direction.ASC
+                : Sort.Direction.DESC;
+        Pageable pageable = PageRequest.of(safePage, safeSize, Sort.by(direction, safeSortBy));
         Page<ProductColorMaster> result = blank(productColor)
-                ? repository.findAll(pageable)
-                : repository.findByProductColorContainingIgnoreCase(trim(productColor), pageable);
-        return result.map(item -> ensureChildColorIds(item));
+                ? repository.findByBuyerKey(allowedBuyer, pageable)
+                : repository.findByBuyerKeyAndProductColorContainingIgnoreCase(allowedBuyer, trim(productColor), pageable);
+        return result.map(this::ensureChildColorIds);
+    }
+
+    private String normalizeProductColorSortField(String sortBy) {
+        String field = trim(sortBy);
+        return switch (field) {
+            case "patternNumber", "productColor", "season", "styleNumber", "createdAt", "updatedAt" -> field;
+            default -> "updatedAt";
+        };
     }
 
     public ProductColorMaster get(String id) {
         ProductColorMaster entity = repository.findById(id)
                 .orElseThrow(() -> new MasterDataNotFoundException("Product Color Master not found"));
+        buyerAccess.requireEntityAccess(entity.getBuyerKey());
+        if (entity.getBuyerKey() == null || entity.getBuyerKey().isBlank()) entity.setBuyerKey(BuyerKeys.LL_BEAN);
         return ensureChildColorIds(entity);
     }
 
     public ProductColorMaster create(ProductColorMasterRequest request) {
+        String buyerKey = buyerAccess.requireBuyer(request == null ? null : request.buyerKey());
         ProductColorMaster entity = fromRequest(new ProductColorMaster(), request);
-        if (repository.findByMasterKey(entity.getMasterKey())
-                .or(() -> repository.findFirstByProductColorIgnoreCase(entity.getProductColor()))
-                .isPresent()) {
-            throw new MasterDataConflictException("Product Color already exists.");
+        entity.setBuyerKey(buyerKey);
+        if (findExact(entity).isPresent()) {
+            throw new MasterDataConflictException("The same Pattern Number, Product Color, Season and Style Number already exists.");
         }
         LocalDateTime now = LocalDateTime.now();
         entity.setCreatedAt(now);
@@ -89,12 +115,26 @@ public class ProductColorMasterService {
 
     public ProductColorMaster update(String id, ProductColorMasterRequest request) {
         ProductColorMaster entity = get(id);
+        String previousIdentityKey = keyFor(entity);
+        String currentBuyer = BuyerKeys.legacyDefault(entity.getBuyerKey());
+        String buyerKey = request == null || blank(request.buyerKey())
+                ? currentBuyer
+                : buyerAccess.requireBuyer(request.buyerKey());
+        if (!currentBuyer.equals(buyerKey)) {
+            throw new MasterDataValidationException("Product Color cannot be moved to another Buyer");
+        }
         fromRequest(entity, request);
-        repository.findByMasterKey(entity.getMasterKey())
-                .or(() -> repository.findFirstByProductColorIgnoreCase(entity.getProductColor()))
+        entity.setBuyerKey(currentBuyer);
+        if (!previousIdentityKey.equals(entity.getMasterKey())
+                && bomRepository.existsByProductColorsProductColorMasterId(entity.getId())) {
+            throw new MasterDataConflictException(
+                    "Cannot change Pattern Number, Product Color, Season or Style Number while this master is linked to a BOM"
+            );
+        }
+        findExact(entity)
                 .filter(item -> !item.getId().equals(entity.getId()))
                 .ifPresent(item -> {
-                    throw new MasterDataConflictException("Product Color already exists.");
+                    throw new MasterDataConflictException("The same Pattern Number, Product Color, Season and Style Number already exists.");
                 });
         entity.setUpdatedAt(LocalDateTime.now());
         return repository.save(entity);
@@ -220,6 +260,11 @@ public class ProductColorMasterService {
      */
     public void applyToBom(BomDocument bom, BomProductColor productColor, ProductColorMaster master) {
         if (bom == null || productColor == null || master == null) return;
+        if (!productColorMatchesMaster(productColor, master)) {
+            throw new MasterDataValidationException(
+                    "Pattern Number, Product Color, Season and Style Number must match the selected Product Color Master"
+            );
+        }
         master = ensureLegacyImageFromBom(master, bom, productColor);
         productColor.setProductColorMasterId(master.getId());
         linkBomValuesToMaster(bom, productColor, master);
@@ -227,7 +272,11 @@ public class ProductColorMasterService {
 
     private ProductColorMaster candidateFromBom(BomDocument bom, BomProductColor productColor) {
         ProductColorMaster candidate = new ProductColorMaster();
+        candidate.setBuyerKey(BuyerKeys.legacyDefault(bom.getBuyerKey()));
+        candidate.setPatternNumber(trim(productColor.getPatternNumber()));
         candidate.setProductColor(trim(productColor.getColorName()));
+        candidate.setSeason(trim(productColor.getSeason()));
+        candidate.setStyleNumber(trim(productColor.getStyleNumber()));
         candidate.setMasterKey(keyFor(candidate));
         candidate.setChildColors(childColorsFromBom(bom, productColor));
         candidate.setActive(true);
@@ -237,30 +286,40 @@ public class ProductColorMasterService {
     private ProductColorMaster upsertCandidate(ProductColorMaster candidate, String preferredMasterId) {
         LocalDateTime now = LocalDateTime.now();
 
-        // A manually selected master remains the parent. It receives any new
-        // Child Colors found in the BOM but does not get replaced by a second
-        // master simply because the current BOM header differs slightly.
+        // Reuse the preferred master only when all four identity fields match.
+        // A different Pattern Number, Product Color, Season or Style Number
+        // must link to a different Product Color Master record.
         if (!blank(preferredMasterId)) {
             Optional<ProductColorMaster> preferred = repository.findById(trim(preferredMasterId));
-            if (preferred.isPresent()) {
+            if (preferred.isPresent()
+                    && BuyerKeys.legacyDefault(preferred.get().getBuyerKey()).equals(candidate.getBuyerKey())
+                    && keyFor(preferred.get()).equals(candidate.getMasterKey())) {
                 ProductColorMaster entity = ensureChildColorIds(preferred.get());
+                entity.setPatternNumber(candidate.getPatternNumber());
+                entity.setProductColor(candidate.getProductColor());
+                entity.setSeason(candidate.getSeason());
+                entity.setStyleNumber(candidate.getStyleNumber());
+                entity.setMasterKey(candidate.getMasterKey());
                 entity.setChildColors(mergeChildColors(entity.getChildColors(), candidate.getChildColors()));
                 entity.setUpdatedAt(now);
                 return repository.save(entity);
             }
         }
 
-        Optional<ProductColorMaster> existing = repository.findByMasterKey(candidate.getMasterKey())
-                .or(() -> repository.findFirstByProductColorIgnoreCase(candidate.getProductColor()));
+        Optional<ProductColorMaster> existing = findExact(candidate);
         if (existing.isPresent()) {
             ProductColorMaster entity = ensureChildColorIds(existing.get());
+            entity.setPatternNumber(candidate.getPatternNumber());
             entity.setProductColor(candidate.getProductColor());
-            entity.setMasterKey(keyFor(entity));
+            entity.setSeason(candidate.getSeason());
+            entity.setStyleNumber(candidate.getStyleNumber());
+            entity.setMasterKey(candidate.getMasterKey());
             entity.setChildColors(mergeChildColors(entity.getChildColors(), candidate.getChildColors()));
             entity.setUpdatedAt(now);
             return repository.save(entity);
         }
 
+        candidate.setBuyerKey(BuyerKeys.legacyDefault(candidate.getBuyerKey()));
         candidate.setChildColors(normalizeChildColors(candidate.getChildColors()));
         candidate.setCreatedAt(now);
         candidate.setUpdatedAt(now);
@@ -383,7 +442,10 @@ public class ProductColorMasterService {
 
     private boolean productColorMatchesMaster(BomProductColor productColor, ProductColorMaster master) {
         if (productColor == null || master == null) return false;
-        return normalize(productColor.getColorName()).equals(normalize(master.getProductColor()));
+        return normalize(productColor.getPatternNumber()).equals(normalize(master.getPatternNumber()))
+                && normalize(productColor.getColorName()).equals(normalize(master.getProductColor()))
+                && normalize(productColor.getSeason()).equals(normalize(master.getSeason()))
+                && normalize(productColor.getStyleNumber()).equals(normalize(master.getStyleNumber()));
     }
 
     private BomAttachment findLegacyColorImage(
@@ -416,7 +478,10 @@ public class ProductColorMasterService {
 
     private ProductColorMaster fromRequest(ProductColorMaster entity, ProductColorMasterRequest request) {
         if (request == null) throw new MasterDataValidationException("Product Color data is required");
+        entity.setPatternNumber(trim(request.patternNumber()));
         entity.setProductColor(required(request.productColor(), "Product Color is required"));
+        entity.setSeason(trim(request.season()));
+        entity.setStyleNumber(trim(request.styleNumber()));
         entity.setActive(request.active() == null || request.active());
         entity.setChildColors(toChildColors(request.childColors()));
         entity.setMasterKey(keyFor(entity));
@@ -487,8 +552,26 @@ public class ProductColorMasterService {
         return repository.save(master);
     }
 
+    private Optional<ProductColorMaster> findExact(ProductColorMaster item) {
+        if (item == null) return Optional.empty();
+        return repository.findByBuyerKeyAndMasterKey(item.getBuyerKey(), keyFor(item))
+                .or(() -> repository.findFirstByBuyerKeyAndPatternNumberIgnoreCaseAndProductColorIgnoreCaseAndSeasonIgnoreCaseAndStyleNumberIgnoreCase(
+                        item.getBuyerKey(),
+                        trim(item.getPatternNumber()),
+                        trim(item.getProductColor()),
+                        trim(item.getSeason()),
+                        trim(item.getStyleNumber())
+                ));
+    }
+
     private String keyFor(ProductColorMaster item) {
-        return normalize(item == null ? null : item.getProductColor());
+        if (item == null) return "";
+        return String.join("\u001F",
+                normalize(item.getPatternNumber()),
+                normalize(item.getProductColor()),
+                normalize(item.getSeason()),
+                normalize(item.getStyleNumber())
+        );
     }
 
     private void validateImage(MultipartFile file) {

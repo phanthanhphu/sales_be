@@ -11,62 +11,74 @@ import org.bsl.sales.dto.VendorCodeRequest;
 import org.bsl.sales.exception.MasterDataConflictException;
 import org.bsl.sales.exception.MasterDataNotFoundException;
 import org.bsl.sales.exception.MasterDataValidationException;
-import org.bsl.sales.model.MprDocument;
-import org.bsl.sales.model.MprLine;
 import org.bsl.sales.model.VendorCode;
 import org.bsl.sales.repository.MatInfoRepository;
 import org.bsl.sales.repository.MprDocumentRepository;
 import org.bsl.sales.repository.VendorCodeRepository;
 import org.bsl.sales.support.ImportCandidate;
 import org.bsl.sales.support.MasterDataBeanValidator;
-import org.bsl.sales.support.MasterDataExcelSupport;
 import org.bsl.sales.support.MasterDataEditWorkbookExporter;
-import org.bsl.sales.support.MasterDataSequentialKey;
+import org.bsl.sales.support.MasterDataExcelSupport;
 import org.bsl.sales.support.MasterDataTextNormalizer;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
+import org.springframework.data.domain.Sort;
+import org.springframework.data.mongodb.core.MongoTemplate;
+import org.springframework.data.mongodb.core.query.Criteria;
+import org.springframework.data.mongodb.core.query.Query;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.time.LocalDateTime;
 import java.util.ArrayList;
-import java.util.Comparator;
+import java.util.Collection;
 import java.util.HashMap;
-import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 @Service
 public class VendorCodeService {
 
-    private static final String MASTER_DATA_NAME = "VENDOR CODE";
+    private static final String MASTER_DATA_NAME = "VENDER CODE";
+    private static final String LEGACY_MASTER_DATA_NAME = "VENDOR CODE";
     private static final String MASTER_KEY_PREFIX = "VC";
+    private static final String SEQUENCE_NAME = "vendor_code";
+    private static final String AUTO_CREATED_REMARK = "Auto-created from MAT_INFO. Please complete Vendor Code, Vendor Name and Mat Charger.";
 
     private final VendorCodeRepository vendorCodeRepository;
     private final MatInfoRepository matInfoRepository;
     private final MprDocumentRepository mprDocumentRepository;
     private final MasterDataBeanValidator beanValidator;
     private final MasterDataExcelSupport excelSupport;
+    private final MongoTemplate mongoTemplate;
+    private final MasterDataSequenceService sequenceService;
+    private volatile boolean masterKeysBackfilled;
 
     public VendorCodeService(
             VendorCodeRepository vendorCodeRepository,
             MatInfoRepository matInfoRepository,
             MprDocumentRepository mprDocumentRepository,
             MasterDataBeanValidator beanValidator,
-            MasterDataExcelSupport excelSupport
+            MasterDataExcelSupport excelSupport,
+            MongoTemplate mongoTemplate,
+            MasterDataSequenceService sequenceService
     ) {
         this.vendorCodeRepository = vendorCodeRepository;
         this.matInfoRepository = matInfoRepository;
         this.mprDocumentRepository = mprDocumentRepository;
         this.beanValidator = beanValidator;
         this.excelSupport = excelSupport;
+        this.mongoTemplate = mongoTemplate;
+        this.sequenceService = sequenceService;
     }
 
     public VendorCode create(VendorCodeRequest request) {
@@ -74,20 +86,15 @@ public class VendorCodeService {
         if (vendorCodeRepository.existsByShortNameSupplierKey(key)) {
             throw new MasterDataConflictException("Short name supplier already exists: " + request.getShortNameSupplier());
         }
-
-        VendorCode vendorCode = new VendorCode();
-        apply(vendorCode, request);
-        assignMasterKeyIfMissing(vendorCode);
+        VendorCode entity = new VendorCode();
+        apply(entity, request);
+        entity.setMasterKey(nextMasterKey());
         LocalDateTime now = LocalDateTime.now();
-        vendorCode.setCreatedAt(now);
-        vendorCode.setUpdatedAt(now);
-        return vendorCodeRepository.save(vendorCode);
+        entity.setCreatedAt(now);
+        entity.setUpdatedAt(now);
+        return vendorCodeRepository.save(entity);
     }
 
-    /**
-     * Field-specific filters avoid one broad all-column keyword search.
-     * All supplied filters are combined with AND logic.
-     */
     public Page<VendorCode> list(
             String masterKey,
             String shortNameSupplier,
@@ -99,47 +106,62 @@ public class VendorCodeService {
     ) {
         backfillMissingMasterKeys();
         Pageable pageable = toPageable(page, size);
-        String masterKeySearch = MasterDataTextNormalizer.key(masterKey);
-        String shortNameSearch = MasterDataTextNormalizer.key(shortNameSupplier);
-        String vendorCodeSearch = MasterDataTextNormalizer.key(vendorCode);
-        String vendorNameSearch = MasterDataTextNormalizer.key(vendorName);
-        String chargerSearch = MasterDataTextNormalizer.key(matCharger);
-
-        List<VendorCode> filtered = vendorCodeRepository.findAll().stream()
-                .filter(item -> contains(item.getMasterKey(), masterKeySearch))
-                .filter(item -> contains(item.getShortNameSupplier(), shortNameSearch))
-                .filter(item -> contains(item.getVendorCode(), vendorCodeSearch))
-                .filter(item -> contains(item.getVendorName(), vendorNameSearch))
-                .filter(item -> contains(item.getMatCharger(), chargerSearch))
-                .sorted(Comparator.comparing(VendorCode::getShortNameSupplier, String.CASE_INSENSITIVE_ORDER))
-                .collect(Collectors.toList());
-
-        return page(filtered, pageable);
+        Query query = new Query();
+        addContainsFilter(query, "masterKey", masterKey);
+        addContainsFilter(query, "shortNameSupplier", shortNameSupplier);
+        addContainsFilter(query, "vendorCode", vendorCode);
+        addContainsFilter(query, "vendorName", vendorName);
+        addContainsFilter(query, "matCharger", matCharger);
+        long total = mongoTemplate.count(query, VendorCode.class);
+        query.with(Sort.by(Sort.Order.asc("shortNameSupplier")));
+        query.skip(pageable.getOffset()).limit(pageable.getPageSize());
+        return new PageImpl<>(mongoTemplate.find(query, VendorCode.class), pageable, total);
     }
 
-    /**
-     * Compatibility overload for the legacy Supplier endpoint.
-     * The main Vendor Code screen uses the field-specific method above.
-     */
     public Page<VendorCode> list(String keyword, int page, int size) {
-        String search = MasterDataTextNormalizer.trimToNull(keyword);
-        if (search == null) {
-            return list(null, null, null, null, null, page, size);
-        }
-
+        String clean = MasterDataTextNormalizer.trimToNull(keyword);
+        if (clean == null) return list(null, null, null, null, null, page, size);
         backfillMissingMasterKeys();
         Pageable pageable = toPageable(page, size);
-        String normalized = MasterDataTextNormalizer.key(search);
-        List<VendorCode> filtered = vendorCodeRepository.findAll().stream()
-                .filter(item -> contains(item.getMasterKey(), normalized)
-                        || contains(item.getShortNameSupplier(), normalized)
-                        || contains(item.getVendorCode(), normalized)
-                        || contains(item.getVendorName(), normalized)
-                        || contains(item.getMatCharger(), normalized))
-                .sorted(Comparator.comparing(VendorCode::getShortNameSupplier, String.CASE_INSENSITIVE_ORDER))
-                .collect(Collectors.toList());
+        Pattern pattern = containsPattern(clean);
+        Query query = Query.query(new Criteria().orOperator(
+                Criteria.where("masterKey").regex(pattern),
+                Criteria.where("shortNameSupplier").regex(pattern),
+                Criteria.where("vendorCode").regex(pattern),
+                Criteria.where("vendorName").regex(pattern),
+                Criteria.where("matCharger").regex(pattern)
+        ));
+        long total = mongoTemplate.count(query, VendorCode.class);
+        query.with(Sort.by(Sort.Order.asc("shortNameSupplier")));
+        query.skip(pageable.getOffset()).limit(pageable.getPageSize());
+        return new PageImpl<>(mongoTemplate.find(query, VendorCode.class), pageable, total);
+    }
 
-        return page(filtered, pageable);
+    /** Lightweight lookup used by MAT_INFO and MPR Vendor Code selectors. */
+    public List<VendorCode> options(String keyword, int limit) {
+        int safeLimit = Math.max(1, Math.min(limit, 5000));
+        Query query = new Query();
+        String clean = MasterDataTextNormalizer.trimToNull(keyword);
+        if (clean != null) {
+            Pattern pattern = containsPattern(clean);
+            query.addCriteria(new Criteria().orOperator(
+                    Criteria.where("masterKey").regex(pattern),
+                    Criteria.where("shortNameSupplier").regex(pattern),
+                    Criteria.where("vendorCode").regex(pattern),
+                    Criteria.where("vendorName").regex(pattern)
+            ));
+        }
+        query.with(Sort.by(Sort.Order.asc("pendingCompletion"), Sort.Order.asc("shortNameSupplier")));
+        query.limit(safeLimit);
+        query.fields()
+                .include("masterKey")
+                .include("shortNameSupplier")
+                .include("vendorCode")
+                .include("vendorName")
+                .include("matCharger")
+                .include("pendingCompletion")
+                .include("autoCreatedFromMatInfo");
+        return mongoTemplate.find(query, VendorCode.class);
     }
 
     public VendorCode getById(String id) {
@@ -150,42 +172,125 @@ public class VendorCodeService {
 
     public VendorCode resolve(String shortNameSupplier) {
         String key = MasterDataTextNormalizer.key(shortNameSupplier);
-        if (key == null) {
-            throw new MasterDataValidationException("shortNameSupplier is required");
-        }
+        if (key == null) throw new MasterDataValidationException("shortNameSupplier is required");
         VendorCode entity = vendorCodeRepository.findByShortNameSupplierKey(key)
                 .orElseThrow(() -> new MasterDataNotFoundException("Supplier not found: " + shortNameSupplier));
         return ensureMasterKeyPersisted(entity);
     }
 
+    /**
+     * MAT_INFO is allowed to introduce a new supplier name. Missing suppliers are created
+     * in one batch with a generated VC key and marked as pending completion.
+     */
+    public Map<String, VendorCode> resolveOrCreateFromMatInfo(Collection<String> supplierNames) {
+        LinkedHashMap<String, String> requested = new LinkedHashMap<>();
+        if (supplierNames != null) {
+            for (String supplierName : supplierNames) {
+                String cleanName = MasterDataTextNormalizer.trimToNull(supplierName);
+                String key = MasterDataTextNormalizer.key(cleanName);
+                if (key != null) requested.putIfAbsent(key, cleanName);
+            }
+        }
+        if (requested.isEmpty()) return Map.of();
+
+        final Map<String, VendorCode> result = new LinkedHashMap<>();
+        putVendorsBySupplierKey(
+                result,
+                vendorCodeRepository.findAllByShortNameSupplierKeyIn(requested.keySet())
+        );
+
+        List<String> missingKeys = requested.keySet().stream()
+                .filter(key -> !result.containsKey(key))
+                .toList();
+        if (!missingKeys.isEmpty()) {
+            List<String> masterKeys = reserveMasterKeys(missingKeys.size());
+            LocalDateTime now = LocalDateTime.now();
+            List<VendorCode> newVendors = new ArrayList<>(missingKeys.size());
+            for (int index = 0; index < missingKeys.size(); index++) {
+                String supplierKey = missingKeys.get(index);
+                VendorCode vendor = new VendorCode();
+                vendor.setMasterKey(masterKeys.get(index));
+                vendor.setShortNameSupplier(requested.get(supplierKey));
+                vendor.setShortNameSupplierKey(supplierKey);
+                vendor.setPendingCompletion(true);
+                vendor.setAutoCreatedFromMatInfo(true);
+                vendor.setRemark(AUTO_CREATED_REMARK);
+                vendor.setCreatedAt(now);
+                vendor.setUpdatedAt(now);
+                newVendors.add(vendor);
+            }
+            try {
+                vendorCodeRepository.saveAll(newVendors);
+            } catch (DuplicateKeyException ignored) {
+                // Another request may have created one of the same supplier names concurrently.
+                // Re-querying below returns the surviving records without failing MAT_INFO.
+            }
+            result.clear();
+            putVendorsBySupplierKey(
+                    result,
+                    vendorCodeRepository.findAllByShortNameSupplierKeyIn(requested.keySet())
+            );
+
+            List<String> remaining = requested.keySet().stream()
+                    .filter(key -> !result.containsKey(key))
+                    .toList();
+            if (!remaining.isEmpty()) {
+                List<String> retryMasterKeys = reserveMasterKeys(remaining.size());
+                for (int index = 0; index < remaining.size(); index++) {
+                    String supplierKey = remaining.get(index);
+                    VendorCode vendor = new VendorCode();
+                    vendor.setMasterKey(retryMasterKeys.get(index));
+                    vendor.setShortNameSupplier(requested.get(supplierKey));
+                    vendor.setShortNameSupplierKey(supplierKey);
+                    vendor.setPendingCompletion(true);
+                    vendor.setAutoCreatedFromMatInfo(true);
+                    vendor.setRemark(AUTO_CREATED_REMARK);
+                    vendor.setCreatedAt(now);
+                    vendor.setUpdatedAt(now);
+                    try {
+                        VendorCode saved = vendorCodeRepository.save(vendor);
+                        result.put(supplierKey, saved);
+                    } catch (DuplicateKeyException ignored) {
+                        vendorCodeRepository.findByShortNameSupplierKey(supplierKey)
+                                .ifPresent(existing -> result.put(supplierKey, existing));
+                    }
+                }
+            }
+        }
+
+        for (Map.Entry<String, String> entry : requested.entrySet()) {
+            if (!result.containsKey(entry.getKey())) {
+                throw new MasterDataValidationException("Unable to create Vendor Code for supplier: " + entry.getValue());
+            }
+        }
+        return result;
+    }
+
+    public VendorCode resolveOrCreateFromMatInfo(String supplierName) {
+        String key = MasterDataTextNormalizer.key(supplierName);
+        if (key == null) throw new MasterDataValidationException("Short name supplier is required");
+        return resolveOrCreateFromMatInfo(List.of(supplierName)).get(key);
+    }
+
     public VendorCode update(String id, VendorCodeRequest request) {
         VendorCode existing = getById(id);
         String nextKey = requireSupplierKey(request);
-
-        if (!existing.getShortNameSupplierKey().equals(nextKey)
+        if (!nextKey.equals(existing.getShortNameSupplierKey())
                 && vendorCodeRepository.existsByShortNameSupplierKey(nextKey)) {
             throw new MasterDataConflictException("Short name supplier already exists: " + request.getShortNameSupplier());
         }
-
-        if (!existing.getShortNameSupplierKey().equals(nextKey)
-                && isVendorCodeUsed(existing.getShortNameSupplierKey())) {
-            throw new MasterDataConflictException(
-                    "Cannot change Short Name Supplier because MAT_INFO or MPR records are using it"
-            );
+        if (!nextKey.equals(existing.getShortNameSupplierKey()) && isVendorCodeUsed(existing)) {
+            throw new MasterDataConflictException("Cannot change Short Name Supplier because MAT_INFO or MPR records are using it");
         }
-
         apply(existing, request);
-        assignMasterKeyIfMissing(existing);
         existing.setUpdatedAt(LocalDateTime.now());
         return vendorCodeRepository.save(existing);
     }
 
     public void delete(String id) {
         VendorCode existing = getById(id);
-        if (isVendorCodeUsed(existing.getShortNameSupplierKey())) {
-            throw new MasterDataConflictException(
-                    "Cannot delete Vendor Code because MAT_INFO or MPR records are using it"
-            );
+        if (isVendorCodeUsed(existing)) {
+            throw new MasterDataConflictException("Cannot delete Vendor Code because MAT_INFO or MPR records are using it");
         }
         vendorCodeRepository.delete(existing);
     }
@@ -193,305 +298,532 @@ public class VendorCodeService {
     public MasterDataImportResult upload(MultipartFile file, ImportMode mode) {
         ImportMode effectiveMode = mode == null ? ImportMode.UPSERT : mode;
         List<ImportRowError> errors = new ArrayList<>();
-        List<ImportCandidate<VendorCodeRequest>> rows = new ArrayList<>();
-        int totalRows = 0;
+        List<ImportCandidate<VendorCodeRequest>> rows = parseStandardWorkbook(file, errors);
+        int totalRows = rows.size();
+        int duplicateRows = deduplicateVendorRows(rows);
 
-        try (Workbook workbook = excelSupport.openWorkbook(file)) {
-            Sheet sheet = excelSupport.requiredSheet(workbook, MASTER_DATA_NAME);
-            FormulaEvaluator evaluator = excelSupport.evaluator(workbook);
-            excelSupport.requireHeaders(
-                    sheet,
-                    evaluator,
-                    new MasterDataExcelSupport.HeaderRequirement(0, "Short name supplier"),
-                    new MasterDataExcelSupport.HeaderRequirement(1, "Vendor Code"),
-                    new MasterDataExcelSupport.HeaderRequirement(2, "Vendor name"),
-                    new MasterDataExcelSupport.HeaderRequirement(3, "MAT CHARGER")
-            );
-
-            Set<String> incomingKeys = new HashSet<>();
-            for (int rowIndex = sheet.getFirstRowNum() + 1; rowIndex <= sheet.getLastRowNum(); rowIndex++) {
-                Row row = sheet.getRow(rowIndex);
-                if (excelSupport.isBlank(row, 5, evaluator)) {
-                    continue;
-                }
-                totalRows++;
-                int excelRow = rowIndex + 1;
-                try {
-                    VendorCodeRequest request = new VendorCodeRequest();
-                    request.setShortNameSupplier(excelSupport.text(row, 0, evaluator));
-                    request.setVendorCode(excelSupport.text(row, 1, evaluator));
-                    request.setVendorName(excelSupport.text(row, 2, evaluator));
-                    request.setMatCharger(excelSupport.text(row, 3, evaluator));
-                    request.setRemark(excelSupport.text(row, 4, evaluator));
-
-                    addBeanErrors(errors, excelRow, beanValidator.validate(request));
-                    String key = MasterDataTextNormalizer.key(request.getShortNameSupplier());
-                    if (key == null) {
-                        errors.add(new ImportRowError(excelRow, "shortNameSupplier", "Short name supplier is required"));
-                    } else if (!incomingKeys.add(key)) {
-                        errors.add(new ImportRowError(excelRow, "shortNameSupplier", "Duplicate short name supplier inside uploaded file"));
-                    }
-                    rows.add(new ImportCandidate<>(excelRow, request));
-                } catch (RuntimeException ex) {
-                    errors.add(new ImportRowError(excelRow, "row", ex.getMessage()));
-                }
-            }
-        } catch (MasterDataValidationException ex) {
-            errors.add(new ImportRowError(1, "file", ex.getMessage()));
-        } catch (Exception ex) {
-            errors.add(new ImportRowError(1, "file", "Cannot import VENDOR CODE: " + ex.getMessage()));
+        Set<String> supplierKeys = rows.stream()
+                .map(row -> MasterDataTextNormalizer.key(row.getValue().getShortNameSupplier()))
+                .filter(value -> value != null)
+                .collect(Collectors.toSet());
+        Map<String, VendorCode> existingBySupplier = vendorCodeRepository.findAllByShortNameSupplierKeyIn(supplierKeys)
+                .stream().collect(Collectors.toMap(VendorCode::getShortNameSupplierKey, item -> item));
+        int existingDuplicateRows;
+        if (effectiveMode == ImportMode.CREATE_ONLY) {
+            // Upload New must never fail only because a supplier already exists.
+            // Existing suppliers are skipped regardless of whether the remaining Vendor fields differ,
+            // because CREATE_ONLY is not allowed to update an existing master record.
+            existingDuplicateRows = removeExistingSuppliersForCreateOnly(rows, existingBySupplier);
+        } else if (effectiveMode == ImportMode.REPLACE_ALL) {
+            existingDuplicateRows = 0;
+        } else {
+            existingDuplicateRows = removeExistingVendorDuplicates(rows, existingBySupplier);
         }
 
-        validateModeBeforeApply(effectiveMode, rows, errors);
-        if (!errors.isEmpty()) {
-            return MasterDataImportResult.rejected(MASTER_DATA_NAME, effectiveMode, totalRows, errors);
+        if (effectiveMode == ImportMode.REPLACE_ALL && (matInfoRepository.count() > 0 || mprDocumentRepository.count() > 0)) {
+            errors.add(new ImportRowError(1, "mode", "Cannot use REPLACE_ALL while MAT_INFO or MPR data exists. Use UPSERT instead."));
         }
+        if (!errors.isEmpty()) return MasterDataImportResult.rejected(MASTER_DATA_NAME, effectiveMode, totalRows, errors);
 
-        MasterDataImportResult result = new MasterDataImportResult();
-        result.setMasterData(MASTER_DATA_NAME);
-        result.setMode(effectiveMode);
-        result.setApplied(true);
-        result.setTotalRows(totalRows);
-        result.setValidRows(rows.size());
+        MasterDataImportResult result = baseResult(effectiveMode, totalRows);
+        result.setSkipped(duplicateRows + existingDuplicateRows);
+        LocalDateTime now = LocalDateTime.now();
+        List<VendorCode> toSave = new ArrayList<>();
 
         if (effectiveMode == ImportMode.REPLACE_ALL) {
-            vendorCodeRepository.deleteAll();
-            for (ImportCandidate<VendorCodeRequest> row : rows) {
-                VendorCode entity = new VendorCode();
-                apply(entity, row.getValue());
-                assignMasterKeyIfMissing(entity);
-                LocalDateTime now = LocalDateTime.now();
-                entity.setCreatedAt(now);
-                entity.setUpdatedAt(now);
-                vendorCodeRepository.save(entity);
-                result.setCreated(result.getCreated() + 1);
+            Set<String> incomingSupplierKeys = rows.stream()
+                    .map(row -> MasterDataTextNormalizer.key(row.getValue().getShortNameSupplier()))
+                    .filter(value -> value != null)
+                    .collect(Collectors.toSet());
+            List<VendorCode> toDelete = vendorCodeRepository.findAll().stream()
+                    .filter(item -> !incomingSupplierKeys.contains(item.getShortNameSupplierKey()))
+                    .collect(Collectors.toList());
+            if (!toDelete.isEmpty()) {
+                vendorCodeRepository.deleteAll(toDelete);
+                result.setDeleted(toDelete.size());
             }
-            return result;
         }
 
+        int newCount = (int) rows.stream()
+                .filter(row -> !existingBySupplier.containsKey(MasterDataTextNormalizer.key(row.getValue().getShortNameSupplier())))
+                .count();
+        List<String> newKeys = reserveMasterKeys(newCount);
+        int keyIndex = 0;
         for (ImportCandidate<VendorCodeRequest> row : rows) {
             VendorCodeRequest request = row.getValue();
-            String key = MasterDataTextNormalizer.key(request.getShortNameSupplier());
-            Optional<VendorCode> existing = vendorCodeRepository.findByShortNameSupplierKey(key);
-            if (existing.isPresent()) {
-                if (effectiveMode == ImportMode.CREATE_ONLY) {
-                    // This case was already returned as a row error by validateModeBeforeApply.
+            String supplierKey = MasterDataTextNormalizer.key(request.getShortNameSupplier());
+            VendorCode entity = existingBySupplier.get(supplierKey);
+            if (entity == null) {
+                entity = new VendorCode();
+                entity.setMasterKey(newKeys.get(keyIndex++));
+                entity.setCreatedAt(now);
+                result.setCreated(result.getCreated() + 1);
+            } else {
+                if (effectiveMode == ImportMode.CREATE_ONLY || sameVendorData(entity, request)) {
+                    result.setSkipped(result.getSkipped() + 1);
                     continue;
                 }
-                apply(existing.get(), request);
-                assignMasterKeyIfMissing(existing.get());
-                existing.get().setUpdatedAt(LocalDateTime.now());
-                vendorCodeRepository.save(existing.get());
                 result.setUpdated(result.getUpdated() + 1);
-            } else {
-                VendorCode entity = new VendorCode();
-                apply(entity, request);
-                assignMasterKeyIfMissing(entity);
-                LocalDateTime now = LocalDateTime.now();
-                entity.setCreatedAt(now);
-                entity.setUpdatedAt(now);
-                vendorCodeRepository.save(entity);
-                result.setCreated(result.getCreated() + 1);
             }
+            apply(entity, request);
+            entity.setUpdatedAt(now);
+            toSave.add(entity);
         }
+        vendorCodeRepository.saveAll(toSave);
         return result;
     }
-
 
     public byte[] exportForEdit() {
         backfillMissingMasterKeys();
         return MasterDataEditWorkbookExporter.vendorCodes(vendorCodeRepository.findAll());
     }
 
-    /**
-     * Edited-workbook upload. Existing Key updates that exact row. Blank Key
-     * creates a new row and receives the next VC key automatically.
-     */
     public MasterDataImportResult uploadEdited(MultipartFile file) {
         List<ImportRowError> errors = new ArrayList<>();
-        List<ImportCandidate<KeyedVendorCodeRequest>> rows = new ArrayList<>();
-        int totalRows = 0;
+        List<ImportCandidate<KeyedVendorCodeRequest>> rows = parseEditedWorkbook(file, errors);
+        int totalRows = rows.size();
+        int duplicateRows = deduplicateEditedVendorRows(rows);
 
+        Set<String> masterKeys = rows.stream().map(row -> row.getValue().masterKey)
+                .filter(value -> value != null).collect(Collectors.toSet());
+        Map<String, VendorCode> existingByMasterKey = vendorCodeRepository.findAllByMasterKeyIn(masterKeys)
+                .stream().collect(Collectors.toMap(item -> normalizeMasterKey(item.getMasterKey()), item -> item));
+
+        Set<String> supplierKeys = rows.stream()
+                .filter(row -> row.getValue().request != null)
+                .map(row -> MasterDataTextNormalizer.key(row.getValue().request.getShortNameSupplier()))
+                .filter(value -> value != null).collect(Collectors.toSet());
+        Map<String, VendorCode> existingBySupplier = vendorCodeRepository.findAllByShortNameSupplierKeyIn(supplierKeys)
+                .stream().collect(Collectors.toMap(VendorCode::getShortNameSupplierKey, item -> item));
+        int existingDuplicateRows = removeExistingEditedVendorDuplicates(rows, existingBySupplier);
+
+        validateEditedRows(rows, existingByMasterKey, existingBySupplier, errors);
+        if (!errors.isEmpty()) return MasterDataImportResult.rejected(MASTER_DATA_NAME, ImportMode.UPSERT, totalRows, errors);
+
+        MasterDataImportResult result = baseResult(ImportMode.UPSERT, totalRows);
+        result.setSkipped(duplicateRows + existingDuplicateRows);
+        LocalDateTime now = LocalDateTime.now();
+        int createCount = (int) rows.stream()
+                .filter(row -> "CREATE".equals(row.getValue().action))
+                .filter(row -> {
+                    String supplierKey = MasterDataTextNormalizer.key(row.getValue().request.getShortNameSupplier());
+                    VendorCode duplicate = existingBySupplier.get(supplierKey);
+                    return duplicate == null || !sameVendorData(duplicate, row.getValue().request);
+                })
+                .count();
+        List<String> newKeys = reserveMasterKeys(createCount);
+        int keyIndex = 0;
+        List<VendorCode> toSave = new ArrayList<>();
+        List<VendorCode> toDelete = new ArrayList<>();
+
+        for (ImportCandidate<KeyedVendorCodeRequest> row : rows) {
+            KeyedVendorCodeRequest keyed = row.getValue();
+            if ("DELETE".equals(keyed.action)) {
+                toDelete.add(existingByMasterKey.get(keyed.masterKey));
+                result.setDeleted(result.getDeleted() + 1);
+                continue;
+            }
+            String supplierKey = MasterDataTextNormalizer.key(keyed.request.getShortNameSupplier());
+            VendorCode duplicate = existingBySupplier.get(supplierKey);
+            if (duplicate != null && sameVendorData(duplicate, keyed.request)) {
+                result.setSkipped(result.getSkipped() + 1);
+                continue;
+            }
+            VendorCode entity;
+            if ("CREATE".equals(keyed.action)) {
+                entity = new VendorCode();
+                entity.setMasterKey(newKeys.get(keyIndex++));
+                entity.setCreatedAt(now);
+                result.setCreated(result.getCreated() + 1);
+            } else {
+                entity = existingByMasterKey.get(keyed.masterKey);
+                result.setUpdated(result.getUpdated() + 1);
+            }
+            apply(entity, keyed.request);
+            entity.setUpdatedAt(now);
+            toSave.add(entity);
+        }
+        if (!toSave.isEmpty()) vendorCodeRepository.saveAll(toSave);
+        if (!toDelete.isEmpty()) vendorCodeRepository.deleteAll(toDelete);
+        return result;
+    }
+
+    private List<ImportCandidate<VendorCodeRequest>> parseStandardWorkbook(MultipartFile file, List<ImportRowError> errors) {
+        List<ImportCandidate<VendorCodeRequest>> rows = new ArrayList<>();
         try (Workbook workbook = excelSupport.openWorkbook(file)) {
-            Sheet sheet = excelSupport.requiredSheet(workbook, MASTER_DATA_NAME);
+            Sheet sheet = excelSupport.requiredSheet(workbook, MASTER_DATA_NAME, LEGACY_MASTER_DATA_NAME);
             FormulaEvaluator evaluator = excelSupport.evaluator(workbook);
-            excelSupport.requireHeaders(
-                    sheet,
-                    evaluator,
-                    new MasterDataExcelSupport.HeaderRequirement(0, "Key"),
-                    new MasterDataExcelSupport.HeaderRequirement(1, "Short name supplier"),
-                    new MasterDataExcelSupport.HeaderRequirement(2, "Vendor Code"),
-                    new MasterDataExcelSupport.HeaderRequirement(3, "Vendor name"),
-                    new MasterDataExcelSupport.HeaderRequirement(4, "MAT CHARGER"),
-                    new MasterDataExcelSupport.HeaderRequirement(5, "Remark")
-            );
-
-            Set<String> incomingMasterKeys = new HashSet<>();
-            Set<String> incomingSupplierKeys = new HashSet<>();
+            excelSupport.requireHeaders(sheet, evaluator,
+                    new MasterDataExcelSupport.HeaderRequirement(0, "Short name supplier"),
+                    new MasterDataExcelSupport.HeaderRequirement(1, "Vender Code", "Vendor Code"),
+                    new MasterDataExcelSupport.HeaderRequirement(2, "Vender Name", "Vendor Name"),
+                    new MasterDataExcelSupport.HeaderRequirement(3, "MAT CHARGER"));
+            Map<String, String> incoming = new HashMap<>();
             for (int rowIndex = sheet.getFirstRowNum() + 1; rowIndex <= sheet.getLastRowNum(); rowIndex++) {
                 Row row = sheet.getRow(rowIndex);
-                if (excelSupport.isBlank(row, 6, evaluator)) {
-                    continue;
+                if (excelSupport.isBlank(row, 5, evaluator)) continue;
+                int excelRow = rowIndex + 1;
+                try {
+                    VendorCodeRequest request = request(row, evaluator, 0);
+                    addBeanErrors(errors, excelRow, beanValidator.validate(request));
+                    String key = MasterDataTextNormalizer.key(request.getShortNameSupplier());
+                    if (key == null) errors.add(new ImportRowError(excelRow, "shortNameSupplier", "Short name supplier is required"));
+                    else {
+                        String fingerprint = vendorDataKey(request);
+                        String previous = incoming.putIfAbsent(key, fingerprint);
+                        if (previous != null && !previous.equals(fingerprint)) {
+                            errors.add(new ImportRowError(
+                                    excelRow,
+                                    "shortNameSupplier",
+                                    "The same Short name supplier appears more than once with different Vendor data"
+                            ));
+                        }
+                    }
+                    rows.add(new ImportCandidate<>(excelRow, request));
+                } catch (RuntimeException ex) {
+                    errors.add(new ImportRowError(excelRow, "row", cleanMessage(ex)));
                 }
-                totalRows++;
+            }
+        } catch (Exception ex) {
+            errors.add(new ImportRowError(1, "file", "Cannot import VENDER CODE: " + cleanMessage(ex)));
+        }
+        return rows;
+    }
+
+    private List<ImportCandidate<KeyedVendorCodeRequest>> parseEditedWorkbook(MultipartFile file, List<ImportRowError> errors) {
+        List<ImportCandidate<KeyedVendorCodeRequest>> rows = new ArrayList<>();
+        try (Workbook workbook = excelSupport.openWorkbook(file)) {
+            Sheet sheet = excelSupport.requiredSheet(workbook, MASTER_DATA_NAME, LEGACY_MASTER_DATA_NAME);
+            FormulaEvaluator evaluator = excelSupport.evaluator(workbook);
+            excelSupport.requireHeaders(sheet, evaluator,
+                    new MasterDataExcelSupport.HeaderRequirement(0, "Key"),
+                    new MasterDataExcelSupport.HeaderRequirement(1, "Row Version"),
+                    new MasterDataExcelSupport.HeaderRequirement(2, "Action"),
+                    new MasterDataExcelSupport.HeaderRequirement(3, "Short name supplier"),
+                    new MasterDataExcelSupport.HeaderRequirement(4, "Vender Code", "Vendor Code"),
+                    new MasterDataExcelSupport.HeaderRequirement(5, "Vender Name", "Vendor Name"),
+                    new MasterDataExcelSupport.HeaderRequirement(6, "MAT CHARGER"),
+                    new MasterDataExcelSupport.HeaderRequirement(7, "Remark"));
+            Map<String, String> fingerprintByMasterKey = new HashMap<>();
+            Map<String, String> fingerprintBySupplierKey = new HashMap<>();
+            for (int rowIndex = sheet.getFirstRowNum() + 1; rowIndex <= sheet.getLastRowNum(); rowIndex++) {
+                Row row = sheet.getRow(rowIndex);
+                if (excelSupport.isBlank(row, 8, evaluator)) continue;
                 int excelRow = rowIndex + 1;
                 try {
                     KeyedVendorCodeRequest keyed = new KeyedVendorCodeRequest();
                     keyed.masterKey = normalizeUploadedMasterKey(excelSupport.text(row, 0, evaluator));
+                    keyed.rowVersion = optionalLong(excelSupport.text(row, 1, evaluator), "Row Version");
+                    keyed.action = normalizeAction(excelSupport.text(row, 2, evaluator), keyed.masterKey);
+                    keyed.request = request(row, evaluator, 3);
 
-                    VendorCodeRequest request = new VendorCodeRequest();
-                    request.setShortNameSupplier(excelSupport.text(row, 1, evaluator));
-                    request.setVendorCode(excelSupport.text(row, 2, evaluator));
-                    request.setVendorName(excelSupport.text(row, 3, evaluator));
-                    request.setMatCharger(excelSupport.text(row, 4, evaluator));
-                    request.setRemark(excelSupport.text(row, 5, evaluator));
-                    keyed.request = request;
-
-                    addBeanErrors(errors, excelRow, beanValidator.validate(request));
-
-                    String supplierKey = MasterDataTextNormalizer.key(request.getShortNameSupplier());
-                    if (supplierKey == null) {
-                        errors.add(new ImportRowError(excelRow, "shortNameSupplier", "Short name supplier is required"));
-                    } else if (!incomingSupplierKeys.add(supplierKey)) {
-                        errors.add(new ImportRowError(excelRow, "shortNameSupplier", "Duplicate short name supplier inside uploaded file"));
+                    if (!"DELETE".equals(keyed.action)) {
+                        addBeanErrors(errors, excelRow, beanValidator.validate(keyed.request));
+                        String supplierKey = MasterDataTextNormalizer.key(keyed.request.getShortNameSupplier());
+                        if (supplierKey == null) errors.add(new ImportRowError(excelRow, "shortNameSupplier", "Short name supplier is required"));
+                        else {
+                            String fingerprint = vendorDataKey(keyed.request);
+                            String previous = fingerprintBySupplierKey.putIfAbsent(supplierKey, fingerprint);
+                            if (previous != null && !previous.equals(fingerprint)) {
+                                errors.add(new ImportRowError(
+                                        excelRow,
+                                        "shortNameSupplier",
+                                        "The same Short name supplier appears more than once with different Vendor data"
+                                ));
+                            }
+                        }
                     }
-
-                    if (keyed.masterKey != null && !incomingMasterKeys.add(keyed.masterKey)) {
-                        errors.add(new ImportRowError(excelRow, "masterKey", "Duplicate Key inside uploaded file"));
+                    if (keyed.masterKey != null) {
+                        String fingerprint = keyed.action + "|" + (keyed.request == null ? "" : vendorDataKey(keyed.request));
+                        String previous = fingerprintByMasterKey.putIfAbsent(keyed.masterKey, fingerprint);
+                        if (previous != null && !previous.equals(fingerprint)) {
+                            errors.add(new ImportRowError(
+                                    excelRow,
+                                    "masterKey",
+                                    "The same Key appears more than once with different Vendor data"
+                            ));
+                        }
                     }
-
                     rows.add(new ImportCandidate<>(excelRow, keyed));
                 } catch (RuntimeException ex) {
-                    errors.add(new ImportRowError(excelRow, "row", ex.getMessage()));
+                    errors.add(new ImportRowError(excelRow, "row", cleanMessage(ex)));
                 }
             }
-        } catch (MasterDataValidationException ex) {
-            errors.add(new ImportRowError(1, "file", ex.getMessage()));
         } catch (Exception ex) {
-            errors.add(new ImportRowError(1, "file", "Cannot import edited VENDOR CODE: " + ex.getMessage()));
+            errors.add(new ImportRowError(1, "file", "Cannot import edited VENDER CODE: " + cleanMessage(ex)));
         }
-
-        validateEditedRows(rows, errors);
-        if (!errors.isEmpty()) {
-            return MasterDataImportResult.rejected(MASTER_DATA_NAME, ImportMode.UPSERT, totalRows, errors);
-        }
-
-        MasterDataImportResult result = new MasterDataImportResult();
-        result.setMasterData(MASTER_DATA_NAME);
-        result.setMode(ImportMode.UPSERT);
-        result.setApplied(true);
-        result.setTotalRows(totalRows);
-        result.setValidRows(rows.size());
-
-        for (ImportCandidate<KeyedVendorCodeRequest> row : rows) {
-            KeyedVendorCodeRequest keyed = row.getValue();
-            VendorCodeRequest request = keyed.request;
-            Optional<VendorCode> existing = keyed.masterKey == null
-                    ? Optional.empty()
-                    : vendorCodeRepository.findByMasterKey(keyed.masterKey);
-
-            if (existing.isPresent()) {
-                apply(existing.get(), request);
-                assignMasterKeyIfMissing(existing.get());
-                existing.get().setUpdatedAt(LocalDateTime.now());
-                vendorCodeRepository.save(existing.get());
-                result.setUpdated(result.getUpdated() + 1);
-            } else {
-                VendorCode entity = new VendorCode();
-                apply(entity, request);
-                entity.setMasterKey(keyed.masterKey);
-                assignMasterKeyIfMissing(entity);
-                LocalDateTime now = LocalDateTime.now();
-                entity.setCreatedAt(now);
-                entity.setUpdatedAt(now);
-                vendorCodeRepository.save(entity);
-                result.setCreated(result.getCreated() + 1);
-            }
-        }
-        return result;
+        return rows;
     }
-
-    private void validateModeBeforeApply(
-            ImportMode mode,
-            List<ImportCandidate<VendorCodeRequest>> rows,
-            List<ImportRowError> errors
-    ) {
-        if (mode == ImportMode.REPLACE_ALL && (matInfoRepository.count() > 0 || mprDocumentRepository.count() > 0)) {
-            errors.add(new ImportRowError(
-                    1,
-                    "mode",
-                    "Cannot use REPLACE_ALL for Vendor Code while MAT_INFO or MPR data exists. Use UPSERT instead."
-            ));
-        }
-
-        if (mode == ImportMode.CREATE_ONLY) {
-            for (ImportCandidate<VendorCodeRequest> row : rows) {
-                String key = MasterDataTextNormalizer.key(row.getValue().getShortNameSupplier());
-                if (key != null && vendorCodeRepository.existsByShortNameSupplierKey(key)) {
-                    errors.add(new ImportRowError(
-                            row.getRowNumber(),
-                            "shortNameSupplier",
-                            "Supplier already exists; CREATE_ONLY does not allow updates"
-                    ));
-                }
-            }
-        }
-    }
-
 
     private void validateEditedRows(
             List<ImportCandidate<KeyedVendorCodeRequest>> rows,
+            Map<String, VendorCode> existingByMasterKey,
+            Map<String, VendorCode> existingBySupplier,
             List<ImportRowError> errors
     ) {
-        Map<String, VendorCode> existingByMasterKey = new HashMap<>();
-        Map<String, VendorCode> existingBySupplierKey = new HashMap<>();
-        for (VendorCode item : vendorCodeRepository.findAll()) {
-            if (item.getMasterKey() != null && !item.getMasterKey().isBlank()) {
-                existingByMasterKey.put(item.getMasterKey().trim().toUpperCase(Locale.ROOT), item);
-            }
-            if (item.getShortNameSupplierKey() != null && !item.getShortNameSupplierKey().isBlank()) {
-                existingBySupplierKey.put(item.getShortNameSupplierKey(), item);
-            }
-        }
-
         for (ImportCandidate<KeyedVendorCodeRequest> row : rows) {
             KeyedVendorCodeRequest keyed = row.getValue();
-            if (keyed == null || keyed.request == null) {
-                continue;
-            }
-            String supplierKey = MasterDataTextNormalizer.key(keyed.request.getShortNameSupplier());
-            if (supplierKey == null) {
-                continue;
-            }
-
             VendorCode target = keyed.masterKey == null ? null : existingByMasterKey.get(keyed.masterKey);
-            VendorCode duplicateSupplier = existingBySupplierKey.get(supplierKey);
-            if (duplicateSupplier != null && (target == null || !duplicateSupplier.getId().equals(target.getId()))) {
-                errors.add(new ImportRowError(
-                        row.getRowNumber(),
-                        "shortNameSupplier",
-                        "Supplier already exists. Keep its Key to update the existing row, or use a new supplier name."
-                ));
+            if ("CREATE".equals(keyed.action)) {
+                if (keyed.masterKey != null) errors.add(new ImportRowError(row.getRowNumber(), "masterKey", "CREATE must have a blank Key"));
+                if (keyed.rowVersion != null) errors.add(new ImportRowError(row.getRowNumber(), "rowVersion", "CREATE must have a blank Row Version"));
+            } else {
+                if (keyed.masterKey == null) errors.add(new ImportRowError(row.getRowNumber(), "masterKey", keyed.action + " requires a Key"));
+                else if (target == null) errors.add(new ImportRowError(row.getRowNumber(), "masterKey", "Key does not exist: " + keyed.masterKey));
+                else if (!sameVersion(keyed.rowVersion, target.getVersion())) {
+                    errors.add(new ImportRowError(row.getRowNumber(), "rowVersion", "Data has changed since this file was downloaded. Download a new edit file."));
+                }
             }
-
-            if (target != null
-                    && target.getShortNameSupplierKey() != null
-                    && !target.getShortNameSupplierKey().equals(supplierKey)
-                    && isVendorCodeUsed(target.getShortNameSupplierKey())) {
-                errors.add(new ImportRowError(
-                        row.getRowNumber(),
-                        "shortNameSupplier",
-                        "Cannot change Short Name Supplier because MAT_INFO or MPR records are using it"
-                ));
+            if (target != null && "DELETE".equals(keyed.action) && isVendorCodeUsed(target)) {
+                errors.add(new ImportRowError(row.getRowNumber(), "action", "Cannot delete Vendor Code because MAT_INFO or MPR records are using it"));
+            }
+            if ("DELETE".equals(keyed.action) || keyed.request == null) continue;
+            String supplierKey = MasterDataTextNormalizer.key(keyed.request.getShortNameSupplier());
+            VendorCode duplicate = existingBySupplier.get(supplierKey);
+            if (duplicate != null
+                    && (target == null || !duplicate.getId().equals(target.getId()))
+                    && !sameVendorData(duplicate, keyed.request)) {
+                errors.add(new ImportRowError(row.getRowNumber(), "shortNameSupplier", "Supplier already exists. Keep its Key to update the existing row."));
+            }
+            if (target != null && !supplierKey.equals(target.getShortNameSupplierKey()) && isVendorCodeUsed(target)) {
+                errors.add(new ImportRowError(row.getRowNumber(), "shortNameSupplier", "Cannot change Short Name Supplier because MAT_INFO or MPR records are using it"));
             }
         }
+    }
+
+    private VendorCodeRequest request(Row row, FormulaEvaluator evaluator, int offset) {
+        VendorCodeRequest request = new VendorCodeRequest();
+        request.setShortNameSupplier(excelSupport.text(row, offset, evaluator));
+        request.setVendorCode(excelSupport.text(row, offset + 1, evaluator));
+        request.setVendorName(excelSupport.text(row, offset + 2, evaluator));
+        request.setMatCharger(excelSupport.text(row, offset + 3, evaluator));
+        request.setRemark(excelSupport.text(row, offset + 4, evaluator));
+        return request;
+    }
+
+    private void apply(VendorCode target, VendorCodeRequest request) {
+        String shortName = MasterDataTextNormalizer.trimToNull(request == null ? null : request.getShortNameSupplier());
+        if (shortName == null) throw new MasterDataValidationException("Short name supplier is required");
+        target.setShortNameSupplier(shortName);
+        target.setShortNameSupplierKey(MasterDataTextNormalizer.key(shortName));
+        target.setVendorCode(vendorCodeText(request.getVendorCode()));
+        target.setVendorName(MasterDataTextNormalizer.trimToNull(request.getVendorName()));
+        target.setMatCharger(MasterDataTextNormalizer.trimToNull(request.getMatCharger()));
+        target.setRemark(MasterDataTextNormalizer.trimToNull(request.getRemark()));
+        target.setPendingCompletion(
+                MasterDataTextNormalizer.trimToNull(target.getVendorCode()) == null
+                        || MasterDataTextNormalizer.trimToNull(target.getVendorName()) == null
+                        || MasterDataTextNormalizer.trimToNull(target.getMatCharger()) == null
+        );
+        if (!target.isPendingCompletion()) target.setAutoCreatedFromMatInfo(false);
+    }
+
+    /**
+     * CREATE_ONLY can only create new suppliers. Any row whose normalized Short Name Supplier
+     * already exists is skipped instead of rejecting the entire Excel import.
+     */
+    private int removeExistingSuppliersForCreateOnly(
+            List<ImportCandidate<VendorCodeRequest>> rows,
+            Map<String, VendorCode> existingBySupplier
+    ) {
+        int skipped = 0;
+        for (int index = rows.size() - 1; index >= 0; index--) {
+            VendorCodeRequest request = rows.get(index).getValue();
+            String supplierKey = MasterDataTextNormalizer.key(request.getShortNameSupplier());
+            if (supplierKey != null && existingBySupplier.containsKey(supplierKey)) {
+                rows.remove(index);
+                skipped++;
+            }
+        }
+        return skipped;
+    }
+
+    /** Removes rows that are already identical in the database before validation. */
+    private int removeExistingVendorDuplicates(
+            List<ImportCandidate<VendorCodeRequest>> rows,
+            Map<String, VendorCode> existingBySupplier
+    ) {
+        int skipped = 0;
+        for (int index = rows.size() - 1; index >= 0; index--) {
+            VendorCodeRequest request = rows.get(index).getValue();
+            String supplierKey = MasterDataTextNormalizer.key(request.getShortNameSupplier());
+            VendorCode existing = existingBySupplier.get(supplierKey);
+            if (existing != null && sameVendorData(existing, request)) {
+                rows.remove(index);
+                skipped++;
+            }
+        }
+        return skipped;
+    }
+
+    /** Edited rows that are already identical are skipped before Key/Row Version validation. */
+    private int removeExistingEditedVendorDuplicates(
+            List<ImportCandidate<KeyedVendorCodeRequest>> rows,
+            Map<String, VendorCode> existingBySupplier
+    ) {
+        int skipped = 0;
+        for (int index = rows.size() - 1; index >= 0; index--) {
+            KeyedVendorCodeRequest keyed = rows.get(index).getValue();
+            if (keyed == null || keyed.request == null || "DELETE".equals(keyed.action)) continue;
+            String supplierKey = MasterDataTextNormalizer.key(keyed.request.getShortNameSupplier());
+            VendorCode existing = existingBySupplier.get(supplierKey);
+            if (existing != null && sameVendorData(existing, keyed.request)) {
+                rows.remove(index);
+                skipped++;
+            }
+        }
+        return skipped;
+    }
+
+    private int deduplicateVendorRows(List<ImportCandidate<VendorCodeRequest>> rows) {
+        LinkedHashMap<String, ImportCandidate<VendorCodeRequest>> unique = new LinkedHashMap<>();
+        int skipped = 0;
+        for (ImportCandidate<VendorCodeRequest> row : rows) {
+            if (unique.putIfAbsent(vendorDataKey(row.getValue()), row) != null) skipped++;
+        }
+        rows.clear();
+        rows.addAll(unique.values());
+        return skipped;
+    }
+
+    private int deduplicateEditedVendorRows(List<ImportCandidate<KeyedVendorCodeRequest>> rows) {
+        LinkedHashMap<String, ImportCandidate<KeyedVendorCodeRequest>> unique = new LinkedHashMap<>();
+        int skipped = 0;
+        for (ImportCandidate<KeyedVendorCodeRequest> row : rows) {
+            KeyedVendorCodeRequest keyed = row.getValue();
+            String key = (keyed.masterKey == null ? "" : keyed.masterKey)
+                    + "|" + keyed.action
+                    + "|" + (keyed.request == null ? "" : vendorDataKey(keyed.request));
+            if (unique.putIfAbsent(key, row) != null) skipped++;
+        }
+        rows.clear();
+        rows.addAll(unique.values());
+        return skipped;
+    }
+
+    private boolean sameVendorData(VendorCode existing, VendorCodeRequest request) {
+        if (existing == null || request == null) return false;
+        return vendorDataKey(existing).equals(vendorDataKey(request));
+    }
+
+    private String vendorDataKey(VendorCodeRequest request) {
+        if (request == null) return "";
+        return String.join("\u001F",
+                normalizedText(request.getShortNameSupplier()),
+                normalizedText(vendorCodeText(request.getVendorCode())),
+                normalizedText(request.getVendorName()),
+                normalizedText(request.getMatCharger()),
+                normalizedText(request.getRemark())
+        );
+    }
+
+    private String vendorDataKey(VendorCode item) {
+        if (item == null) return "";
+        return String.join("\u001F",
+                normalizedText(item.getShortNameSupplier()),
+                normalizedText(vendorCodeText(item.getVendorCode())),
+                normalizedText(item.getVendorName()),
+                normalizedText(item.getMatCharger()),
+                normalizedText(item.getRemark())
+        );
+    }
+
+    private String normalizedText(String value) {
+        String normalized = MasterDataTextNormalizer.key(value);
+        return normalized == null ? "" : normalized;
+    }
+
+
+    private void putVendorsBySupplierKey(
+            Map<String, VendorCode> target,
+            Collection<VendorCode> vendors
+    ) {
+        if (target == null || vendors == null) return;
+        for (VendorCode vendor : vendors) {
+            if (vendor == null) continue;
+            String supplierKey = vendor.getShortNameSupplierKey();
+            if (supplierKey != null && !supplierKey.isBlank()) {
+                target.putIfAbsent(supplierKey, vendor);
+            }
+        }
+    }
+
+    private boolean isVendorCodeUsed(VendorCode vendor) {
+        if (vendor == null) return false;
+        String key = vendor.getShortNameSupplierKey();
+        return (key != null && matInfoRepository.existsByShortNameSupplierKey(key))
+                || mprDocumentRepository.existsByLinesShortNameSupplierIgnoreCase(vendor.getShortNameSupplier())
+                || (vendor.getId() != null && mprDocumentRepository.existsByLinesShipToIdsContaining(vendor.getId()));
+    }
+
+    private synchronized void backfillMissingMasterKeys() {
+        if (masterKeysBackfilled) return;
+        Query query = new Query(new Criteria().orOperator(
+                Criteria.where("masterKey").exists(false),
+                Criteria.where("masterKey").is(null),
+                Criteria.where("masterKey").is("")
+        ));
+        List<VendorCode> missing = mongoTemplate.find(query, VendorCode.class);
+        if (!missing.isEmpty()) {
+            List<String> keys = reserveMasterKeys(missing.size());
+            for (int i = 0; i < missing.size(); i++) missing.get(i).setMasterKey(keys.get(i));
+            vendorCodeRepository.saveAll(missing);
+        }
+        masterKeysBackfilled = true;
+    }
+
+    private VendorCode ensureMasterKeyPersisted(VendorCode entity) {
+        if (entity.getMasterKey() == null || entity.getMasterKey().isBlank()) {
+            entity.setMasterKey(nextMasterKey());
+            return vendorCodeRepository.save(entity);
+        }
+        return entity;
+    }
+
+    private String nextMasterKey() {
+        return sequenceService.next(SEQUENCE_NAME, MASTER_KEY_PREFIX, this::maxExistingSequence);
+    }
+
+    private List<String> reserveMasterKeys(int count) {
+        return sequenceService.reserve(SEQUENCE_NAME, MASTER_KEY_PREFIX, count, this::maxExistingSequence);
+    }
+
+    private long maxExistingSequence() {
+        Query query = new Query(Criteria.where("masterKey").regex("^" + MASTER_KEY_PREFIX + "\\d+$"));
+        query.with(Sort.by(Sort.Direction.DESC, "masterKey")).limit(1);
+        query.fields().include("masterKey");
+        VendorCode latest = mongoTemplate.findOne(query, VendorCode.class);
+        return parseSequence(latest == null ? null : latest.getMasterKey());
+    }
+
+    private long parseSequence(String key) {
+        if (key == null || !key.matches("^" + MASTER_KEY_PREFIX + "\\d+$")) return 0;
+        try { return Long.parseLong(key.substring(MASTER_KEY_PREFIX.length())); }
+        catch (NumberFormatException ex) { return 0; }
+    }
+
+    private MasterDataImportResult baseResult(ImportMode mode, int totalRows) {
+        MasterDataImportResult result = new MasterDataImportResult();
+        result.setMasterData(MASTER_DATA_NAME);
+        result.setMode(mode);
+        result.setApplied(true);
+        result.setTotalRows(totalRows);
+        result.setValidRows(totalRows);
+        return result;
+    }
+
+    private void addContainsFilter(Query query, String field, String value) {
+        String clean = MasterDataTextNormalizer.trimToNull(value);
+        if (clean != null) query.addCriteria(Criteria.where(field).regex(containsPattern(clean)));
+    }
+
+    private Pattern containsPattern(String value) {
+        return Pattern.compile(Pattern.quote(value), Pattern.CASE_INSENSITIVE);
     }
 
     private String normalizeUploadedMasterKey(String raw) {
         String value = MasterDataTextNormalizer.trimToNull(raw);
-        if (value == null) {
-            return null;
-        }
+        if (value == null) return null;
         String normalized = value.toUpperCase(Locale.ROOT);
         if (!normalized.matches("^" + MASTER_KEY_PREFIX + "\\d+$")) {
             throw new MasterDataValidationException("Invalid Key format: " + value + ". Expected " + MASTER_KEY_PREFIX + "000001 style.");
@@ -499,142 +831,67 @@ public class VendorCodeService {
         return normalized;
     }
 
-    private AtomicLong masterKeyCounter() {
-        return MasterDataSequentialKey.counter(
-                vendorCodeRepository.findAll().stream()
-                        .map(VendorCode::getMasterKey)
-                        .collect(Collectors.toSet()),
-                MASTER_KEY_PREFIX
-        );
+    private String normalizeMasterKey(String value) {
+        return value == null ? null : value.trim().toUpperCase(Locale.ROOT);
     }
 
-    private void assignMasterKeyIfMissing(VendorCode entity) {
-        if (entity == null) {
-            return;
+    private String normalizeAction(String raw, String masterKey) {
+        String value = MasterDataTextNormalizer.upper(raw);
+        if (value == null) return masterKey == null ? "CREATE" : "UPDATE";
+        if (!Set.of("CREATE", "UPDATE", "DELETE").contains(value)) {
+            throw new MasterDataValidationException("Action must be CREATE, UPDATE or DELETE");
         }
-        MasterDataSequentialKey.ensure(
-                entity::getMasterKey,
-                entity::setMasterKey,
-                masterKeyCounter(),
-                MASTER_KEY_PREFIX
-        );
+        return value;
     }
 
-    private VendorCode ensureMasterKeyPersisted(VendorCode entity) {
-        if (entity == null || (entity.getMasterKey() != null && !entity.getMasterKey().isBlank())) {
-            return entity;
-        }
-        assignMasterKeyIfMissing(entity);
-        return vendorCodeRepository.save(entity);
-    }
-
-    private void backfillMissingMasterKeys() {
-        AtomicLong counter = masterKeyCounter();
-        boolean changed = false;
-        for (VendorCode entity : vendorCodeRepository.findAll()) {
-            if (entity.getMasterKey() == null || entity.getMasterKey().isBlank()) {
-                MasterDataSequentialKey.ensure(entity::getMasterKey, entity::setMasterKey, counter, MASTER_KEY_PREFIX);
-                vendorCodeRepository.save(entity);
-                changed = true;
-            }
-        }
-        if (changed) {
-            // Recalculate the next counter after saving legacy rows.
+    private Long optionalLong(String raw, String field) {
+        String clean = MasterDataTextNormalizer.trimToNull(raw);
+        if (clean == null) return null;
+        try {
+            return new java.math.BigDecimal(clean.replace(",", "")).longValueExact();
+        } catch (RuntimeException ex) {
+            throw new MasterDataValidationException(field + " must be a whole number");
         }
     }
 
-    private void apply(VendorCode target, VendorCodeRequest request) {
-        String shortName = MasterDataTextNormalizer.trimToNull(request.getShortNameSupplier());
-        if (shortName == null) {
-            throw new MasterDataValidationException("Short name supplier is required");
-        }
-        target.setShortNameSupplier(shortName);
-        target.setShortNameSupplierKey(MasterDataTextNormalizer.key(shortName));
-        target.setVendorCode(vendorCodeText(request.getVendorCode()));
-        target.setVendorName(MasterDataTextNormalizer.trimToNull(request.getVendorName()));
-        target.setMatCharger(MasterDataTextNormalizer.trimToNull(request.getMatCharger()));
-        target.setRemark(MasterDataTextNormalizer.trimToNull(request.getRemark()));
+    private boolean sameVersion(Long uploaded, Long current) {
+        return uploaded == null ? current == null : uploaded.equals(current);
     }
 
     private String vendorCodeText(String value) {
         String text = MasterDataTextNormalizer.trimToNull(value);
-        if (text == null) {
-            return null;
-        }
+        if (text == null) return null;
         return text.matches("^[0-9,]+$") ? text.replace(",", "") : text;
     }
 
     private String requireSupplierKey(VendorCodeRequest request) {
         String key = MasterDataTextNormalizer.key(request == null ? null : request.getShortNameSupplier());
-        if (key == null) {
-            throw new MasterDataValidationException("Short name supplier is required");
-        }
+        if (key == null) throw new MasterDataValidationException("Short name supplier is required");
         return key;
     }
 
-    private boolean isVendorCodeUsed(String shortNameSupplierKey) {
-        if (shortNameSupplierKey == null || shortNameSupplierKey.isBlank()) {
-            return false;
-        }
-
-        // Scan the visible value too so old MAT_INFO documents without a
-        // normalized helper key are protected as well.
-        if (matInfoRepository.findAll().stream()
-                .map(item -> MasterDataTextNormalizer.key(item.getShortNameSupplier()))
-                .anyMatch(shortNameSupplierKey::equals)) {
-            return true;
-        }
-
-        for (MprDocument mpr : mprDocumentRepository.findAll()) {
-            if (mpr.getLines() == null) {
-                continue;
-            }
-
-            for (MprLine line : mpr.getLines()) {
-                String lineKey = MasterDataTextNormalizer.key(line == null ? null : line.getShortNameSupplier());
-                if (shortNameSupplierKey != null && shortNameSupplierKey.equals(lineKey)) {
-                    return true;
-                }
-            }
-        }
-
-        return false;
-    }
-
-    private boolean contains(String value, String normalizedSearch) {
-        if (normalizedSearch == null) {
-            return true;
-        }
-        return value != null && value.toUpperCase(Locale.ROOT).contains(normalizedSearch);
-    }
-
     private Pageable toPageable(int page, int size) {
-        if (page < 0) {
-            throw new MasterDataValidationException("page must be >= 0");
-        }
-        if (size < 1 || size > 200) {
-            throw new MasterDataValidationException("size must be between 1 and 200");
-        }
+        if (page < 0) throw new MasterDataValidationException("page must be >= 0");
+        if (size < 1 || size > 200) throw new MasterDataValidationException("size must be between 1 and 200");
         return PageRequest.of(page, size);
     }
 
-    private <T> Page<T> page(List<T> items, Pageable pageable) {
-        int from = Math.min((int) pageable.getOffset(), items.size());
-        int to = Math.min(from + pageable.getPageSize(), items.size());
-        return new PageImpl<>(items.subList(from, to), pageable, items.size());
-    }
-
-    private void addBeanErrors(List<ImportRowError> errors, int row, List<String> messages) {
+    private void addBeanErrors(List<ImportRowError> errors, int row, Collection<String> messages) {
         for (String message : messages) {
             String[] parts = message.split(": ", 2);
             errors.add(new ImportRowError(row, parts[0], parts.length > 1 ? parts[1] : message));
         }
     }
 
+    private String cleanMessage(Exception ex) {
+        String message = MasterDataTextNormalizer.trimToNull(ex.getMessage());
+        return message == null ? ex.getClass().getSimpleName() : message;
+    }
 
     private static class KeyedVendorCodeRequest {
         private String masterKey;
+        private Long rowVersion;
+        private String action;
         private VendorCodeRequest request;
     }
-
 }

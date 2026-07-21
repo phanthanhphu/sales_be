@@ -2,6 +2,7 @@ package org.bsl.sales.model;
 
 import com.fasterxml.jackson.annotation.JsonIgnore;
 import org.springframework.data.annotation.Id;
+import org.springframework.data.annotation.Version;
 import org.springframework.data.mongodb.core.index.Indexed;
 import org.springframework.data.mongodb.core.mapping.Document;
 
@@ -25,8 +26,18 @@ public class VendorCode {
     private String vendorName;
     private String matCharger;
     private String remark;
+
+    /** True when the vendor was created with only a supplier name and still needs master-data completion. */
+    private boolean pendingCompletion;
+
+    /** Identifies vendors created automatically while importing or saving MAT_INFO. */
+    private boolean autoCreatedFromMatInfo;
+
     private LocalDateTime createdAt;
     private LocalDateTime updatedAt;
+
+    @Version
+    private Long version;
 
     public String getId() {
         return id;
@@ -93,6 +104,22 @@ public class VendorCode {
         this.remark = remark;
     }
 
+    public boolean isPendingCompletion() {
+        return pendingCompletion;
+    }
+
+    public void setPendingCompletion(boolean pendingCompletion) {
+        this.pendingCompletion = pendingCompletion;
+    }
+
+    public boolean isAutoCreatedFromMatInfo() {
+        return autoCreatedFromMatInfo;
+    }
+
+    public void setAutoCreatedFromMatInfo(boolean autoCreatedFromMatInfo) {
+        this.autoCreatedFromMatInfo = autoCreatedFromMatInfo;
+    }
+
     public LocalDateTime getCreatedAt() {
         return createdAt;
     }
@@ -108,4 +135,7 @@ public class VendorCode {
     public void setUpdatedAt(LocalDateTime updatedAt) {
         this.updatedAt = updatedAt;
     }
+
+    public Long getVersion() { return version; }
+    public void setVersion(Long version) { this.version = version; }
 }

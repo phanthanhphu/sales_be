@@ -19,6 +19,8 @@ public class UserRequest {
 
     /** Multipart-friendly value: BOM,SALES or VIEW_SYSTEM. */
     private String accessPermissions;
+    /** Multipart-friendly Buyer keys, for example LLBEAN,TNF. */
+    private String buyerKeys;
     private MultipartFile profileImage;
 
     public String getUsername() { return username; }
@@ -39,8 +41,16 @@ public class UserRequest {
     public void setDepartmentId(String departmentId) { this.departmentId = departmentId; }
     public String getAccessPermissions() { return accessPermissions; }
     public void setAccessPermissions(String accessPermissions) { this.accessPermissions = accessPermissions; }
+    public String getBuyerKeys() { return buyerKeys; }
+    public void setBuyerKeys(String buyerKeys) { this.buyerKeys = buyerKeys; }
     public MultipartFile getProfileImage() { return profileImage; }
     public void setProfileImage(MultipartFile profileImage) { this.profileImage = profileImage; }
+
+    public List<String> getBuyerKeyList() {
+        if (buyerKeys == null || buyerKeys.trim().isEmpty()) return new ArrayList<>();
+        String raw = buyerKeys.trim().replace("[", "").replace("]", "").replace("\"", "");
+        return User.normalizeBuyerKeys(Arrays.asList(raw.split("[,;|]")), User.ROLE_ADMIN.equals(User.normalizeRole(role)));
+    }
 
     public List<String> getAccessPermissionList() {
         if (accessPermissions == null || accessPermissions.trim().isEmpty()) {

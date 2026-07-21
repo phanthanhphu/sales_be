@@ -158,12 +158,25 @@ public class CurrencyMasterService {
                 .collect(Collectors.toList());
     }
 
+    /** Current/latest rate rows without usage decoration; optimized for bulk imports. */
+    public Map<String, CurrencyMaster> currentCurrencyMap() {
+        Map<String, CurrencyMaster> newestByCode = new LinkedHashMap<>();
+        currencyMasterRepository.findAll().stream()
+                .filter(item -> {
+                    String code = MasterDataTextNormalizer.upper(item.getCurrencyCode());
+                    return code != null && code.matches("^[A-Z]{3}$")
+                            && item.getRateToVnd() != null
+                            && item.getRateToVnd().compareTo(BigDecimal.ZERO) > 0;
+                })
+                .sorted(Comparator
+                        .comparing(CurrencyMaster::getCreatedAt, Comparator.nullsLast(Comparator.reverseOrder()))
+                        .thenComparing(CurrencyMaster::getUpdatedAt, Comparator.nullsLast(Comparator.reverseOrder())))
+                .forEach(item -> newestByCode.putIfAbsent(codeKey(item.getCurrencyCode()), item));
+        return newestByCode;
+    }
+
     public Set<String> currentCurrencyCodes() {
-        return listCurrent().stream()
-                .map(CurrencyMaster::getCurrencyCode)
-                .filter(value -> value != null && !value.isBlank())
-                .map(this::codeKey)
-                .collect(Collectors.toCollection(LinkedHashSet::new));
+        return new LinkedHashSet<>(currentCurrencyMap().keySet());
     }
 
     public CurrencyMaster getById(String id) {

@@ -25,6 +25,10 @@ public class BomPacking {
      */
     private List<String> applicableColors = new ArrayList<>();
 
+    /** Number of rows in bom_lines for this packing. */
+    private long lineCount;
+
+    /** Legacy/in-memory aggregate only. New MongoDB records store rows in bom_lines. */
     private List<BomLine> lines = new ArrayList<>();
     /** Imported Excel packing files are retained for export/history. Manual Packing-file upload is disabled. */
     private List<BomAttachment> attachments = new ArrayList<>();

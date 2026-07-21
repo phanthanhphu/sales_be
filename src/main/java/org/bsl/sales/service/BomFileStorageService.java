@@ -14,6 +14,7 @@ import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.util.Locale;
 import java.util.UUID;
 
 /** Local storage for uploaded BOM workbooks, attachments, and Product Color master images. */
@@ -101,12 +102,14 @@ public class BomFileStorageService {
         Path root = Path.of(uploadDirectory).toAbsolutePath().normalize();
         Files.createDirectories(root);
 
-        String stored = UUID.randomUUID() + extensionOf(original);
+        String extension = preferredExtension(original, contentType);
+        String normalizedOriginal = extensionOf(original).isBlank() && !extension.isBlank() ? original + extension : original;
+        String stored = UUID.randomUUID() + extension;
         Path target = root.resolve(stored).normalize();
         if (!target.startsWith(root)) throw new OrderBomMprValidationException("Invalid upload file name");
 
         Files.copy(input, target, StandardCopyOption.REPLACE_EXISTING);
-        return new StoredFile(original, stored, contentType, size);
+        return new StoredFile(normalizedOriginal, stored, normalizedContentType(contentType, extension), size);
     }
 
     private String sanitize(String name) {
@@ -116,8 +119,39 @@ public class BomFileStorageService {
     }
 
     private String extensionOf(String name) {
+        if (name == null || name.isBlank()) return "";
         int dot = name.lastIndexOf('.');
-        return dot >= 0 ? name.substring(dot) : "";
+        return dot >= 0 ? name.substring(dot).toLowerCase(Locale.ROOT) : "";
+    }
+
+    private String preferredExtension(String name, String contentType) {
+        String existing = extensionOf(name);
+        if (!existing.isBlank()) return existing;
+        String type = contentType == null ? "" : contentType.toLowerCase(Locale.ROOT);
+        if (type.contains("emf")) return ".emf";
+        if (type.contains("wmf")) return ".wmf";
+        if (type.contains("png")) return ".png";
+        if (type.contains("jpeg") || type.contains("jpg")) return ".jpg";
+        if (type.contains("gif")) return ".gif";
+        if (type.contains("webp")) return ".webp";
+        if (type.contains("bmp")) return ".bmp";
+        return "";
+    }
+
+    private String normalizedContentType(String contentType, String extension) {
+        if (contentType != null && !contentType.isBlank() && !"application/octet-stream".equalsIgnoreCase(contentType)) {
+            return contentType;
+        }
+        return switch (extension) {
+            case ".emf" -> "image/x-emf";
+            case ".wmf" -> "image/x-wmf";
+            case ".png" -> "image/png";
+            case ".jpg", ".jpeg" -> "image/jpeg";
+            case ".gif" -> "image/gif";
+            case ".webp" -> "image/webp";
+            case ".bmp" -> "image/bmp";
+            default -> contentType;
+        };
     }
 
     public record StoredFile(String originalFileName, String storedFileName, String contentType, long size) { }

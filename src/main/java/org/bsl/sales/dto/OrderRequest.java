@@ -4,6 +4,8 @@ import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Size;
 
 public record OrderRequest(
+        @Size(max = 40, message = "Buyer Key must not exceed 40 characters")
+        String buyerKey,
         @NotBlank(message = "Order No is required")
         @Size(max = 100, message = "Order No must not exceed 100 characters")
         String orderNo,

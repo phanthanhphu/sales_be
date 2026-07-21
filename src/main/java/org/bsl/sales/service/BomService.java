@@ -2,6 +2,7 @@ package org.bsl.sales.service;
 
 import org.bsl.sales.dto.BomCreateRequest;
 import org.bsl.sales.dto.BomLineRequest;
+import org.bsl.sales.dto.BomLinePageResponse;
 import org.bsl.sales.dto.BomPackingRequest;
 import org.bsl.sales.dto.BomProductColorRequest;
 import org.bsl.sales.exception.OrderBomMprNotFoundException;
@@ -10,15 +11,20 @@ import org.bsl.sales.model.BomAttachment;
 import org.bsl.sales.model.BomDocument;
 import org.bsl.sales.model.BomLine;
 import org.bsl.sales.model.BomLineColorValue;
+import org.bsl.sales.model.BomLineDocument;
+import org.bsl.sales.model.BomImage;
 import org.bsl.sales.model.BomPacking;
 import org.bsl.sales.model.BomProductColor;
 import org.bsl.sales.model.ProductColorAttribute;
+import org.bsl.sales.model.SalesOrder;
+import org.bsl.sales.support.BuyerKeys;
 import org.bsl.sales.repository.BomDocumentRepository;
 import org.bsl.sales.repository.MprDocumentRepository;
 import org.springframework.core.io.Resource;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
+import java.math.BigDecimal;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -36,6 +42,8 @@ public class BomService {
     private final OrderService orderService;
     private final BomExcelParser excelParser;
     private final BomFileStorageService fileStorage;
+    private final BomImageStorageService imageStorage;
+    private final BomLineStore lineStore;
     private final ProductColorMasterService productColorMasterService;
 
     public BomService(
@@ -44,6 +52,8 @@ public class BomService {
             OrderService orderService,
             BomExcelParser excelParser,
             BomFileStorageService fileStorage,
+            BomImageStorageService imageStorage,
+            BomLineStore lineStore,
             ProductColorMasterService productColorMasterService
     ) {
         this.bomRepository = bomRepository;
@@ -51,28 +61,87 @@ public class BomService {
         this.orderService = orderService;
         this.excelParser = excelParser;
         this.fileStorage = fileStorage;
+        this.imageStorage = imageStorage;
+        this.lineStore = lineStore;
         this.productColorMasterService = productColorMasterService;
     }
 
     public List<BomDocument> listByOrder(String orderId) {
-        orderService.get(orderId);
+        SalesOrder order = orderService.get(orderId);
         return bomRepository.findByOrderIdOrderByUpdatedAtDesc(orderId).stream()
-                .map(this::normalizeProductColorLinks)
+                .map(bom -> prepareStoredSummary(bom, order))
                 .toList();
     }
 
+    /** Full aggregate for internal MPR/export workflows. */
     public BomDocument get(String id) {
-        return normalizeProductColorLinks(bomRepository.findById(id)
-                .orElseThrow(() -> new OrderBomMprNotFoundException("BOM not found")));
+        BomDocument stored = findStored(id);
+        SalesOrder order = orderService.get(stored.getOrderId());
+        stored = prepareStoredSummary(stored, order);
+        return normalizeProductColorLinks(lineStore.hydrate(stored));
+    }
+
+    /** Lightweight header returned to the BOM screen. Material rows use the paged lines endpoint. */
+    public BomDocument getSummary(String id) {
+        BomDocument stored = findStored(id);
+        SalesOrder order = orderService.get(stored.getOrderId());
+        return prepareStoredSummary(stored, order);
+    }
+
+    public BomDocument get(String id, String expectedBuyerKey) {
+        BomDocument bom = get(id);
+        validateExpectedBuyer(bom, expectedBuyerKey);
+        return bom;
+    }
+
+    public BomDocument getSummary(String id, String expectedBuyerKey) {
+        BomDocument bom = getSummary(id);
+        validateExpectedBuyer(bom, expectedBuyerKey);
+        return bom;
+    }
+
+    private void validateExpectedBuyer(BomDocument bom, String expectedBuyerKey) {
+        if (expectedBuyerKey == null || expectedBuyerKey.isBlank()) return;
+        String expected = BuyerKeys.normalize(expectedBuyerKey);
+        if (!expected.equals(BuyerKeys.legacyDefault(bom.getBuyerKey()))) {
+            throw new OrderBomMprNotFoundException("BOM not found for Buyer " + expected);
+        }
+    }
+
+    private BomDocument findStored(String id) {
+        return bomRepository.findById(id)
+                .orElseThrow(() -> new OrderBomMprNotFoundException("BOM not found"));
+    }
+
+    private BomDocument prepareStoredSummary(BomDocument bom, SalesOrder order) {
+        if (bom.getBuyerKey() == null || bom.getBuyerKey().isBlank()) {
+            bom.setBuyerKey(BuyerKeys.legacyDefault(order.getBuyerKey()));
+        }
+        if (!lineStore.isSeparate(bom)) {
+            // One-time, backward-compatible migration of embedded rows and old line-image attachments.
+            normalizeProductColorLinks(bom);
+            migrateLegacyLineImages(bom);
+            lineStore.replaceAll(bom);
+            lineStore.compactForStorage(bom);
+            bom = bomRepository.save(bom);
+        } else {
+            lineStore.compactForStorage(bom);
+        }
+        return bom;
     }
 
     public BomDocument create(String orderId, BomCreateRequest request) {
-        orderService.get(orderId);
+        SalesOrder order = orderService.get(orderId);
         LocalDateTime now = LocalDateTime.now();
 
         BomDocument bom = new BomDocument();
+        bom.setId(UUID.randomUUID().toString());
         bom.setOrderId(orderId);
-        bom.setBomNo(required(request.bomNo(), "BOM No is required"));
+        bom.setBuyerKey(BuyerKeys.legacyDefault(order.getBuyerKey()));
+        String normalizedBomNo = required(request.bomNo(), "BOM No is required");
+        ensureUniqueBomNo(orderId, normalizedBomNo, null);
+        bom.setBomNo(normalizedBomNo);
+        bom.setBomNoKey(normalize(normalizedBomNo));
         bom.setBomName(required(request.bomName(), "BOM Name is required"));
         bom.setHeader(request.header() == null ? new org.bsl.sales.model.BomHeader() : request.header());
         bom.setStatus("DRAFT");
@@ -80,6 +149,10 @@ public class BomService {
         bom.setUpdatedAt(now);
         bom.setCreatedBy(RequestActor.current());
         bom.setUpdatedBy(RequestActor.current());
+        bom.setLineStorageMode(BomLineStore.SEPARATE);
+        bom.setLineCount(0);
+        bom.setCoreLineCount(0);
+        bom.setImageCount(0);
 
         BomDocument saved = bomRepository.save(bom);
         orderService.markBomInProgress(orderId);
@@ -89,60 +162,43 @@ public class BomService {
     public BomDocument update(String id, BomCreateRequest request) {
         BomDocument bom = get(id);
         ensureEditable(bom);
-        bom.setBomNo(required(request.bomNo(), "BOM No is required"));
+        String normalizedBomNo = required(request.bomNo(), "BOM No is required");
+        ensureUniqueBomNo(bom.getOrderId(), normalizedBomNo, bom.getId());
+        bom.setBomNo(normalizedBomNo);
+        bom.setBomNoKey(normalize(normalizedBomNo));
         bom.setBomName(required(request.bomName(), "BOM Name is required"));
         bom.setHeader(request.header() == null ? new org.bsl.sales.model.BomHeader() : request.header());
         return saveChanged(bom);
     }
 
-    public BomDocument upload(String orderId, String bomNo, String bomName, MultipartFile file) {
-        orderService.get(orderId);
-
-        BomExcelParser.ParsedBom parsed = excelParser.parse(file);
-        BomFileStorageService.StoredFile stored = fileStorage.store(file);
-        LocalDateTime now = LocalDateTime.now();
-
-        BomDocument bom = new BomDocument();
-        bom.setOrderId(orderId);
-        bom.setBomNo(firstNonBlank(bomNo, parsed.header().getStyleNumber(), "BOM-" + now.toString().replace(":", "")));
-        bom.setBomName(firstNonBlank(bomName, parsed.header().getStyleName(), file.getOriginalFilename(), "BOM"));
-        bom.setStatus("DRAFT");
-        bom.setSourceFileName(stored.originalFileName());
-        bom.setSourceFileStoredName(stored.storedFileName());
-        bom.setCreatedAt(now);
-        bom.setUpdatedAt(now);
-        bom.setCreatedBy(RequestActor.current());
-        bom.setUpdatedBy(RequestActor.current());
-
-        applyParsedBom(bom, parsed);
-
-        BomDocument saved = bomRepository.save(normalizeProductColorLinks(bom));
-        // Product Color Master assigns stable childColorId values after the
-        // source workbook is parsed. Save once more so the BOM rows retain
-        // those links instead of only the readable child-color text.
-        productColorMasterService.synchronizeFromBom(saved);
-        saved = bomRepository.save(normalizeProductColorLinks(saved));
-        orderService.markBomInProgress(orderId);
-        return saved;
-    }
-
     public BomDocument replaceExcel(String id, MultipartFile file) {
         BomDocument bom = get(id);
         ensureEditable(bom);
+        requireLlBeanImplementation(bom.getBuyerKey(), "BOM Excel replacement");
 
         BomExcelParser.ParsedBom parsed = excelParser.parse(file);
+        validateParsedBom(parsed);
         BomFileStorageService.StoredFile stored = fileStorage.store(file);
 
-        // Replacing the source workbook also replaces all material/packing anchors and color items.
-        deleteAllAttachmentFiles(bom);
-        fileStorage.deleteQuietly(bom.getSourceFileStoredName());
+        String oldSource = bom.getSourceFileStoredName();
+        List<String> oldAttachmentFiles = collectAttachmentStoredNames(bom);
+        List<BomImage> oldImages = collectLineImages(bom);
 
         bom.setSourceFileName(stored.originalFileName());
         bom.setSourceFileStoredName(stored.storedFileName());
         bom.setAttachments(new ArrayList<>());
-        applyParsedBom(bom, parsed);
-
-        return saveChanged(bom);
+        try {
+            applyParsedBom(bom, parsed);
+            BomDocument saved = saveChanged(bom);
+            fileStorage.deleteQuietly(oldSource);
+            oldAttachmentFiles.forEach(fileStorage::deleteQuietly);
+            oldImages.forEach(imageStorage::delete);
+            return saved;
+        } catch (RuntimeException ex) {
+            fileStorage.deleteQuietly(stored.storedFileName());
+            deleteAllAttachmentFiles(bom);
+            throw ex;
+        }
     }
 
     public void delete(String id) {
@@ -153,19 +209,14 @@ public class BomService {
 
         fileStorage.deleteQuietly(bom.getSourceFileStoredName());
         deleteAllAttachmentFiles(bom);
+        lineStore.deleteByBomId(bom.getId());
         bomRepository.delete(bom);
     }
 
     public BomDocument submit(String id) {
         BomDocument bom = get(id);
-        // A BOM may validly contain only Packing lines (for example, an imported workbook
-        // with no separate Core section). Accept any BOM that has at least one material line.
-        boolean hasMaterialLines = !safe(bom.getCoreLines()).isEmpty()
-                || safe(bom.getPackings()).stream().anyMatch(packing -> !safe(packing.getLines()).isEmpty());
-        if (!hasMaterialLines) {
-            throw new OrderBomMprValidationException("Cannot submit BOM without material lines");
-        }
-
+        ensureEditable(bom);
+        validateBomAggregate(bom, true);
         bom.setStatus("SUBMITTED");
         bom.setSubmittedAt(LocalDateTime.now());
         bom.setSubmittedBy(RequestActor.current());
@@ -188,18 +239,37 @@ public class BomService {
         org.bsl.sales.model.ProductColorMaster master = productColorMasterService.resolve(
                 required(request.productColorMasterId(), "Product Color Master is required")
         );
+        requireSameBuyer(bom, master);
 
         String colorName = required(master.getProductColor(), "Product Color is required");
-        if (findProductColorByName(bom, colorName) != null) {
-            throw new OrderBomMprValidationException("Product Color already exists in this BOM: " + colorName);
+        String patternNumber = firstNonBlank(
+                request.patternNumber(), master.getPatternNumber(),
+                bom.getHeader() == null ? null : bom.getHeader().getPatternNumber()
+        );
+        String season = firstNonBlank(
+                request.season(), master.getSeason(),
+                bom.getHeader() == null ? null : bom.getHeader().getSeason()
+        );
+        String styleNumber = firstNonBlank(
+                request.styleNumber(), master.getStyleNumber(),
+                bom.getHeader() == null ? null : bom.getHeader().getStyleNumber()
+        );
+        if (findProductColorByIdentity(bom, patternNumber, colorName, season, styleNumber) != null) {
+            throw new OrderBomMprValidationException(
+                    "Product Color already exists in this BOM for the same Pattern Number, Color, Season and Style Number"
+            );
         }
 
         BomProductColor productColor = new BomProductColor();
         productColor.setId(UUID.randomUUID().toString());
         productColor.setProductColorMasterId(master.getId());
         productColor.setColorName(colorName);
-        productColor.setPatternNumber(firstNonBlank(request.patternNumber(), bom.getHeader() == null ? null : bom.getHeader().getPatternNumber()));
-        productColor.setSeason(firstNonBlank(request.season(), bom.getHeader() == null ? null : bom.getHeader().getSeason()));
+        productColor.setPatternNumber(patternNumber);
+        productColor.setSeason(season);
+        productColor.setStyleNumber(styleNumber);
+        int sequence = request.sequence() == null ? nextProductColorSequence(bom) : request.sequence();
+        validateProductColorSequence(bom, null, sequence);
+        productColor.setSequence(sequence);
         productColor.setSourceColumnIndex(null);
         ensureProductColorsList(bom).add(productColor);
         productColorMasterService.applyToBom(bom, productColor, master);
@@ -222,16 +292,38 @@ public class BomService {
         org.bsl.sales.model.ProductColorMaster selectedMaster = productColorMasterService.resolve(
                 required(request.productColorMasterId(), "Product Color Master is required")
         );
+        requireSameBuyer(bom, selectedMaster);
         String newColorName = required(selectedMaster.getProductColor(), "Product Color is required");
-        BomProductColor duplicate = findProductColorByName(bom, newColorName);
+        String newPatternNumber = firstNonBlank(
+                request.patternNumber(), selectedMaster.getPatternNumber(), productColor.getPatternNumber(),
+                bom.getHeader() == null ? null : bom.getHeader().getPatternNumber()
+        );
+        String newSeason = firstNonBlank(
+                request.season(), selectedMaster.getSeason(), productColor.getSeason(),
+                bom.getHeader() == null ? null : bom.getHeader().getSeason()
+        );
+        String newStyleNumber = firstNonBlank(
+                request.styleNumber(), selectedMaster.getStyleNumber(), productColor.getStyleNumber(),
+                bom.getHeader() == null ? null : bom.getHeader().getStyleNumber()
+        );
+        BomProductColor duplicate = findProductColorByIdentity(
+                bom, newPatternNumber, newColorName, newSeason, newStyleNumber
+        );
         if (duplicate != null && !Objects.equals(duplicate.getId(), productColor.getId())) {
-            throw new OrderBomMprValidationException("Product Color already exists in this BOM: " + newColorName);
+            throw new OrderBomMprValidationException(
+                    "Product Color already exists in this BOM for the same Pattern Number, Color, Season and Style Number"
+            );
         }
 
         productColor.setColorName(newColorName);
         productColor.setProductColorMasterId(selectedMaster.getId());
-        productColor.setPatternNumber(firstNonBlank(request.patternNumber(), productColor.getPatternNumber(), bom.getHeader() == null ? null : bom.getHeader().getPatternNumber()));
-        productColor.setSeason(firstNonBlank(request.season(), productColor.getSeason(), bom.getHeader() == null ? null : bom.getHeader().getSeason()));
+        productColor.setPatternNumber(newPatternNumber);
+        productColor.setSeason(newSeason);
+        productColor.setStyleNumber(newStyleNumber);
+        if (request.sequence() != null) {
+            validateProductColorSequence(bom, productColor.getId(), request.sequence());
+            productColor.setSequence(request.sequence());
+        }
         productColorMasterService.applyToBom(bom, productColor, selectedMaster);
         forEachLine(bom, line -> synchronizeLineProductColorValues(bom, line, false));
 
@@ -279,8 +371,11 @@ public class BomService {
 
         BomPacking packing = new BomPacking();
         packing.setId(UUID.randomUUID().toString());
-        packing.setPackingName(required(request.packingName(), "Packing name is required"));
-        packing.setSequence(request.sequence() == null ? safe(bom.getPackings()).size() + 1 : request.sequence());
+        String packingName = required(request.packingName(), "Packing name is required");
+        int sequence = request.sequence() == null ? safe(bom.getPackings()).size() + 1 : request.sequence();
+        validatePackingIdentity(bom, null, packingName, sequence);
+        packing.setPackingName(packingName);
+        packing.setSequence(sequence);
         applyPackingProductColors(bom, packing, request.applicableProductColorIds(), request.applicableColors());
         ensurePackings(bom).add(packing);
         return saveChanged(bom);
@@ -291,8 +386,13 @@ public class BomService {
         ensureEditable(bom);
 
         BomPacking packing = findPacking(bom, packingId);
-        packing.setPackingName(required(request.packingName(), "Packing name is required"));
-        if (request.sequence() != null) packing.setSequence(request.sequence());
+        String packingName = required(request.packingName(), "Packing name is required");
+        int sequence = request.sequence() == null
+                ? (packing.getSequence() == null ? safe(bom.getPackings()).size() + 1 : packing.getSequence())
+                : request.sequence();
+        validatePackingIdentity(bom, packingId, packingName, sequence);
+        packing.setPackingName(packingName);
+        packing.setSequence(sequence);
         applyPackingProductColors(bom, packing, request.applicableProductColorIds(), request.applicableColors());
         return saveChanged(bom);
     }
@@ -305,6 +405,7 @@ public class BomService {
         for (BomAttachment attachment : safe(packing.getAttachments())) fileStorage.deleteQuietly(attachment.getStoredFileName());
         for (BomLine line : safe(packing.getLines())) {
             for (BomAttachment attachment : safe(line.getAttachments())) fileStorage.deleteQuietly(attachment.getStoredFileName());
+            imageStorage.delete(line.getPrimaryImage());
             rememberDeletedSourceRow(bom, line.getSourceRowNumber());
         }
 
@@ -350,6 +451,7 @@ public class BomService {
 
         BomLine line = findLine(bom, lineId);
         for (BomAttachment attachment : safe(line.getAttachments())) fileStorage.deleteQuietly(attachment.getStoredFileName());
+        imageStorage.delete(line.getPrimaryImage());
         rememberDeletedSourceRow(bom, line.getSourceRowNumber());
 
         boolean removed = ensureCoreLines(bom).removeIf(item -> lineId.equals(item.getId()));
@@ -358,6 +460,76 @@ public class BomService {
         }
         if (!removed) throw new OrderBomMprNotFoundException("BOM line not found");
         return saveChanged(bom);
+    }
+
+    public BomLinePageResponse getLines(String bomId, String packingId, int page, int size) {
+        BomDocument bom = getSummary(bomId);
+        if (packingId != null && !packingId.isBlank() && !"__CORE__".equalsIgnoreCase(packingId)) {
+            findPacking(bom, packingId);
+        }
+        return lineStore.page(bomId, packingId, page, size);
+    }
+
+    public BomLine uploadLineImage(String bomId, String lineId, MultipartFile file) {
+        BomDocument bom = getSummary(bomId);
+        ensureEditable(bom);
+        BomLineDocument document = lineStore.findDocument(bomId, lineId);
+        BomLine line = document.getLine();
+        BomImage next = imageStorage.store(file, false, line.getSourceRowNumber(), 2);
+        BomImage previous = line.getPrimaryImage();
+        line.setPrimaryImage(next);
+        try {
+            BomLine saved = lineStore.saveDocument(document);
+            if (previous == null) bom.setImageCount(bom.getImageCount() + 1);
+            touchStoredSummary(bom);
+            imageStorage.delete(previous);
+            return saved;
+        } catch (RuntimeException ex) {
+            imageStorage.delete(next);
+            throw ex;
+        }
+    }
+
+    public BomLine deleteLineImage(String bomId, String lineId) {
+        BomDocument bom = getSummary(bomId);
+        ensureEditable(bom);
+        BomLineDocument document = lineStore.findDocument(bomId, lineId);
+        BomLine line = document.getLine();
+        BomImage previous = line.getPrimaryImage();
+        line.setPrimaryImage(null);
+        BomLine saved = lineStore.saveDocument(document);
+        if (previous != null) {
+            bom.setImageCount(Math.max(0, bom.getImageCount() - 1));
+            touchStoredSummary(bom);
+            imageStorage.delete(previous);
+        }
+        return saved;
+    }
+
+    public LineImageResource downloadLineImage(String bomId, String lineId, String variant) {
+        getSummary(bomId);
+        BomLineDocument document = lineStore.findDocument(bomId, lineId);
+        BomLine line = document.getLine();
+        BomImage image = line.getPrimaryImage();
+
+        // Old EMF/WMF records may not have derivatives because LibreOffice was unavailable during import.
+        // Retry lazily and persist the generated PNG metadata so subsequent GET requests are fast.
+        if (image != null && !"original".equalsIgnoreCase(trim(variant)) && imageStorage.ensureDerivatives(image)) {
+            lineStore.saveDocument(document);
+        }
+
+        return new LineImageResource(
+                imageStorage.load(image, variant),
+                imageStorage.fileName(image, variant),
+                imageStorage.contentType(image, variant)
+        );
+    }
+
+    private void touchStoredSummary(BomDocument bom) {
+        bom.setUpdatedAt(LocalDateTime.now());
+        bom.setUpdatedBy(RequestActor.current());
+        lineStore.compactForStorage(bom);
+        bomRepository.save(bom);
     }
 
     public BomDocument addAttachment(
@@ -419,7 +591,30 @@ public class BomService {
         return new AttachmentResource(resource, attachment.getOriginalFileName(), attachment.getContentType());
     }
 
+    private void migrateLegacyLineImages(BomDocument bom) {
+        forEachLine(bom, line -> {
+            if (line.getPrimaryImage() != null) return;
+            BomAttachment legacy = safe(line.getAttachments()).stream()
+                    .filter(this::isImageAttachment)
+                    .findFirst().orElse(null);
+            if (legacy == null || !hasText(legacy.getStoredFileName())) return;
+            try (var input = fileStorage.load(legacy.getStoredFileName()).getInputStream()) {
+                BomImage image = imageStorage.storeBytes(
+                        input.readAllBytes(), legacy.getOriginalFileName(), legacy.getContentType(),
+                        legacy.isImportedFromExcel(), legacy.getSourceRowNumber(), 2
+                );
+                imageStorage.bindUrls(image, bom.getId(), line.getId());
+                line.setPrimaryImage(image);
+                ensureAttachments(line).remove(legacy);
+                fileStorage.deleteQuietly(legacy.getStoredFileName());
+            } catch (Exception ignored) {
+                // Keep the legacy attachment when it cannot be converted safely.
+            }
+        });
+    }
+
     private void applyParsedBom(BomDocument bom, BomExcelParser.ParsedBom parsed) {
+        validateParsedBom(parsed);
         bom.setHeader(parsed.header());
         // Replace means the current workbook is the source of truth: keep only its Product Color items.
         bom.setColors(new ArrayList<>());
@@ -430,12 +625,26 @@ public class BomService {
         normalizeProductColorLinks(bom);
 
         for (BomExcelParser.ParsedAttachment imported : safe(parsed.importedAttachments())) {
-            BomFileStorageService.StoredFile stored = fileStorage.storeBytes(
-                    imported.bytes(),
-                    imported.originalFileName(),
-                    imported.contentType()
-            );
+            boolean lineImage = "LINE".equalsIgnoreCase(imported.scope())
+                    && imported.lineId() != null && !imported.lineId().isBlank()
+                    && isImage(imported.originalFileName(), imported.contentType());
 
+            if (lineImage) {
+                BomLine line = findLine(bom, imported.lineId());
+                BomImage previous = line.getPrimaryImage();
+                BomImage image = imageStorage.storeBytes(
+                        imported.bytes(), imported.originalFileName(), imported.contentType(),
+                        true, imported.sourceRowNumber(), 2
+                );
+                imageStorage.bindUrls(image, bom.getId(), line.getId());
+                line.setPrimaryImage(image);
+                if (previous != null) imageStorage.delete(previous);
+                continue;
+            }
+
+            BomFileStorageService.StoredFile stored = fileStorage.storeBytes(
+                    imported.bytes(), imported.originalFileName(), imported.contentType()
+            );
             BomAttachment attachment = newAttachment(
                     stored,
                     imported.scope(),
@@ -503,25 +712,45 @@ public class BomService {
     }
 
     private BomDocument saveChanged(BomDocument bom) {
-        normalizeProductColorLinks(bom);
         bom.setUpdatedAt(LocalDateTime.now());
         bom.setUpdatedBy(RequestActor.current());
-        BomDocument saved = bomRepository.save(bom);
-        // Master synchronization may assign Product Color Master ids and
-        // Child Color ids to material rows, therefore persist that link.
-        productColorMasterService.synchronizeFromBom(saved);
-        return bomRepository.save(normalizeProductColorLinks(saved));
+        return persistAggregate(bom);
+    }
+
+    /**
+     * Persists material rows before compacting the BOM header. MongoDB therefore never receives
+     * one oversized document containing every material line or any image bytes.
+     */
+    private BomDocument persistAggregate(BomDocument bom) {
+        normalizeProductColorLinks(bom);
+        productColorMasterService.synchronizeFromBom(bom);
+        normalizeProductColorLinks(bom);
+        lineStore.replaceAll(bom);
+        lineStore.compactForStorage(bom);
+        return bomRepository.save(bom);
+    }
+
+    private void requireSameBuyer(BomDocument bom, org.bsl.sales.model.ProductColorMaster master) {
+        String bomBuyer = BuyerKeys.legacyDefault(bom.getBuyerKey());
+        String masterBuyer = BuyerKeys.legacyDefault(master.getBuyerKey());
+        if (!Objects.equals(bomBuyer, masterBuyer)) {
+            throw new OrderBomMprValidationException(
+                    "Product Color belongs to buyer " + masterBuyer + " and cannot be used for buyer " + bomBuyer
+            );
+        }
     }
 
     private void ensureEditable(BomDocument bom) {
+        if (isUsedByMpr(bom.getId())) {
+            throw new OrderBomMprValidationException("BOM is already used by MPR and is version-locked. Create a new BOM revision instead.");
+        }
         if ("SUBMITTED".equalsIgnoreCase(bom.getStatus()) && !RequestActor.isAdmin()) {
             throw new OrderBomMprValidationException("Submitted BOM can only be edited by Admin");
         }
     }
 
     private boolean isUsedByMpr(String bomId) {
-        return mprRepository.findAll().stream().anyMatch(mpr -> safe(mpr.getSelections()).stream()
-                .anyMatch(selection -> bomId.equals(selection.getBomId())));
+        return mprRepository.existsBySelectionsBomId(bomId);
     }
 
     private BomPacking findPacking(BomDocument bom, String packingId) {
@@ -600,10 +829,12 @@ public class BomService {
             for (BomAttachment attachment : ensureAttachments(packing)) fileStorage.deleteQuietly(attachment.getStoredFileName());
             for (BomLine line : ensureLines(packing)) {
                 for (BomAttachment attachment : ensureAttachments(line)) fileStorage.deleteQuietly(attachment.getStoredFileName());
+                imageStorage.delete(line.getPrimaryImage());
             }
         }
         for (BomLine line : ensureCoreLines(bom)) {
             for (BomAttachment attachment : ensureAttachments(line)) fileStorage.deleteQuietly(attachment.getStoredFileName());
+            imageStorage.delete(line.getPrimaryImage());
         }
     }
 
@@ -616,6 +847,7 @@ public class BomService {
     /** Populates productColors for legacy BOMs and synchronizes legacy colors/values for API compatibility. */
     private BomDocument normalizeProductColorLinks(BomDocument bom) {
         ensureProductColors(bom);
+        mergeDuplicateProductColors(bom);
         for (BomLine line : ensureCoreLines(bom)) synchronizeLineProductColorValues(bom, line, false);
         for (BomPacking packing : ensurePackings(bom)) {
             for (BomLine line : ensureLines(packing)) synchronizeLineProductColorValues(bom, line, false);
@@ -623,6 +855,77 @@ public class BomService {
         syncPackingColorNames(bom);
         syncLegacyColorNames(bom);
         return bom;
+    }
+
+    /**
+     * Keeps the first Product Color for an exact identity match and redirects
+     * every BOM link to it. This makes old records and imported duplicate
+     * columns self-healing instead of failing with "Duplicate Product Color".
+     */
+    private void mergeDuplicateProductColors(BomDocument bom) {
+        List<BomProductColor> source = ensureProductColorsList(bom);
+        if (source.size() < 2) return;
+
+        LinkedHashMap<String, BomProductColor> canonicalByIdentity = new LinkedHashMap<>();
+        LinkedHashMap<String, String> replacementIds = new LinkedHashMap<>();
+        List<BomProductColor> unique = new ArrayList<>();
+
+        for (BomProductColor item : source) {
+            if (item == null) continue;
+            if (trim(item.getId()).isBlank()) item.setId(UUID.randomUUID().toString());
+
+            String identity = productColorIdentityKey(item);
+            BomProductColor canonical = canonicalByIdentity.get(identity);
+            if (canonical == null) {
+                canonicalByIdentity.put(identity, item);
+                unique.add(item);
+                continue;
+            }
+
+            replacementIds.put(item.getId(), canonical.getId());
+            if (trim(canonical.getProductColorMasterId()).isBlank()
+                    && !trim(item.getProductColorMasterId()).isBlank()) {
+                canonical.setProductColorMasterId(item.getProductColorMasterId());
+            }
+            if (canonical.getSequence() == null && item.getSequence() != null) {
+                canonical.setSequence(item.getSequence());
+            }
+        }
+
+        if (replacementIds.isEmpty()) return;
+        bom.setProductColors(unique);
+
+        forEachLine(bom, line -> {
+            for (BomLineColorValue value : safe(line.getProductColorValues())) {
+                String replacement = replacementIds.get(value.getProductColorId());
+                if (replacement != null) value.setProductColorId(replacement);
+            }
+        });
+
+        for (BomPacking packing : ensurePackings(bom)) {
+            LinkedHashSet<String> remapped = new LinkedHashSet<>();
+            for (String id : safe(packing.getApplicableProductColorIds())) {
+                remapped.add(replacementIds.getOrDefault(id, id));
+            }
+            packing.setApplicableProductColorIds(new ArrayList<>(remapped));
+        }
+
+        for (BomAttachment attachment : ensureAttachments(bom)) {
+            String replacement = replacementIds.get(attachment.getProductColorId());
+            if (replacement == null) continue;
+            attachment.setProductColorId(replacement);
+            BomProductColor canonical = findProductColorById(bom, replacement);
+            if (canonical != null) attachment.setColorKey(canonical.getColorName());
+        }
+    }
+
+    private String productColorIdentityKey(BomProductColor item) {
+        return String.join("\u001F",
+                normalize(item == null ? null : item.getPatternNumber()),
+                normalize(item == null ? null : item.getColorName()),
+                normalize(item == null ? null : item.getSeason()),
+                normalize(item == null ? null : item.getStyleNumber())
+        );
     }
 
     private void synchronizeLineProductColorValues(BomDocument bom, BomLine line, boolean strict) {
@@ -748,6 +1051,8 @@ public class BomService {
         productColor.setColorName(trim(colorName));
         productColor.setPatternNumber(bom.getHeader() == null ? "" : trim(bom.getHeader().getPatternNumber()));
         productColor.setSeason(bom.getHeader() == null ? "" : trim(bom.getHeader().getSeason()));
+        productColor.setStyleNumber(bom.getHeader() == null ? "" : trim(bom.getHeader().getStyleNumber()));
+        productColor.setSequence(nextProductColorSequence(bom));
         productColor.setSourceColumnIndex(null);
         ensureProductColorsList(bom).add(productColor);
         return productColor;
@@ -756,6 +1061,16 @@ public class BomService {
     private List<BomProductColor> ensureProductColorsList(BomDocument bom) {
         if (bom.getProductColors() == null) bom.setProductColors(new ArrayList<>());
         return bom.getProductColors();
+    }
+
+    private int nextProductColorSequence(BomDocument bom) {
+        return ensureProductColorsList(bom).stream()
+                .filter(Objects::nonNull)
+                .map(BomProductColor::getSequence)
+                .filter(Objects::nonNull)
+                .mapToInt(Integer::intValue)
+                .max()
+                .orElse(0) + 1;
     }
 
     private void syncLegacyColorNames(BomDocument bom) {
@@ -794,6 +1109,28 @@ public class BomService {
         if (wanted.isBlank()) return null;
         return ensureProductColorsList(bom).stream()
                 .filter(item -> item != null && wanted.equals(normalize(item.getColorName())))
+                .findFirst()
+                .orElse(null);
+    }
+
+    private BomProductColor findProductColorByIdentity(
+            BomDocument bom,
+            String patternNumber,
+            String colorName,
+            String season,
+            String styleNumber
+    ) {
+        String wantedPattern = normalize(patternNumber);
+        String wantedColor = normalize(colorName);
+        String wantedSeason = normalize(season);
+        String wantedStyle = normalize(styleNumber);
+        if (wantedColor.isBlank()) return null;
+        return ensureProductColorsList(bom).stream()
+                .filter(Objects::nonNull)
+                .filter(item -> wantedPattern.equals(normalize(item.getPatternNumber())))
+                .filter(item -> wantedColor.equals(normalize(item.getColorName())))
+                .filter(item -> wantedSeason.equals(normalize(item.getSeason())))
+                .filter(item -> wantedStyle.equals(normalize(item.getStyleNumber())))
                 .findFirst()
                 .orElse(null);
     }
@@ -897,9 +1234,11 @@ public class BomService {
         target.setDirection(source.getDirection());
         target.setCosting(source.getCosting());
         target.setCostingUnit(source.getCostingUnit());
+        target.setDetailConsumption(source.getDetailConsumption());
         target.setConsumptionNet(source.getConsumptionNet());
         target.setConsumptionUnit(source.getConsumptionUnit());
         target.setBomRemark(source.getBomRemark());
+        target.setAdditionalRemark(source.getAdditionalRemark());
         target.setProductColorValues(copyProductColorValues(source.getProductColorValues()));
         target.setColorValues(source.getColorValues() == null ? new LinkedHashMap<>() : new LinkedHashMap<>(source.getColorValues()));
         target.setDetailLine(source.isDetailLine());
@@ -917,10 +1256,205 @@ public class BomService {
         return result;
     }
 
+    private void ensureUniqueBomNo(String orderId, String bomNo, String excludedBomId) {
+        String key = normalize(bomNo);
+        if (key.isBlank()) throw new OrderBomMprValidationException("BOM No is required");
+        boolean duplicate = excludedBomId == null
+                ? bomRepository.existsByOrderIdAndBomNoKey(orderId, key)
+                : bomRepository.existsByOrderIdAndBomNoKeyAndIdNot(orderId, key, excludedBomId);
+        if (duplicate) {
+            throw new OrderBomMprValidationException("BOM No already exists in this Order: " + bomNo);
+        }
+    }
+
+    private void validateParsedBom(BomExcelParser.ParsedBom parsed) {
+        if (parsed == null) throw new OrderBomMprValidationException("Unable to read BOM Excel file");
+        if (parsed.header() == null) throw new OrderBomMprValidationException("BOM header is missing");
+        if (safe(parsed.productColors()).isEmpty()) {
+            throw new OrderBomMprValidationException("BOM Excel must contain at least one Product Color");
+        }
+        validateProductColors(parsed.productColors(), false);
+        validatePackingCollection(parsed.packings(), false);
+        for (BomLine line : safe(parsed.coreLines())) validateManualLine(line);
+        for (BomPacking packing : safe(parsed.packings())) {
+            for (BomLine line : safe(packing.getLines())) validateManualLine(line);
+        }
+    }
+
+    private void validateBomAggregate(BomDocument bom, boolean submitting) {
+        required(bom.getBomNo(), "BOM No is required");
+        required(bom.getBomName(), "BOM Name is required");
+        validateProductColors(ensureProductColorsList(bom), submitting);
+        validatePackingCollection(ensurePackings(bom), submitting);
+
+        int totalLines = 0;
+        for (BomLine line : ensureCoreLines(bom)) {
+            validateManualLine(line);
+            totalLines++;
+        }
+        for (BomPacking packing : ensurePackings(bom)) {
+            List<BomLine> lines = ensureLines(packing);
+            if (submitting && lines.isEmpty()) {
+                throw new OrderBomMprValidationException("Packing " + packing.getPackingName() + " must contain at least one material line before submit");
+            }
+            for (BomLine line : lines) {
+                validateManualLine(line);
+                totalLines++;
+            }
+        }
+        if (submitting && totalLines == 0) {
+            throw new OrderBomMprValidationException("BOM must contain at least one material line before submit");
+        }
+    }
+
+    private void validateProductColors(List<BomProductColor> productColors, boolean requireMasterLink) {
+        LinkedHashSet<String> ids = new LinkedHashSet<>();
+        LinkedHashSet<Integer> sequences = new LinkedHashSet<>();
+        for (BomProductColor color : safe(productColors)) {
+            if (color == null) throw new OrderBomMprValidationException("Product Color contains an empty item");
+            String name = required(color.getColorName(), "Product Color name is required");
+            if (trim(color.getId()).isBlank()) color.setId(UUID.randomUUID().toString());
+            if (!ids.add(color.getId())) {
+                throw new OrderBomMprValidationException("Duplicate Product Color id: " + color.getId());
+            }
+            Integer sequence = color.getSequence();
+            if (sequence == null || sequence <= 0) {
+                throw new OrderBomMprValidationException("Product Color sequence must be greater than 0: " + name);
+            }
+            if (!sequences.add(sequence)) {
+                throw new OrderBomMprValidationException("Duplicate Product Color sequence: " + sequence);
+            }
+            if (requireMasterLink && trim(color.getProductColorMasterId()).isBlank()) {
+                throw new OrderBomMprValidationException("Product Color must be linked to Product Color Master before submit: " + name);
+            }
+            limitText(name, 100, "Product Color");
+            limitText(color.getPatternNumber(), 100, "Pattern Number");
+            limitText(color.getSeason(), 50, "Season");
+            limitText(color.getStyleNumber(), 100, "Style Number");
+        }
+    }
+
+    private void validatePackingCollection(List<BomPacking> packings, boolean submitting) {
+        LinkedHashSet<String> names = new LinkedHashSet<>();
+        LinkedHashSet<Integer> sequences = new LinkedHashSet<>();
+        for (BomPacking packing : safe(packings)) {
+            if (packing == null) throw new OrderBomMprValidationException("Packing contains an empty item");
+            String name = required(packing.getPackingName(), "Packing name is required");
+            Integer sequence = packing.getSequence();
+            if (sequence == null || sequence <= 0) {
+                throw new OrderBomMprValidationException("Packing sequence must be greater than 0: " + name);
+            }
+            if (!names.add(normalize(name))) {
+                throw new OrderBomMprValidationException("Duplicate Packing name: " + name);
+            }
+            if (!sequences.add(sequence)) {
+                throw new OrderBomMprValidationException("Duplicate Packing sequence: " + sequence);
+            }
+            limitText(name, 200, "Packing name");
+            if (submitting && trim(packing.getId()).isBlank()) {
+                throw new OrderBomMprValidationException("Packing id is missing: " + name);
+            }
+        }
+    }
+
+
+    private void validateProductColorSequence(BomDocument bom, String excludedProductColorId, int sequence) {
+        if (sequence <= 0) throw new OrderBomMprValidationException("Product Color sequence must be greater than 0");
+        for (BomProductColor existing : ensureProductColorsList(bom)) {
+            if (existing == null || Objects.equals(excludedProductColorId, existing.getId())) continue;
+            if (existing.getSequence() != null && existing.getSequence() == sequence) {
+                throw new OrderBomMprValidationException("Product Color sequence already exists in this BOM: " + sequence);
+            }
+        }
+    }
+
+    private void validatePackingIdentity(BomDocument bom, String excludedPackingId, String packingName, int sequence) {
+        if (sequence <= 0) throw new OrderBomMprValidationException("Packing sequence must be greater than 0");
+        String wantedName = normalize(packingName);
+        for (BomPacking existing : ensurePackings(bom)) {
+            if (Objects.equals(excludedPackingId, existing.getId())) continue;
+            if (wantedName.equals(normalize(existing.getPackingName()))) {
+                throw new OrderBomMprValidationException("Packing name already exists in this BOM: " + packingName);
+            }
+            if (existing.getSequence() != null && existing.getSequence() == sequence) {
+                throw new OrderBomMprValidationException("Packing sequence already exists in this BOM: " + sequence);
+            }
+        }
+    }
+
+    private List<String> collectAttachmentStoredNames(BomDocument bom) {
+        LinkedHashSet<String> names = new LinkedHashSet<>();
+        for (BomAttachment item : ensureAttachments(bom)) addStoredName(names, item);
+        for (BomPacking packing : ensurePackings(bom)) {
+            for (BomAttachment item : ensureAttachments(packing)) addStoredName(names, item);
+            for (BomLine line : ensureLines(packing)) {
+                for (BomAttachment item : ensureAttachments(line)) addStoredName(names, item);
+            }
+        }
+        for (BomLine line : ensureCoreLines(bom)) {
+            for (BomAttachment item : ensureAttachments(line)) addStoredName(names, item);
+        }
+        return new ArrayList<>(names);
+    }
+
+    private void addStoredName(LinkedHashSet<String> names, BomAttachment attachment) {
+        if (attachment != null && hasText(attachment.getStoredFileName())) names.add(attachment.getStoredFileName());
+    }
+
+    private List<BomImage> collectLineImages(BomDocument bom) {
+        List<BomImage> images = new ArrayList<>();
+        forEachLine(bom, line -> {
+            if (line.getPrimaryImage() != null) images.add(line.getPrimaryImage());
+        });
+        return images;
+    }
+
     private void validateManualLine(BomLine line) {
+        if (line == null) throw new OrderBomMprValidationException("BOM line is empty");
         boolean detail = line.isDetailLine();
         if (!detail && trim(line.getMaterialType()).isBlank()) {
             throw new OrderBomMprValidationException("Material type is required for a material-group line");
+        }
+        if (detail && line.getMaterialGroupNo() == null) {
+            throw new OrderBomMprValidationException("Detail line must be linked to a material group number");
+        }
+        if (line.getMaterialGroupNo() != null && line.getMaterialGroupNo() <= 0) {
+            throw new OrderBomMprValidationException("Material group number must be greater than 0");
+        }
+        validateDecimal(line.getDimensionX(), "Dimension X");
+        validateDecimal(line.getDimensionY(), "Dimension Y");
+        validateDecimal(line.getQuantity(), "Quantity");
+        validateDecimal(line.getCosting(), "Costing");
+        validateDecimal(line.getDetailConsumption(), "Detail Consumption");
+        validateDecimal(line.getConsumptionNet(), "Consumption Net");
+
+        limitText(line.getMaterialType(), 100, "Material Type");
+        limitText(line.getSapCode(), 100, "SAP Code");
+        limitText(line.getDetailNo(), 100, "Detail No");
+        limitText(line.getPosition(), 100, "Position");
+        limitText(line.getPositionDescription(), 500, "Position Description");
+        limitText(line.getPositionDescriptionExtra(), 500, "Position Description Extra");
+        limitText(line.getPieceCode(), 50, "Piece Code");
+        limitText(line.getDirection(), 50, "Direction");
+        limitText(line.getCostingUnit(), 50, "Costing Unit");
+        limitText(line.getConsumptionUnit(), 50, "Consumption Unit");
+        limitText(line.getBomRemark(), 1000, "BOM Remark");
+        limitText(line.getAdditionalRemark(), 1000, "Additional Remark");
+    }
+
+    private void validateDecimal(BigDecimal value, String label) {
+        if (value == null) return;
+        if (value.signum() < 0) throw new OrderBomMprValidationException(label + " must not be negative");
+        BigDecimal normalized = value.stripTrailingZeros();
+        int scale = Math.max(0, normalized.scale());
+        int integerDigits = Math.max(0, normalized.precision() - normalized.scale());
+        if (scale > 6) throw new OrderBomMprValidationException(label + " supports at most 6 decimal places");
+        if (integerDigits > 18) throw new OrderBomMprValidationException(label + " is too large");
+    }
+
+    private void limitText(String value, int max, String label) {
+        if (value != null && value.trim().length() > max) {
+            throw new OrderBomMprValidationException(label + " must not exceed " + max + " characters");
         }
     }
 
@@ -932,10 +1466,25 @@ public class BomService {
         };
     }
 
+    private boolean isImage(String fileName, String contentType) {
+        String descriptor = (String.valueOf(fileName) + " " + String.valueOf(contentType)).toLowerCase(Locale.ROOT);
+        return descriptor.contains("image/") || descriptor.matches(".*\\.(png|jpe?g|gif|webp|bmp|emf|wmf)(\\s.*)?$");
+    }
+
     private boolean isImageAttachment(BomAttachment attachment) {
         String contentType = trim(attachment.getContentType()).toLowerCase(Locale.ROOT);
         String fileName = trim(attachment.getOriginalFileName()).toLowerCase(Locale.ROOT);
-        return contentType.startsWith("image/") || fileName.matches(".*\\.(png|jpe?g|gif|webp|bmp)$");
+        return contentType.startsWith("image/") || fileName.matches(".*\\.(png|jpe?g|gif|webp|bmp|emf|wmf)$");
+    }
+
+    private void requireLlBeanImplementation(String buyerKey, String feature) {
+        String normalizedBuyerKey = BuyerKeys.legacyDefault(buyerKey);
+        if (!BuyerKeys.LL_BEAN.equals(normalizedBuyerKey)) {
+            throw new OrderBomMprValidationException(
+                    feature + " is currently configured for L.L.BEAN only. "
+                            + "Buyer strategy has not been configured for " + normalizedBuyerKey
+            );
+        }
     }
 
     private String required(String value, String message) {
@@ -950,6 +1499,10 @@ public class BomService {
             if (!clean.isBlank()) return clean;
         }
         return "";
+    }
+
+    private boolean hasText(String value) {
+        return value != null && !value.trim().isEmpty();
     }
 
     private String trim(String value) {
@@ -995,4 +1548,6 @@ public class BomService {
     }
 
     public record AttachmentResource(Resource resource, String fileName, String contentType) { }
+
+    public record LineImageResource(Resource resource, String fileName, String contentType) { }
 }

@@ -6,6 +6,7 @@ import lombok.Data;
 import lombok.NoArgsConstructor;
 import org.springframework.data.annotation.Id;
 import org.springframework.data.mongodb.core.index.Indexed;
+import org.springframework.data.mongodb.core.index.CompoundIndex;
 import org.springframework.data.mongodb.core.mapping.Document;
 
 import java.time.LocalDateTime;
@@ -14,14 +15,19 @@ import java.time.LocalDateTime;
 @Data
 @NoArgsConstructor
 @Document(collection = "orders")
+@CompoundIndex(name = "uk_order_buyer_no", def = "{'buyerKey': 1, 'orderNoKey': 1}", unique = true)
 public class SalesOrder {
 
     @Id
     private String id;
 
     @JsonIgnore
-    @Indexed(unique = true)
+    @Indexed
     private String orderNoKey;
+
+    /** Data owner. Legacy rows without this field belong to L.L.BEAN. */
+    @Indexed
+    private String buyerKey;
 
     private String orderNo;
     private String style;

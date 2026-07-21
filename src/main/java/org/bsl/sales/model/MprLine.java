@@ -25,8 +25,9 @@ public class MprLine {
     private String productColorId;
 
     /**
-     * Stable duplicate identity copied from the source BOM fields.
-     * Used to remove only truly identical Core/Packing rows per Product Color.
+     * Stable source identity for BOM + Product Color + Core/Packing + source row.
+     * It prevents re-adding the exact same source row while retaining distinct
+     * rows that happen to contain identical material values.
      */
     private String sourceBomDedupKey;
 
@@ -75,7 +76,7 @@ public class MprLine {
     private BigDecimal nonSapStockQuantity;
     private BigDecimal purchaseQuantity;
 
-    /* Y-AD: copied from MAT_INFO and Vendor Code Master when available. */
+    /* Y-AD: copied from MAT_INFO and Vender Code Master when available. */
     private String currencyMasterId;
     private String currency;
     private BigDecimal matPriceWithoutTax;
