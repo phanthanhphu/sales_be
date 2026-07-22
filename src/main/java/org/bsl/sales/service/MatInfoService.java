@@ -22,6 +22,7 @@ import org.bsl.sales.support.MasterDataBeanValidator;
 import org.bsl.sales.support.MasterDataEditWorkbookExporter;
 import org.bsl.sales.support.MasterDataExcelSupport;
 import org.bsl.sales.support.MasterDataTextNormalizer;
+import org.bsl.sales.support.NewestFirstSort;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
@@ -70,6 +71,7 @@ public class MatInfoService {
     private final BuyerAccessService buyerAccess;
     private final MongoTemplate mongoTemplate;
     private final MasterDataSequenceService sequenceService;
+    private final UserService userService;
     private final Set<String> backfilledBuyers = ConcurrentHashMap.newKeySet();
     private final Set<String> masterKeyBackfilledBuyers = ConcurrentHashMap.newKeySet();
 
@@ -81,7 +83,8 @@ public class MatInfoService {
             MasterDataExcelSupport excelSupport,
             BuyerAccessService buyerAccess,
             MongoTemplate mongoTemplate,
-            MasterDataSequenceService sequenceService
+            MasterDataSequenceService sequenceService,
+            UserService userService
     ) {
         this.matInfoRepository = matInfoRepository;
         this.vendorCodeService = vendorCodeService;
@@ -91,6 +94,7 @@ public class MatInfoService {
         this.buyerAccess = buyerAccess;
         this.mongoTemplate = mongoTemplate;
         this.sequenceService = sequenceService;
+        this.userService = userService;
     }
 
     public MatInfo create(MatInfoRequest request) {
@@ -150,7 +154,7 @@ public class MatInfoService {
         addContainsFilter(query, "matColor", matColor);
         addContainsFilter(query, "shortNameSupplier", shortNameSupplier);
         long total = mongoTemplate.count(query, MatInfo.class);
-        query.with(Sort.by(Sort.Order.desc("updatedAt"), Sort.Order.asc("matFullDescription")));
+        query.with(NewestFirstSort.mongo());
         query.skip(pageable.getOffset()).limit(pageable.getPageSize());
         return new PageImpl<>(mongoTemplate.find(query, MatInfo.class), pageable, total);
     }
@@ -355,12 +359,16 @@ public class MatInfoService {
             Sheet sheet = excelSupport.requiredSheet(workbook, MASTER_DATA_NAME);
             FormulaEvaluator evaluator = excelSupport.evaluator(workbook);
             requireStandardHeaders(sheet, evaluator, 0);
+            String uploader = currentUploaderName();
             for (int rowIndex = sheet.getFirstRowNum() + 1; rowIndex <= sheet.getLastRowNum(); rowIndex++) {
                 Row row = sheet.getRow(rowIndex);
                 if (excelSupport.isBlank(row, 12, evaluator)) continue;
                 int excelRow = rowIndex + 1;
                 try {
                     MatInfoRequest request = toRequest(row, evaluator, 0);
+                    // Updated PIC is always the authenticated user performing the upload.
+                    // The value typed in Excel is intentionally ignored.
+                    request.setUpdatedPic(uploader);
                     request.setBuyerKey(buyer);
                     List<String> beanErrors = beanValidator.validate(request);
                     addBeanErrors(errors, excelRow, beanErrors);
@@ -385,21 +393,28 @@ public class MatInfoService {
         try (Workbook workbook = excelSupport.openWorkbook(file)) {
             Sheet sheet = excelSupport.requiredSheet(workbook, MASTER_DATA_NAME);
             FormulaEvaluator evaluator = excelSupport.evaluator(workbook);
+            boolean legacyHasRowVersion = "ROW VERSION".equals(
+                    MasterDataTextNormalizer.upper(excelSupport.text(sheet.getRow(sheet.getFirstRowNum()), 1, evaluator))
+            );
+            int actionColumn = legacyHasRowVersion ? 2 : 1;
+            int dataOffset = actionColumn + 1;
             excelSupport.requireHeaders(sheet, evaluator,
                     new MasterDataExcelSupport.HeaderRequirement(0, "Key"),
-                    new MasterDataExcelSupport.HeaderRequirement(1, "Row Version"),
-                    new MasterDataExcelSupport.HeaderRequirement(2, "Action"));
-            requireStandardHeaders(sheet, evaluator, 3);
+                    new MasterDataExcelSupport.HeaderRequirement(actionColumn, "Action"));
+            requireStandardHeaders(sheet, evaluator, dataOffset);
+            String uploader = currentUploaderName();
             for (int rowIndex = sheet.getFirstRowNum() + 1; rowIndex <= sheet.getLastRowNum(); rowIndex++) {
                 Row row = sheet.getRow(rowIndex);
-                if (excelSupport.isBlank(row, 15, evaluator)) continue;
+                if (excelSupport.isBlank(row, dataOffset + 12, evaluator)) continue;
                 int excelRow = rowIndex + 1;
                 try {
                     KeyedMatInfoRequest keyed = new KeyedMatInfoRequest();
                     keyed.masterKey = normalizeUploadedMasterKey(excelSupport.text(row, 0, evaluator));
-                    keyed.rowVersion = optionalLong(excelSupport.text(row, 1, evaluator));
-                    keyed.action = normalizeAction(excelSupport.text(row, 2, evaluator), keyed.masterKey);
-                    keyed.request = toRequest(row, evaluator, 3);
+                    keyed.action = normalizeAction(excelSupport.text(row, actionColumn, evaluator), keyed.masterKey);
+                    keyed.request = toRequest(row, evaluator, dataOffset);
+                    // Updated PIC is always the authenticated user performing the upload.
+                    // The value typed in Excel is intentionally ignored.
+                    keyed.request.setUpdatedPic(uploader);
                     keyed.request.setBuyerKey(buyer);
                     if (!"DELETE".equals(keyed.action)) {
                         List<String> beanErrors = beanValidator.validate(keyed.request);
@@ -450,6 +465,15 @@ public class MatInfoService {
         return request;
     }
 
+    private String currentUploaderName() {
+        String actor = RequestActor.current();
+        if (actor == null || actor.isBlank()) return "system";
+        return userService.findByEmail(actor)
+                .map(user -> MasterDataTextNormalizer.trimToNull(user.getUsername()))
+                .filter(value -> value != null && !value.isBlank())
+                .orElse(actor);
+    }
+
     private void validateReferences(
             List<ImportCandidate<MatInfoRequest>> rows,
             Map<String, CurrencyMaster> currencies,
@@ -476,12 +500,10 @@ public class MatInfoService {
             MatInfo target = keyed.masterKey == null ? null : allTargets.get(keyed.masterKey);
             if ("CREATE".equals(keyed.action)) {
                 if (keyed.masterKey != null) errors.add(new ImportRowError(row.getRowNumber(), "masterKey", "CREATE must have a blank Key"));
-                if (keyed.rowVersion != null) errors.add(new ImportRowError(row.getRowNumber(), "rowVersion", "CREATE must have a blank Row Version"));
             } else {
                 if (keyed.masterKey == null) errors.add(new ImportRowError(row.getRowNumber(), "masterKey", keyed.action + " requires a Key"));
                 else if (target == null) errors.add(new ImportRowError(row.getRowNumber(), "masterKey", "Key does not exist: " + keyed.masterKey));
                 else if (!buyer.equals(BuyerKeys.legacyDefault(target.getBuyerKey()))) errors.add(new ImportRowError(row.getRowNumber(), "masterKey", "Key belongs to another Buyer"));
-                else if (!sameVersion(keyed.rowVersion, target.getVersion())) errors.add(new ImportRowError(row.getRowNumber(), "rowVersion", "Data has changed. Download a new edit file."));
             }
             if ("DELETE".equals(keyed.action) || keyed.request == null) continue;
             String currency = MasterDataTextNormalizer.upper(keyed.request.getCurrency());
@@ -790,16 +812,6 @@ public class MatInfoService {
         return value;
     }
 
-    private Long optionalLong(String raw) {
-        String clean = MasterDataTextNormalizer.trimToNull(raw);
-        if (clean == null) return null;
-        try { return new BigDecimal(clean.replace(",", "")).longValueExact(); }
-        catch (RuntimeException ex) { throw new MasterDataValidationException("Row Version must be a whole number"); }
-    }
-
-    private boolean sameVersion(Long uploaded, Long current) {
-        return uploaded == null ? current == null : uploaded.equals(current);
-    }
 
     private void addContainsFilter(Query query, String field, String value) {
         String clean = MasterDataTextNormalizer.trimToNull(value);
@@ -842,7 +854,6 @@ public class MatInfoService {
 
     private static class KeyedMatInfoRequest {
         private String masterKey;
-        private Long rowVersion;
         private String action;
         private MatInfoRequest request;
     }

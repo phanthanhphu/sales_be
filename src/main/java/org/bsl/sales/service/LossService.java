@@ -28,6 +28,7 @@ import org.bsl.sales.support.MasterDataExcelSupport;
 import org.bsl.sales.support.MasterDataEditWorkbookExporter;
 import org.bsl.sales.support.MasterDataSequentialKey;
 import org.bsl.sales.support.MasterDataTextNormalizer;
+import org.bsl.sales.support.NewestFirstSort;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.PageRequest;
@@ -39,7 +40,6 @@ import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
@@ -132,7 +132,7 @@ public class LossService {
                 .filter(item -> sameDecimal(item.getLossLt1501(), lossLt1501))
                 .filter(item -> sameDecimal(item.getLossLt3001(), lossLt3001))
                 .filter(item -> sameDecimal(item.getLossGte3001(), lossGte3001))
-                .sorted(Comparator.comparing(Loss::getMaterialGroup, String.CASE_INSENSITIVE_ORDER))
+                .sorted(NewestFirstSort.comparator(Loss::getCreatedAt, Loss::getUpdatedAt, Loss::getId))
                 .collect(Collectors.toList());
 
         return page(filtered, pageable);
@@ -523,10 +523,9 @@ public class LossService {
                         "Material group in direct-loss table and factor table do not match: " + group + " / " + factorGroup
                 );
             }
-            validateFactorMatchesLoss(lossLt501, factorLt501, "<501");
-            validateFactorMatchesLoss(lossLt1501, factorLt1501, "<1501");
-            validateFactorMatchesLoss(lossLt3001, factorLt3001, "<3001");
-            validateFactorMatchesLoss(lossGte3001, factorGte3001, ">=3001");
+            // For edited workbooks, columns C:F are the source of truth.
+            // The factor table H:L is retained for display/reference only, so users
+            // do not have to update both representations of the same Loss values.
         }
 
         LossRequest request = new LossRequest();

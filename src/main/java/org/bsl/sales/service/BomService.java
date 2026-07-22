@@ -68,7 +68,7 @@ public class BomService {
 
     public List<BomDocument> listByOrder(String orderId) {
         SalesOrder order = orderService.get(orderId);
-        return bomRepository.findByOrderIdOrderByUpdatedAtDesc(orderId).stream()
+        return bomRepository.findByOrderIdOrderByCreatedAtDescUpdatedAtDesc(orderId).stream()
                 .map(bom -> prepareStoredSummary(bom, order))
                 .toList();
     }

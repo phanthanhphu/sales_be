@@ -1,6 +1,7 @@
 package org.bsl.sales.service;
 
 import org.bsl.sales.dto.UserDTO;
+import org.bsl.sales.model.Department;
 import org.bsl.sales.model.User;
 import org.bsl.sales.repository.UserRepository;
 import org.springframework.data.domain.Page;
@@ -22,10 +23,16 @@ import java.util.stream.Collectors;
 public class UserService {
     private final UserRepository userRepository;
     private final MongoTemplate mongoTemplate;
+    private final DepartmentService departmentService;
 
-    public UserService(UserRepository userRepository, MongoTemplate mongoTemplate) {
+    public UserService(
+            UserRepository userRepository,
+            MongoTemplate mongoTemplate,
+            DepartmentService departmentService
+    ) {
         this.userRepository = userRepository;
         this.mongoTemplate = mongoTemplate;
+        this.departmentService = departmentService;
     }
 
     public User saveUser(User user) {
@@ -138,6 +145,11 @@ public class UserService {
         dto.setCreatedAt(user.getCreatedAt());
         dto.setEnabled(user.isEnabled());
         dto.setDepartmentId(user.getDepartmentId());
+        Department department = departmentService.getById(user.getDepartmentId());
+        if (department != null) {
+            dto.setDepartmentName(department.getDepartmentName());
+            dto.setDivision(department.getDivision());
+        }
         dto.setAccessPermissions(user.getAccessPermissions());
         dto.setBuyerKeys(user.getBuyerKeys());
         dto.setCanManageBom(user.canManageBom());

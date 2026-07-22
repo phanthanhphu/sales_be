@@ -91,14 +91,16 @@ public class BuyerService {
         int safeSize = Math.max(1, Math.min(size, 200));
         String requestedSortBy = sortBy == null ? "" : sortBy.trim();
         String safeSortBy = Set.of("buyerKey", "buyerName", "sequence", "active", "createdAt", "updatedAt")
-                .contains(requestedSortBy) ? requestedSortBy : "sequence";
-        Sort.Direction direction = "desc".equalsIgnoreCase(sortDir)
+                .contains(requestedSortBy) ? requestedSortBy : "createdAt";
+        Sort.Direction direction = sortDir == null || sortDir.isBlank() || "desc".equalsIgnoreCase(sortDir)
                 ? Sort.Direction.DESC
                 : Sort.Direction.ASC;
 
         Sort sort = Sort.by(direction, safeSortBy);
         if ("sequence".equals(safeSortBy)) {
             sort = sort.and(Sort.by(Sort.Direction.ASC, "buyerName"));
+        } else if ("createdAt".equals(safeSortBy) && direction == Sort.Direction.DESC) {
+            sort = sort.and(Sort.by(Sort.Order.desc("updatedAt"), Sort.Order.desc("_id")));
         }
         Pageable pageable = PageRequest.of(safePage, safeSize, sort);
 

@@ -25,6 +25,7 @@ import org.bsl.sales.support.ImportCandidate;
 import org.bsl.sales.support.MasterDataBeanValidator;
 import org.bsl.sales.support.MasterDataExcelSupport;
 import org.bsl.sales.support.MasterDataTextNormalizer;
+import org.bsl.sales.support.NewestFirstSort;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.PageRequest;
@@ -129,10 +130,11 @@ public class CurrencyMasterService {
 
         List<CurrencyMaster> rows = currencyMasterRepository.findAll().stream()
                 .filter(item -> matches(item, filter))
-                .sorted(Comparator
-                        .comparing(CurrencyMaster::getCurrencyCode, Comparator.nullsLast(String.CASE_INSENSITIVE_ORDER))
-                        .thenComparing(CurrencyMaster::getUpdatedAt, Comparator.nullsLast(Comparator.reverseOrder()))
-                        .thenComparing(CurrencyMaster::getCreatedAt, Comparator.nullsLast(Comparator.reverseOrder())))
+                .sorted(NewestFirstSort.comparator(
+                        CurrencyMaster::getCreatedAt,
+                        CurrencyMaster::getUpdatedAt,
+                        CurrencyMaster::getId
+                ))
                 .map(this::decorateUsage)
                 .collect(Collectors.toList());
 

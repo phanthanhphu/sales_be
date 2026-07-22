@@ -241,7 +241,11 @@ public class UserController {
             @RequestParam(required = false, defaultValue = "") String accessPermission
     ) {
         try {
-            Pageable pageable = PageRequest.of(page, size, Sort.by(Sort.Order.desc("createdAt")));
+            Pageable pageable = PageRequest.of(
+                    page,
+                    size,
+                    Sort.by(Sort.Order.desc("createdAt"), Sort.Order.desc("_id"))
+            );
             Page<UserDTO> userDTOPage = userService.filterUsers(
                     username,
                     address,
@@ -495,7 +499,18 @@ public class UserController {
             }
 
             User updatedUser = userService.updateUser(id, user);
-            appSocketPublisher.userChanged("UPDATED", updatedUser.getId());
+
+            String socketAction;
+            if (existingUser.isEnabled() && !updatedUser.isEnabled()) {
+                socketAction = "DISABLED";
+            } else if (!existingUser.isEnabled() && updatedUser.isEnabled()) {
+                socketAction = "ENABLED";
+            } else if (accessChanged) {
+                socketAction = "ACCESS_CHANGED";
+            } else {
+                socketAction = "UPDATED";
+            }
+            appSocketPublisher.userChanged(socketAction, updatedUser.getId());
 
             return ResponseEntity.ok(Map.of(
                     "message", "User updated successfully",
@@ -567,7 +582,7 @@ public class UserController {
             user.setPassword(passwordEncoder.encode(passwordRequest.getNewPassword()));
             userRepository.save(user);
 
-            appSocketPublisher.userChanged("UPDATED", user.getId());
+            appSocketPublisher.userChanged("SESSION_REVOKED", user.getId());
 
             Map<String, String> response = new HashMap<>();
             response.put("message", "Password changed successfully");
@@ -623,7 +638,7 @@ public class UserController {
             user.setPassword(passwordEncoder.encode(passwordRequest.getNewPassword()));
             userRepository.save(user);
 
-            appSocketPublisher.userChanged("UPDATED", user.getId());
+            appSocketPublisher.userChanged("SESSION_REVOKED", user.getId());
 
             logger.info("Invalidated all tokens and sessions for user: {}", user.getEmail());
 

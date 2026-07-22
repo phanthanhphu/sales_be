@@ -9,6 +9,7 @@ import org.bsl.sales.repository.MprDocumentRepository;
 import org.bsl.sales.repository.SalesOrderRepository;
 import org.bsl.sales.security.BuyerAccessService;
 import org.bsl.sales.support.BuyerKeys;
+import org.bsl.sales.support.NewestFirstSort;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.PageRequest;
@@ -16,7 +17,6 @@ import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
-import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
 import java.util.stream.Collectors;
@@ -53,7 +53,7 @@ public class OrderService {
                         || contains(order.getCustomer(), keywordKey))
                 .filter(order -> seasonKey == null || contains(order.getSeason(), seasonKey))
                 .filter(order -> statusKey == null || statusKey.equals(key(order.getStatus())))
-                .sorted(Comparator.comparing(SalesOrder::getUpdatedAt, Comparator.nullsLast(Comparator.reverseOrder())))
+                .sorted(NewestFirstSort.comparator(SalesOrder::getCreatedAt, SalesOrder::getUpdatedAt, SalesOrder::getId))
                 .collect(Collectors.toList());
 
         int from = Math.min((int) pageable.getOffset(), rows.size());

@@ -41,7 +41,13 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
 
                 if (userOpt.isPresent()) {
                     User user = userOpt.get();
-                    if (user.isEnabled() && jwtUtil.validateToken(token, user.getEmail(), user.getTokenVersion())) {
+                    if (!user.isEnabled()) {
+                        request.setAttribute(RestAuthEntryPoint.ATTR_AUTH_FAILURE_CODE, RestAuthEntryPoint.ACCOUNT_DISABLED);
+                        SecurityContextHolder.clearContext();
+                    } else if (!jwtUtil.validateToken(token, user.getEmail(), user.getTokenVersion())) {
+                        request.setAttribute(RestAuthEntryPoint.ATTR_AUTH_FAILURE_CODE, RestAuthEntryPoint.SESSION_REVOKED);
+                        SecurityContextHolder.clearContext();
+                    } else {
                         List<SimpleGrantedAuthority> authorities = new ArrayList<>();
                         authorities.add(new SimpleGrantedAuthority("ROLE_" + user.getRole()));
                         for (String permission : user.getAccessPermissions()) {
@@ -55,9 +61,10 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
                         request.setAttribute(AuditLogFilter.ATTR_USERNAME, user.getUsername());
                         request.setAttribute(AuditLogFilter.ATTR_USER_EMAIL, user.getEmail());
                         request.setAttribute(AuditLogFilter.ATTR_USER_ROLE, user.getRole());
-                    } else {
-                        SecurityContextHolder.clearContext();
                     }
+                } else if (StringUtils.hasText(email)) {
+                    request.setAttribute(RestAuthEntryPoint.ATTR_AUTH_FAILURE_CODE, RestAuthEntryPoint.ACCOUNT_NOT_FOUND);
+                    SecurityContextHolder.clearContext();
                 }
             } catch (Exception ignored) {
                 SecurityContextHolder.clearContext();

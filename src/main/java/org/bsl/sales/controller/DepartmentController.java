@@ -13,7 +13,6 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
-import java.time.LocalDateTime;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -62,7 +61,7 @@ public class DepartmentController {
     @GetMapping
     public ResponseEntity<?> getAll() {
         List<Department> departments = service.getAll();
-        return ResponseEntity.ok(sortDepartmentsByUpdatedAtDesc(departments));
+        return ResponseEntity.ok(sortDepartmentsNewestFirst(departments));
     }
 
     @GetMapping("/{id}")
@@ -153,7 +152,7 @@ public class DepartmentController {
             @RequestParam(defaultValue = "false") boolean paged,
             @RequestParam(defaultValue = "0") int page,
             @RequestParam(defaultValue = "25") int size,
-            @RequestParam(defaultValue = "updatedAt") String sortBy,
+            @RequestParam(defaultValue = "createdAt") String sortBy,
             @RequestParam(defaultValue = "desc") String sortDir
     ) {
         try {
@@ -247,7 +246,7 @@ public class DepartmentController {
             return service.searchPage(division, departmentName, page, size, sortBy, sortDir);
         }
 
-        List<Department> departments = sortDepartmentsByUpdatedAtDesc(
+        List<Department> departments = sortDepartmentsNewestFirst(
                 service.getAll(division, departmentName)
         );
         int legacySize = Math.max(1, departments.size());
@@ -274,21 +273,22 @@ public class DepartmentController {
         return response;
     }
 
-    private List<Department> sortDepartmentsByUpdatedAtDesc(List<Department> departments) {
+    private List<Department> sortDepartmentsNewestFirst(List<Department> departments) {
         if (departments == null || departments.isEmpty()) {
             return departments;
         }
 
         departments.sort(
                 Comparator.comparing(
+                        Department::getCreatedAt,
+                        Comparator.nullsLast(Comparator.reverseOrder())
+                ).thenComparing(
                         Department::getUpdatedAt,
-                        Comparator.nullsLast(LocalDateTime::compareTo)
+                        Comparator.nullsLast(Comparator.reverseOrder())
+                ).thenComparing(
+                        Department::getId,
+                        Comparator.nullsLast(Comparator.reverseOrder())
                 )
-                        .thenComparing(
-                                Department::getCreatedAt,
-                                Comparator.nullsLast(LocalDateTime::compareTo)
-                        )
-                        .reversed()
         );
 
         return departments;

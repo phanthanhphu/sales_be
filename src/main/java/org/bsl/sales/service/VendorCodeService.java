@@ -20,6 +20,7 @@ import org.bsl.sales.support.MasterDataBeanValidator;
 import org.bsl.sales.support.MasterDataEditWorkbookExporter;
 import org.bsl.sales.support.MasterDataExcelSupport;
 import org.bsl.sales.support.MasterDataTextNormalizer;
+import org.bsl.sales.support.NewestFirstSort;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
@@ -113,7 +114,7 @@ public class VendorCodeService {
         addContainsFilter(query, "vendorName", vendorName);
         addContainsFilter(query, "matCharger", matCharger);
         long total = mongoTemplate.count(query, VendorCode.class);
-        query.with(Sort.by(Sort.Order.asc("shortNameSupplier")));
+        query.with(NewestFirstSort.mongo());
         query.skip(pageable.getOffset()).limit(pageable.getPageSize());
         return new PageImpl<>(mongoTemplate.find(query, VendorCode.class), pageable, total);
     }
@@ -132,7 +133,7 @@ public class VendorCodeService {
                 Criteria.where("matCharger").regex(pattern)
         ));
         long total = mongoTemplate.count(query, VendorCode.class);
-        query.with(Sort.by(Sort.Order.asc("shortNameSupplier")));
+        query.with(NewestFirstSort.mongo());
         query.skip(pageable.getOffset()).limit(pageable.getPageSize());
         return new PageImpl<>(mongoTemplate.find(query, VendorCode.class), pageable, total);
     }
@@ -495,27 +496,30 @@ public class VendorCodeService {
         try (Workbook workbook = excelSupport.openWorkbook(file)) {
             Sheet sheet = excelSupport.requiredSheet(workbook, MASTER_DATA_NAME, LEGACY_MASTER_DATA_NAME);
             FormulaEvaluator evaluator = excelSupport.evaluator(workbook);
+            boolean legacyHasRowVersion = "ROW VERSION".equals(
+                    MasterDataTextNormalizer.upper(excelSupport.text(sheet.getRow(sheet.getFirstRowNum()), 1, evaluator))
+            );
+            int actionColumn = legacyHasRowVersion ? 2 : 1;
+            int dataOffset = actionColumn + 1;
             excelSupport.requireHeaders(sheet, evaluator,
                     new MasterDataExcelSupport.HeaderRequirement(0, "Key"),
-                    new MasterDataExcelSupport.HeaderRequirement(1, "Row Version"),
-                    new MasterDataExcelSupport.HeaderRequirement(2, "Action"),
-                    new MasterDataExcelSupport.HeaderRequirement(3, "Short name supplier"),
-                    new MasterDataExcelSupport.HeaderRequirement(4, "Vender Code", "Vendor Code"),
-                    new MasterDataExcelSupport.HeaderRequirement(5, "Vender Name", "Vendor Name"),
-                    new MasterDataExcelSupport.HeaderRequirement(6, "MAT CHARGER"),
-                    new MasterDataExcelSupport.HeaderRequirement(7, "Remark"));
+                    new MasterDataExcelSupport.HeaderRequirement(actionColumn, "Action"),
+                    new MasterDataExcelSupport.HeaderRequirement(dataOffset, "Short name supplier"),
+                    new MasterDataExcelSupport.HeaderRequirement(dataOffset + 1, "Vender Code", "Vendor Code"),
+                    new MasterDataExcelSupport.HeaderRequirement(dataOffset + 2, "Vender Name", "Vendor Name"),
+                    new MasterDataExcelSupport.HeaderRequirement(dataOffset + 3, "MAT CHARGER"),
+                    new MasterDataExcelSupport.HeaderRequirement(dataOffset + 4, "Remark"));
             Map<String, String> fingerprintByMasterKey = new HashMap<>();
             Map<String, String> fingerprintBySupplierKey = new HashMap<>();
             for (int rowIndex = sheet.getFirstRowNum() + 1; rowIndex <= sheet.getLastRowNum(); rowIndex++) {
                 Row row = sheet.getRow(rowIndex);
-                if (excelSupport.isBlank(row, 8, evaluator)) continue;
+                if (excelSupport.isBlank(row, dataOffset + 5, evaluator)) continue;
                 int excelRow = rowIndex + 1;
                 try {
                     KeyedVendorCodeRequest keyed = new KeyedVendorCodeRequest();
                     keyed.masterKey = normalizeUploadedMasterKey(excelSupport.text(row, 0, evaluator));
-                    keyed.rowVersion = optionalLong(excelSupport.text(row, 1, evaluator), "Row Version");
-                    keyed.action = normalizeAction(excelSupport.text(row, 2, evaluator), keyed.masterKey);
-                    keyed.request = request(row, evaluator, 3);
+                    keyed.action = normalizeAction(excelSupport.text(row, actionColumn, evaluator), keyed.masterKey);
+                    keyed.request = request(row, evaluator, dataOffset);
 
                     if (!"DELETE".equals(keyed.action)) {
                         addBeanErrors(errors, excelRow, beanValidator.validate(keyed.request));
@@ -566,13 +570,9 @@ public class VendorCodeService {
             VendorCode target = keyed.masterKey == null ? null : existingByMasterKey.get(keyed.masterKey);
             if ("CREATE".equals(keyed.action)) {
                 if (keyed.masterKey != null) errors.add(new ImportRowError(row.getRowNumber(), "masterKey", "CREATE must have a blank Key"));
-                if (keyed.rowVersion != null) errors.add(new ImportRowError(row.getRowNumber(), "rowVersion", "CREATE must have a blank Row Version"));
             } else {
                 if (keyed.masterKey == null) errors.add(new ImportRowError(row.getRowNumber(), "masterKey", keyed.action + " requires a Key"));
                 else if (target == null) errors.add(new ImportRowError(row.getRowNumber(), "masterKey", "Key does not exist: " + keyed.masterKey));
-                else if (!sameVersion(keyed.rowVersion, target.getVersion())) {
-                    errors.add(new ImportRowError(row.getRowNumber(), "rowVersion", "Data has changed since this file was downloaded. Download a new edit file."));
-                }
             }
             if (target != null && "DELETE".equals(keyed.action) && isVendorCodeUsed(target)) {
                 errors.add(new ImportRowError(row.getRowNumber(), "action", "Cannot delete Vendor Code because MAT_INFO or MPR records are using it"));
@@ -656,7 +656,7 @@ public class VendorCodeService {
         return skipped;
     }
 
-    /** Edited rows that are already identical are skipped before Key/Row Version validation. */
+    /** Edited rows that are already identical are skipped before Key validation. */
     private int removeExistingEditedVendorDuplicates(
             List<ImportCandidate<KeyedVendorCodeRequest>> rows,
             Map<String, VendorCode> existingBySupplier
@@ -844,19 +844,6 @@ public class VendorCodeService {
         return value;
     }
 
-    private Long optionalLong(String raw, String field) {
-        String clean = MasterDataTextNormalizer.trimToNull(raw);
-        if (clean == null) return null;
-        try {
-            return new java.math.BigDecimal(clean.replace(",", "")).longValueExact();
-        } catch (RuntimeException ex) {
-            throw new MasterDataValidationException(field + " must be a whole number");
-        }
-    }
-
-    private boolean sameVersion(Long uploaded, Long current) {
-        return uploaded == null ? current == null : uploaded.equals(current);
-    }
 
     private String vendorCodeText(String value) {
         String text = MasterDataTextNormalizer.trimToNull(value);
@@ -890,7 +877,6 @@ public class VendorCodeService {
 
     private static class KeyedVendorCodeRequest {
         private String masterKey;
-        private Long rowVersion;
         private String action;
         private VendorCodeRequest request;
     }

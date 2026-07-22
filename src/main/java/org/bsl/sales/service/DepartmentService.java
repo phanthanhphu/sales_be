@@ -124,11 +124,15 @@ public class DepartmentService {
         int safeSize = Math.max(1, Math.min(size, 200));
         String requestedSortBy = sortBy == null ? "" : sortBy.trim();
         String safeSortBy = Set.of("division", "departmentName", "createdAt", "updatedAt")
-                .contains(requestedSortBy) ? requestedSortBy : "updatedAt";
+                .contains(requestedSortBy) ? requestedSortBy : "createdAt";
         Sort.Direction direction = "asc".equalsIgnoreCase(sortDir)
                 ? Sort.Direction.ASC
                 : Sort.Direction.DESC;
-        Pageable pageable = PageRequest.of(safePage, safeSize, Sort.by(direction, safeSortBy));
+        Sort sort = Sort.by(direction, safeSortBy);
+        if ("createdAt".equals(safeSortBy) && direction == Sort.Direction.DESC) {
+            sort = sort.and(Sort.by(Sort.Order.desc("updatedAt"), Sort.Order.desc("_id")));
+        }
+        Pageable pageable = PageRequest.of(safePage, safeSize, sort);
 
         Query query = new Query();
         String cleanDivision = division == null ? "" : division.trim();

@@ -19,6 +19,7 @@ import org.bsl.sales.support.MasterDataBeanValidator;
 import org.bsl.sales.support.MasterDataEditWorkbookExporter;
 import org.bsl.sales.support.MasterDataExcelSupport;
 import org.bsl.sales.support.MasterDataTextNormalizer;
+import org.bsl.sales.support.NewestFirstSort;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.PageRequest;
@@ -99,7 +100,7 @@ public class ShipToService {
         addContains(query, "shipToCode", shipToCode);
         if (active != null) query.addCriteria(Criteria.where("active").is(active));
         long total = mongoTemplate.count(query, ShipTo.class);
-        query.with(Sort.by(Sort.Order.asc("shipToName")));
+        query.with(NewestFirstSort.mongo());
         query.skip(pageable.getOffset()).limit(pageable.getPageSize());
         return new PageImpl<>(mongoTemplate.find(query, ShipTo.class), pageable, total);
     }
@@ -245,11 +246,9 @@ public class ShipToService {
             ShipTo target = keyed.masterKey == null ? null : byKey.get(keyed.masterKey);
             if ("CREATE".equals(keyed.action)) {
                 if (keyed.masterKey != null) errors.add(new ImportRowError(row.getRowNumber(), "masterKey", "CREATE must have a blank Key"));
-                if (keyed.rowVersion != null) errors.add(new ImportRowError(row.getRowNumber(), "rowVersion", "CREATE must have a blank Row Version"));
             } else {
                 if (keyed.masterKey == null) errors.add(new ImportRowError(row.getRowNumber(), "masterKey", keyed.action + " requires a Key"));
                 else if (target == null) errors.add(new ImportRowError(row.getRowNumber(), "masterKey", "Key does not exist: " + keyed.masterKey));
-                else if (!sameVersion(keyed.rowVersion, target.getVersion())) errors.add(new ImportRowError(row.getRowNumber(), "rowVersion", "Data has changed. Download a new edit file."));
             }
             if (target != null && "DELETE".equals(keyed.action) && isUsed(target)) {
                 errors.add(new ImportRowError(row.getRowNumber(), "action", "Cannot delete Ship To because an MPR is using it"));
@@ -339,25 +338,28 @@ public class ShipToService {
         try (Workbook workbook = excelSupport.openWorkbook(file)) {
             Sheet sheet = excelSupport.requiredSheet(workbook, MASTER_DATA_NAME);
             FormulaEvaluator evaluator = excelSupport.evaluator(workbook);
+            boolean legacyHasRowVersion = "ROW VERSION".equals(
+                    MasterDataTextNormalizer.upper(excelSupport.text(sheet.getRow(sheet.getFirstRowNum()), 1, evaluator))
+            );
+            int actionColumn = legacyHasRowVersion ? 2 : 1;
+            int dataOffset = actionColumn + 1;
             excelSupport.requireHeaders(sheet, evaluator,
                     new MasterDataExcelSupport.HeaderRequirement(0, "Key"),
-                    new MasterDataExcelSupport.HeaderRequirement(1, "Row Version"),
-                    new MasterDataExcelSupport.HeaderRequirement(2, "Action"),
-                    new MasterDataExcelSupport.HeaderRequirement(3, "Ship To Code"),
-                    new MasterDataExcelSupport.HeaderRequirement(4, "Ship To Name"),
-                    new MasterDataExcelSupport.HeaderRequirement(5, "Active"),
-                    new MasterDataExcelSupport.HeaderRequirement(6, "Remark"));
+                    new MasterDataExcelSupport.HeaderRequirement(actionColumn, "Action"),
+                    new MasterDataExcelSupport.HeaderRequirement(dataOffset, "Ship To Code"),
+                    new MasterDataExcelSupport.HeaderRequirement(dataOffset + 1, "Ship To Name"),
+                    new MasterDataExcelSupport.HeaderRequirement(dataOffset + 2, "Active"),
+                    new MasterDataExcelSupport.HeaderRequirement(dataOffset + 3, "Remark"));
             Set<String> keys = new HashSet<>();
             for (int rowIndex = sheet.getFirstRowNum() + 1; rowIndex <= sheet.getLastRowNum(); rowIndex++) {
                 Row row = sheet.getRow(rowIndex);
-                if (excelSupport.isBlank(row, 7, evaluator)) continue;
+                if (excelSupport.isBlank(row, dataOffset + 4, evaluator)) continue;
                 int excelRow = rowIndex + 1;
                 try {
                     KeyedShipToRequest keyed = new KeyedShipToRequest();
                     keyed.masterKey = normalizeUploadedMasterKey(excelSupport.text(row, 0, evaluator));
-                    keyed.rowVersion = optionalLong(excelSupport.text(row, 1, evaluator));
-                    keyed.action = normalizeAction(excelSupport.text(row, 2, evaluator), keyed.masterKey);
-                    keyed.request = request(row, evaluator, 3);
+                    keyed.action = normalizeAction(excelSupport.text(row, actionColumn, evaluator), keyed.masterKey);
+                    keyed.request = request(row, evaluator, dataOffset);
                     if (!"DELETE".equals(keyed.action)) addBeanErrors(errors, excelRow, beanValidator.validate(keyed.request));
                     if (keyed.masterKey != null && !keys.add(keyed.masterKey)) errors.add(new ImportRowError(excelRow, "masterKey", "Duplicate Key inside uploaded file"));
                     rows.add(new ImportCandidate<>(excelRow, keyed));
@@ -487,16 +489,6 @@ public class ShipToService {
         return value;
     }
 
-    private Long optionalLong(String raw) {
-        String clean = MasterDataTextNormalizer.trimToNull(raw);
-        if (clean == null) return null;
-        try { return new java.math.BigDecimal(clean.replace(",", "")).longValueExact(); }
-        catch (RuntimeException ex) { throw new MasterDataValidationException("Row Version must be a whole number"); }
-    }
-
-    private boolean sameVersion(Long uploaded, Long current) {
-        return uploaded == null ? current == null : uploaded.equals(current);
-    }
 
     private MasterDataImportResult baseResult(ImportMode mode, int totalRows) {
         MasterDataImportResult result = new MasterDataImportResult();
@@ -522,7 +514,6 @@ public class ShipToService {
 
     private static class KeyedShipToRequest {
         private String masterKey;
-        private Long rowVersion;
         private String action;
         private ShipToRequest request;
     }

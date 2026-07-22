@@ -77,18 +77,38 @@ public class ProductColorMasterService {
         Sort.Direction direction = "asc".equalsIgnoreCase(trim(sortDir))
                 ? Sort.Direction.ASC
                 : Sort.Direction.DESC;
-        Pageable pageable = PageRequest.of(safePage, safeSize, Sort.by(direction, safeSortBy));
+        Sort sort = Sort.by(direction, safeSortBy);
+        if ("createdAt".equals(safeSortBy) && direction == Sort.Direction.DESC) {
+            sort = sort.and(Sort.by(Sort.Order.desc("updatedAt"), Sort.Order.desc("_id")));
+        }
+        Pageable pageable = PageRequest.of(safePage, safeSize, sort);
         Page<ProductColorMaster> result = blank(productColor)
                 ? repository.findByBuyerKey(allowedBuyer, pageable)
                 : repository.findByBuyerKeyAndProductColorContainingIgnoreCase(allowedBuyer, trim(productColor), pageable);
-        return result.map(this::ensureChildColorIds);
+        return result.map(this::withUsageState);
+    }
+
+    /**
+     * Adds the current BOM usage state to the API response. The lock is
+     * calculated every time data is read, so it is removed automatically after
+     * the final BOM link is removed.
+     */
+    private ProductColorMaster withUsageState(ProductColorMaster entity) {
+        if (entity == null) return null;
+        ensureChildColorIds(entity);
+        long linkedBomCount = blank(entity.getId())
+                ? 0
+                : bomRepository.countByProductColorsProductColorMasterId(entity.getId());
+        entity.setLinkedBomCount(linkedBomCount);
+        entity.setDeleteLocked(linkedBomCount > 0);
+        return entity;
     }
 
     private String normalizeProductColorSortField(String sortBy) {
         String field = trim(sortBy);
         return switch (field) {
             case "patternNumber", "productColor", "season", "styleNumber", "createdAt", "updatedAt" -> field;
-            default -> "updatedAt";
+            default -> "createdAt";
         };
     }
 
@@ -97,7 +117,7 @@ public class ProductColorMasterService {
                 .orElseThrow(() -> new MasterDataNotFoundException("Product Color Master not found"));
         buyerAccess.requireEntityAccess(entity.getBuyerKey());
         if (entity.getBuyerKey() == null || entity.getBuyerKey().isBlank()) entity.setBuyerKey(BuyerKeys.LL_BEAN);
-        return ensureChildColorIds(entity);
+        return withUsageState(entity);
     }
 
     public ProductColorMaster create(ProductColorMasterRequest request) {
@@ -110,7 +130,7 @@ public class ProductColorMasterService {
         LocalDateTime now = LocalDateTime.now();
         entity.setCreatedAt(now);
         entity.setUpdatedAt(now);
-        return repository.save(entity);
+        return withUsageState(repository.save(entity));
     }
 
     public ProductColorMaster update(String id, ProductColorMasterRequest request) {
@@ -137,14 +157,16 @@ public class ProductColorMasterService {
                     throw new MasterDataConflictException("The same Pattern Number, Product Color, Season and Style Number already exists.");
                 });
         entity.setUpdatedAt(LocalDateTime.now());
-        return repository.save(entity);
+        return withUsageState(repository.save(entity));
     }
 
     public void delete(String id) {
         ProductColorMaster entity = get(id);
-        if (bomRepository.existsByProductColorsProductColorMasterId(entity.getId())) {
+        long linkedBomCount = bomRepository.countByProductColorsProductColorMasterId(entity.getId());
+        if (linkedBomCount > 0) {
             throw new MasterDataConflictException(
-                    "Cannot delete Product Color because one or more BOMs are linked to it. Remove or change the BOM link first."
+                    "This Product Color is locked because it is linked to " + linkedBomCount
+                            + " BOM(s). Remove or change every BOM link before deleting it."
             );
         }
         repository.delete(entity);
@@ -170,7 +192,7 @@ public class ProductColorMasterService {
 
         ProductColorMaster saved = repository.save(entity);
         fileStorage.deleteQuietly(previousStoredFileName);
-        return saved;
+        return withUsageState(saved);
     }
 
     public ProductColorImageResource downloadImage(String id) {

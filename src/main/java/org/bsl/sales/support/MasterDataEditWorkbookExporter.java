@@ -40,7 +40,7 @@ public final class MasterDataEditWorkbookExporter {
             Styles styles = new Styles(workbook);
 
             writeHeader(sheet, styles.header, 0,
-                    "Key", "Row Version", "Action", "Short name supplier", "Vendor Code", "Vendor Name", "MAT\nCHARGER", "Remark");
+                    "Key", "Action", "Short name supplier", "Vendor Code", "Vendor Name", "MAT\nCHARGER", "Remark");
             sheet.createFreezePane(0, 1);
 
             List<VendorCode> sorted = rows == null ? Collections.emptyList() : rows.stream()
@@ -51,18 +51,17 @@ public final class MasterDataEditWorkbookExporter {
             for (VendorCode item : sorted) {
                 Row row = sheet.createRow(rowIndex++);
                 write(row, 0, item.getMasterKey(), styles.lockedText);
-                write(row, 1, item.getVersion(), styles.lockedText);
-                write(row, 2, "UPDATE", styles.text);
-                write(row, 3, item.getShortNameSupplier(), styles.text);
-                write(row, 4, item.getVendorCode(), styles.text);
-                write(row, 5, item.getVendorName(), styles.text);
-                write(row, 6, item.getMatCharger(), styles.text);
-                write(row, 7, item.getRemark(), styles.text);
+                write(row, 1, "UPDATE", styles.text);
+                write(row, 2, item.getShortNameSupplier(), styles.text);
+                write(row, 3, item.getVendorCode(), styles.text);
+                write(row, 4, item.getVendorName(), styles.text);
+                write(row, 5, item.getMatCharger(), styles.text);
+                write(row, 6, item.getRemark(), styles.text);
             }
 
-            setWidths(sheet, 16, 14, 12, 28, 18, 30, 18, 34);
-            addActionValidation(sheet, 2, Math.max(5000, rowIndex + 100));
-            protectIdentityColumns(sheet, 0, 1);
+            setWidths(sheet, 16, 12, 28, 18, 30, 18, 34);
+            addActionValidation(sheet, 1, Math.max(5000, rowIndex + 100));
+            protectIdentityColumns(sheet, 0);
             return toBytes(workbook);
         } catch (IOException ex) {
             throw new IllegalStateException("Cannot export Vendor Code edit workbook", ex);
@@ -75,7 +74,7 @@ public final class MasterDataEditWorkbookExporter {
             Styles styles = new Styles(workbook);
 
             writeHeader(sheet, styles.header, 0,
-                    "Key", "Row Version", "Action", "FLEX ID", "Material type", "MAT FULL DESCRIPTION", "MAT COLOR", "MAT UNIT",
+                    "Key", "Action", "FLEX ID", "Material type", "MAT FULL DESCRIPTION", "MAT COLOR", "MAT UNIT",
                     "CUR", "MAT\nPRICE\n(W/O TAX)", "Short name supplier", "Remark", "Updated Date",
                     "Updated PIC", "Style Desc");
             sheet.createFreezePane(0, 1);
@@ -88,26 +87,25 @@ public final class MasterDataEditWorkbookExporter {
             for (MatInfo item : sorted) {
                 Row row = sheet.createRow(rowIndex++);
                 write(row, 0, item.getMasterKey(), styles.lockedText);
-                write(row, 1, item.getVersion(), styles.lockedText);
-                write(row, 2, "UPDATE", styles.text);
-                write(row, 3, item.getFlexId(), styles.text);
-                write(row, 4, item.getMaterialType(), styles.text);
-                write(row, 5, item.getMatFullDescription(), styles.textWrap);
-                write(row, 6, item.getMatColor(), styles.textWrap);
-                write(row, 7, item.getMatUnit(), styles.text);
-                write(row, 8, item.getCurrency(), styles.text);
+                write(row, 1, "UPDATE", styles.text);
+                write(row, 2, item.getFlexId(), styles.text);
+                write(row, 3, item.getMaterialType(), styles.text);
+                write(row, 4, item.getMatFullDescription(), styles.textWrap);
+                write(row, 5, item.getMatColor(), styles.textWrap);
+                write(row, 6, item.getMatUnit(), styles.text);
+                write(row, 7, item.getCurrency(), styles.text);
                 CellStyle moneyStyle = "VND".equalsIgnoreCase(item.getCurrency()) ? styles.vnd : styles.decimal;
-                write(row, 9, item.getMatPriceWithoutTax(), moneyStyle);
-                write(row, 10, item.getShortNameSupplier(), styles.text);
-                write(row, 11, item.getRemark(), styles.textWrap);
-                write(row, 12, item.getUpdatedDate() == null ? null : DATE_FORMAT.format(item.getUpdatedDate()), styles.text);
-                write(row, 13, item.getUpdatedPic(), styles.text);
-                write(row, 14, item.getStyleDesc(), styles.textWrap);
+                write(row, 8, item.getMatPriceWithoutTax(), moneyStyle);
+                write(row, 9, item.getShortNameSupplier(), styles.text);
+                write(row, 10, item.getRemark(), styles.textWrap);
+                write(row, 11, item.getUpdatedDate() == null ? null : DATE_FORMAT.format(item.getUpdatedDate()), styles.text);
+                write(row, 12, item.getUpdatedPic(), styles.text);
+                write(row, 13, item.getStyleDesc(), styles.textWrap);
             }
 
-            setWidths(sheet, 16, 14, 12, 13, 18, 46, 28, 12, 10, 18, 24, 34, 16, 16, 30);
-            addActionValidation(sheet, 2, Math.max(10000, rowIndex + 100));
-            protectIdentityColumns(sheet, 0, 1);
+            setWidths(sheet, 16, 12, 13, 18, 46, 28, 12, 10, 18, 24, 34, 16, 16, 30);
+            addActionValidation(sheet, 1, Math.max(10000, rowIndex + 100));
+            protectIdentityColumns(sheet, 0);
             return toBytes(workbook);
         } catch (IOException ex) {
             throw new IllegalStateException("Cannot export MAT_INFO edit workbook", ex);
@@ -119,7 +117,7 @@ public final class MasterDataEditWorkbookExporter {
             Sheet sheet = workbook.createSheet("SHIP TO");
             Styles styles = new Styles(workbook);
             writeHeader(sheet, styles.header, 0,
-                    "Key", "Row Version", "Action", "Ship To Code", "Ship To Name", "Active", "Remark");
+                    "Key", "Action", "Ship To Code", "Ship To Name", "Active", "Remark");
             sheet.createFreezePane(0, 1);
 
             List<ShipTo> sorted = rows == null ? Collections.emptyList() : rows.stream()
@@ -130,16 +128,15 @@ public final class MasterDataEditWorkbookExporter {
             for (ShipTo item : sorted) {
                 Row row = sheet.createRow(rowIndex++);
                 write(row, 0, item.getMasterKey(), styles.lockedText);
-                write(row, 1, item.getVersion(), styles.lockedText);
-                write(row, 2, "UPDATE", styles.text);
-                write(row, 3, item.getShipToCode(), styles.text);
-                write(row, 4, item.getShipToName(), styles.text);
-                write(row, 5, item.isActive() ? "TRUE" : "FALSE", styles.text);
-                write(row, 6, item.getRemark(), styles.textWrap);
+                write(row, 1, "UPDATE", styles.text);
+                write(row, 2, item.getShipToCode(), styles.text);
+                write(row, 3, item.getShipToName(), styles.text);
+                write(row, 4, item.isActive() ? "TRUE" : "FALSE", styles.text);
+                write(row, 5, item.getRemark(), styles.textWrap);
             }
-            setWidths(sheet, 16, 14, 12, 20, 36, 12, 40);
-            addActionValidation(sheet, 2, Math.max(5000, rowIndex + 100));
-            protectIdentityColumns(sheet, 0, 1);
+            setWidths(sheet, 16, 12, 20, 36, 12, 40);
+            addActionValidation(sheet, 1, Math.max(5000, rowIndex + 100));
+            protectIdentityColumns(sheet, 0);
             return toBytes(workbook);
         } catch (IOException ex) {
             throw new IllegalStateException("Cannot export Ship To edit workbook", ex);
@@ -164,10 +161,10 @@ public final class MasterDataEditWorkbookExporter {
                 Row row = sheet.createRow(rowIndex++);
                 write(row, 0, item.getMasterKey(), styles.text);
                 write(row, 1, item.getMaterialGroup(), styles.text);
-                write(row, 2, item.getLossLt501(), styles.decimal);
-                write(row, 3, item.getLossLt1501(), styles.decimal);
-                write(row, 4, item.getLossLt3001(), styles.decimal);
-                write(row, 5, item.getLossGte3001(), styles.decimal);
+                write(row, 2, item.getLossLt501(), styles.percentage);
+                write(row, 3, item.getLossLt1501(), styles.percentage);
+                write(row, 4, item.getLossLt3001(), styles.percentage);
+                write(row, 5, item.getLossGte3001(), styles.percentage);
                 write(row, 7, item.getMaterialGroup(), styles.text);
                 write(row, 8, item.getFactorLt501(), styles.decimal);
                 write(row, 9, item.getFactorLt1501(), styles.decimal);
@@ -241,6 +238,7 @@ public final class MasterDataEditWorkbookExporter {
         private final CellStyle lockedText;
         private final CellStyle textWrap;
         private final CellStyle decimal;
+        private final CellStyle percentage;
         private final CellStyle vnd;
 
         private Styles(Workbook workbook) {
@@ -274,6 +272,10 @@ public final class MasterDataEditWorkbookExporter {
             decimal = workbook.createCellStyle();
             decimal.cloneStyleFrom(text);
             decimal.setDataFormat(workbook.getCreationHelper().createDataFormat().getFormat("#,##0.######"));
+
+            percentage = workbook.createCellStyle();
+            percentage.cloneStyleFrom(text);
+            percentage.setDataFormat(workbook.getCreationHelper().createDataFormat().getFormat("0.##%"));
 
             vnd = workbook.createCellStyle();
             vnd.cloneStyleFrom(text);

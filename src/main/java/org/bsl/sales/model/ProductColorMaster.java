@@ -5,6 +5,7 @@ import com.fasterxml.jackson.annotation.JsonProperty;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 import org.springframework.data.annotation.Id;
+import org.springframework.data.annotation.Transient;
 import org.springframework.data.mongodb.core.index.Indexed;
 import org.springframework.data.mongodb.core.index.CompoundIndex;
 import org.springframework.data.mongodb.core.index.CompoundIndexes;
@@ -55,6 +56,18 @@ public class ProductColorMaster {
     private String styleNumber;
     private boolean active = true;
     private List<ProductColorAttribute> childColors = new ArrayList<>();
+
+    /**
+     * Runtime-only usage information. A Product Color that is still linked to
+     * at least one BOM cannot be deleted or have its four identity fields
+     * changed. These fields are calculated by ProductColorMasterService and
+     * are never persisted to MongoDB.
+     */
+    @Transient
+    private boolean deleteLocked;
+
+    @Transient
+    private long linkedBomCount;
 
     /** Product image belongs to Product Color Master and is reused by every linked BOM. */
     @JsonIgnore
