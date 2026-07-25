@@ -14,7 +14,14 @@ RUN ./gradlew dependencies --no-daemon || true
 
 COPY src src
 
-RUN ./gradlew bootJar -x test --no-daemon
+RUN ./gradlew clean bootJar -x test --no-daemon
+
+# Tìm file jar thực tế và copy về đường dẫn cố định
+RUN JAR_FILE="$(find /app -type f -path '*/build/libs/*.jar' \
+    ! -name '*-plain.jar' | head -n 1)" \
+    && echo "JAR found: $JAR_FILE" \
+    && test -n "$JAR_FILE" \
+    && cp "$JAR_FILE" /app/app.jar
 
 
 # ===== RUN STAGE =====
@@ -22,7 +29,7 @@ FROM eclipse-temurin:17-jre
 
 WORKDIR /app
 
-COPY --from=build /app/build/libs/*.jar app.jar
+COPY --from=build /app/app.jar app.jar
 
 EXPOSE 8082
 
