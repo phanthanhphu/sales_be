@@ -12,5 +12,7 @@ public record MprSelectionRequest(
         List<String> packingIds,
         Map<String, BigDecimal> poQtyByColor,
         /** One or more Ship To master ids for each selected Product Color. */
-        Map<String, List<String>> shipToIdsByColor
+        Map<String, List<String>> shipToIdsByColor,
+        /** Separate PO Qty per Ship To id for each selected Product Color. */
+        Map<String, Map<String, BigDecimal>> shipToQtyByColor
 ) { }

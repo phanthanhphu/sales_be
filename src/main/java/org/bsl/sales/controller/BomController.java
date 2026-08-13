@@ -11,24 +11,58 @@ import org.bsl.sales.model.BomLine;
 import org.bsl.sales.service.BomService;
 import org.bsl.sales.service.OrderBomMprExcelExporter;
 import org.springframework.core.io.Resource;
+import org.springframework.core.io.ClassPathResource;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
+import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
 import java.util.List;
 
 @RestController
 @RequestMapping("/api")
 public class BomController {
+    private static final ZoneId DOWNLOAD_TIME_ZONE = ZoneId.of("Asia/Ho_Chi_Minh");
+    private static final DateTimeFormatter DOWNLOAD_TIME_FORMAT = DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss");
+    private static final DateTimeFormatter DOWNLOAD_DATE_FORMAT = DateTimeFormatter.ofPattern("yyyyMMdd");
+
     private final BomService bomService;
     private final OrderBomMprExcelExporter exporter;
 
     public BomController(BomService bomService, OrderBomMprExcelExporter exporter) {
         this.bomService = bomService;
         this.exporter = exporter;
+    }
+
+    @GetMapping("/boms/template")
+    public ResponseEntity<Resource> downloadBomTemplate() {
+        Resource resource = new ClassPathResource("templates/BOM_Upload_Template.xlsx");
+        if (!resource.exists()) {
+            throw new IllegalStateException("BOM upload template is missing");
+        }
+        return ResponseEntity.ok()
+                .contentType(MediaType.APPLICATION_OCTET_STREAM)
+                .header(HttpHeaders.CONTENT_DISPOSITION, contentDisposition("BOM_Template_" + timestamp() + ".xlsx"))
+                .body(resource);
+    }
+
+    @GetMapping("/boms/{id}/template")
+    public ResponseEntity<byte[]> downloadBomTemplate(@PathVariable String id) {
+        BomDocument bom = bomService.get(id);
+        return ResponseEntity.ok()
+                .contentType(MediaType.APPLICATION_OCTET_STREAM)
+                .header(
+                        HttpHeaders.CONTENT_DISPOSITION,
+                        contentDisposition(downloadFileName(bom, true))
+                )
+                .body(exporter.exportBomTemplate(bom));
     }
 
     @GetMapping("/orders/{orderId}/boms")
@@ -158,9 +192,56 @@ public class BomController {
         BomDocument bom = bomService.get(id);
         return ResponseEntity.ok()
                 .contentType(MediaType.APPLICATION_OCTET_STREAM)
-                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + safeFileName(bom.getBomNo()) + ".xlsx\"")
+                .header(HttpHeaders.CONTENT_DISPOSITION, contentDisposition(downloadFileName(bom, false)))
                 .body(exporter.exportBom(bom));
     }
 
-    private String safeFileName(String value) { return (value == null ? "BOM" : value).replaceAll("[^A-Za-z0-9._-]", "_"); }
+    private String downloadFileName(BomDocument bom, boolean template) {
+        String buyer = safeBuyerPart(bom == null ? null : bom.getBuyerKey());
+        String bomNo = safeFilePart(bom == null ? null : bom.getBomNo(), "BOM");
+        String date = LocalDate.now(DOWNLOAD_TIME_ZONE).format(DOWNLOAD_DATE_FORMAT);
+        if (template) {
+            return "BOM_" + buyer + "_" + bomNo + "_Template_" + date + ".xlsx";
+        }
+        return "BOM_" + buyer + "_" + bomNo + "_" + date + ".xlsx";
+    }
+
+    private String safeBuyerPart(String value) {
+        String resolved = value == null ? "" : value.trim().toUpperCase();
+        String safe = resolved.replaceAll("[^A-Z0-9]", "");
+        return safe.isBlank() ? "BUYER" : safe;
+    }
+
+    private String safeFilePart(String value, String fallback) {
+        String resolved = firstText(value, fallback).trim();
+        String safe = resolved.replaceAll("[^A-Za-z0-9._-]", "_")
+                .replaceAll("_+", "_")
+                .replaceAll("^_+|_+$", "");
+        return safe.isBlank() ? fallback : safe;
+    }
+
+    private String timestamp() {
+        return LocalDateTime.now(DOWNLOAD_TIME_ZONE).format(DOWNLOAD_TIME_FORMAT);
+    }
+
+    private String contentDisposition(String fileName) {
+        String resolved = firstText(fileName, "BOM_" + timestamp() + ".xlsx");
+        String asciiFallback = safeFileName(resolved);
+        String encoded = URLEncoder.encode(resolved, StandardCharsets.UTF_8).replace("+", "%20");
+        return "attachment; filename=\"" + asciiFallback + "\"; filename*=UTF-8''" + encoded;
+    }
+
+    private String firstText(String... values) {
+        if (values == null) return "BOM";
+        for (String value : values) {
+            if (value != null && !value.isBlank()) return value;
+        }
+        return "BOM";
+    }
+
+    private String safeFileName(String value) {
+        String safe = firstText(value, "BOM").replaceAll("[^A-Za-z0-9._-]", "_");
+        return safe.isBlank() ? "BOM.xlsx" : safe;
+    }
 }
+

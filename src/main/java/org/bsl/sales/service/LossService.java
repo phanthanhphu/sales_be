@@ -22,6 +22,8 @@ import org.bsl.sales.repository.BomDocumentRepository;
 import org.bsl.sales.repository.LossRepository;
 import org.bsl.sales.repository.MatInfoRepository;
 import org.bsl.sales.repository.MprDocumentRepository;
+import org.bsl.sales.security.BuyerAccessService;
+import org.bsl.sales.support.BuyerKeys;
 import org.bsl.sales.support.ImportCandidate;
 import org.bsl.sales.support.MasterDataBeanValidator;
 import org.bsl.sales.support.MasterDataExcelSupport;
@@ -66,6 +68,7 @@ public class LossService {
     private final MprDocumentRepository mprDocumentRepository;
     private final MasterDataBeanValidator beanValidator;
     private final MasterDataExcelSupport excelSupport;
+    private final BuyerAccessService buyerAccess;
 
     public LossService(
             LossRepository lossRepository,
@@ -74,7 +77,8 @@ public class LossService {
             BomLineStore lineStore,
             MprDocumentRepository mprDocumentRepository,
             MasterDataBeanValidator beanValidator,
-            MasterDataExcelSupport excelSupport
+            MasterDataExcelSupport excelSupport,
+            BuyerAccessService buyerAccess
     ) {
         this.lossRepository = lossRepository;
         this.matInfoRepository = matInfoRepository;
@@ -83,15 +87,18 @@ public class LossService {
         this.mprDocumentRepository = mprDocumentRepository;
         this.beanValidator = beanValidator;
         this.excelSupport = excelSupport;
+        this.buyerAccess = buyerAccess;
     }
 
-    public Loss create(LossRequest request) {
+    public Loss create(String buyerKey, LossRequest request) {
+        String buyer = buyerAccess.requireBuyer(buyerKey);
         String key = materialGroupKey(request);
-        if (lossRepository.existsByMaterialGroupKey(key)) {
+        if (lossRepository.existsByBuyerKeyAndMaterialGroupKey(buyer, key)) {
             throw new MasterDataConflictException("Loss master already exists for material group: " + request.getMaterialGroup());
         }
 
         Loss entity = new Loss();
+        entity.setBuyerKey(buyer);
         apply(entity, request);
         assignMasterKeyIfMissing(entity);
         LocalDateTime now = LocalDateTime.now();
@@ -106,6 +113,7 @@ public class LossService {
      * decimal values (0.03).
      */
     public Page<Loss> list(
+            String buyerKey,
             String masterKey,
             String materialGroup,
             BigDecimal lossLt501Percent,
@@ -115,6 +123,7 @@ public class LossService {
             int page,
             int size
     ) {
+        String buyer = buyerAccess.requireBuyer(buyerKey);
         backfillMissingMasterKeys();
         Pageable pageable = toPageable(page, size);
         String masterKeySearch = MasterDataTextNormalizer.key(masterKey);
@@ -125,7 +134,7 @@ public class LossService {
         BigDecimal lossLt3001 = percentToDecimal(lossLt3001Percent, "Loss <3001");
         BigDecimal lossGte3001 = percentToDecimal(lossGte3001Percent, "Loss ≥3001");
 
-        List<Loss> filtered = lossRepository.findAll().stream()
+        List<Loss> filtered = lossRepository.findByBuyerKey(buyer).stream()
                 .filter(item -> contains(item.getMasterKey(), masterKeySearch))
                 .filter(item -> materialGroupSearch == null || item.getMaterialGroupKey().contains(materialGroupSearch))
                 .filter(item -> sameDecimal(item.getLossLt501(), lossLt501))
@@ -138,34 +147,44 @@ public class LossService {
         return page(filtered, pageable);
     }
 
-    public Loss getById(String id) {
+    public Loss getById(String buyerKey, String id) {
+        String buyer = buyerAccess.requireBuyer(buyerKey);
         Loss entity = lossRepository.findById(id)
                 .orElseThrow(() -> new MasterDataNotFoundException("Loss master record not found"));
+        String storedBuyer = BuyerKeys.legacyDefault(entity.getBuyerKey());
+        if (!buyer.equals(storedBuyer)) {
+            throw new MasterDataNotFoundException("Loss master record not found for Buyer: " + buyer);
+        }
+        buyerAccess.requireEntityAccess(storedBuyer);
         return ensureMasterKeyPersisted(entity);
     }
 
-    public Loss update(String id, LossRequest request) {
-        Loss existing = getById(id);
+    public Loss update(String buyerKey, String id, LossRequest request) {
+        String buyer = buyerAccess.requireBuyer(buyerKey);
+        Loss existing = getById(buyer, id);
         String nextKey = materialGroupKey(request);
-        if (!existing.getMaterialGroupKey().equals(nextKey) && lossRepository.existsByMaterialGroupKey(nextKey)) {
+        if (!existing.getMaterialGroupKey().equals(nextKey)
+                && lossRepository.existsByBuyerKeyAndMaterialGroupKey(buyer, nextKey)) {
             throw new MasterDataConflictException("Loss master already exists for material group: " + request.getMaterialGroup());
         }
         if (!existing.getMaterialGroupKey().equals(nextKey)
-                && isLossUsed(existing.getMaterialGroupKey())) {
+                && isLossUsed(buyer, existing.getMaterialGroupKey())) {
             throw new MasterDataConflictException(
                     "Cannot change Material Group because MAT_INFO, BOM or MPR records are using this loss group"
             );
         }
 
+        existing.setBuyerKey(buyer);
         apply(existing, request);
         assignMasterKeyIfMissing(existing);
         existing.setUpdatedAt(LocalDateTime.now());
         return lossRepository.save(existing);
     }
 
-    public void delete(String id) {
-        Loss existing = getById(id);
-        if (isLossUsed(existing.getMaterialGroupKey())) {
+    public void delete(String buyerKey, String id) {
+        String buyer = buyerAccess.requireBuyer(buyerKey);
+        Loss existing = getById(buyer, id);
+        if (isLossUsed(buyer, existing.getMaterialGroupKey())) {
             throw new MasterDataConflictException(
                     "Cannot delete Loss because MAT_INFO, BOM or MPR records are using this Material Group"
             );
@@ -173,7 +192,8 @@ public class LossService {
         lossRepository.delete(existing);
     }
 
-    public LossResolutionResponse resolve(String materialType, BigDecimal totalQuantity) {
+    public LossResolutionResponse resolve(String buyerKey, String materialType, BigDecimal totalQuantity) {
+        String buyer = buyerAccess.requireBuyer(buyerKey);
         String key = MasterDataTextNormalizer.materialGroupKey(materialType);
         if (key == null) {
             throw new MasterDataValidationException("materialType is required");
@@ -182,7 +202,7 @@ public class LossService {
             throw new MasterDataValidationException("totalQuantity must be greater than or equal to 0");
         }
 
-        Loss loss = lossRepository.findByMaterialGroupKey(key)
+        Loss loss = lossRepository.findByBuyerKeyAndMaterialGroupKey(buyer, key)
                 .orElseThrow(() -> new MasterDataNotFoundException("No loss master found for material type: " + materialType));
         loss = ensureMasterKeyPersisted(loss);
 
@@ -211,7 +231,8 @@ public class LossService {
         return response;
     }
 
-    public MasterDataImportResult upload(MultipartFile file, ImportMode mode) {
+    public MasterDataImportResult upload(MultipartFile file, ImportMode mode, String buyerKey) {
+        String buyer = buyerAccess.requireBuyer(buyerKey);
         ImportMode effectiveMode = mode == null ? ImportMode.UPSERT : mode;
         List<ImportRowError> errors = new ArrayList<>();
         List<ImportCandidate<LossRequest>> rows = new ArrayList<>();
@@ -265,13 +286,13 @@ public class LossService {
         }
 
         int duplicateRows = deduplicateLossRows(rows);
-        Map<String, Loss> existingByMaterialKey = lossRepository.findAll().stream()
+        Map<String, Loss> existingByMaterialKey = lossRepository.findByBuyerKey(buyer).stream()
                 .filter(item -> item.getMaterialGroupKey() != null)
                 .collect(Collectors.toMap(Loss::getMaterialGroupKey, item -> item, (a, b) -> a));
         int existingDuplicateRows = effectiveMode == ImportMode.REPLACE_ALL
                 ? 0
                 : removeExistingLossDuplicates(rows, existingByMaterialKey);
-        validateBeforeApply(effectiveMode, rows, errors);
+        validateBeforeApply(buyer, effectiveMode, rows, errors);
         if (!errors.isEmpty()) {
             return MasterDataImportResult.rejected(MASTER_DATA_NAME, effectiveMode, totalRows, errors);
         }
@@ -288,7 +309,7 @@ public class LossService {
             Set<String> incomingKeys = rows.stream()
                     .map(row -> materialGroupKey(row.getValue()))
                     .collect(Collectors.toSet());
-            List<Loss> toDelete = lossRepository.findAll().stream()
+            List<Loss> toDelete = lossRepository.findByBuyerKey(buyer).stream()
                     .filter(item -> !incomingKeys.contains(item.getMaterialGroupKey()))
                     .collect(Collectors.toList());
             if (!toDelete.isEmpty()) {
@@ -300,7 +321,7 @@ public class LossService {
         for (ImportCandidate<LossRequest> row : rows) {
             LossRequest request = row.getValue();
             String key = materialGroupKey(request);
-            Optional<Loss> existing = lossRepository.findByMaterialGroupKey(key);
+            Optional<Loss> existing = lossRepository.findByBuyerKeyAndMaterialGroupKey(buyer, key);
             if (existing.isPresent()) {
                 if (sameLossData(existing.get(), request)) {
                     result.setSkipped(result.getSkipped() + 1);
@@ -313,6 +334,7 @@ public class LossService {
                 result.setUpdated(result.getUpdated() + 1);
             } else {
                 Loss entity = new Loss();
+                entity.setBuyerKey(buyer);
                 apply(entity, request);
                 assignMasterKeyIfMissing(entity);
                 LocalDateTime now = LocalDateTime.now();
@@ -326,16 +348,18 @@ public class LossService {
     }
 
 
-    public byte[] exportForEdit() {
+    public byte[] exportForEdit(String buyerKey) {
+        String buyer = buyerAccess.requireBuyer(buyerKey);
         backfillMissingMasterKeys();
-        return MasterDataEditWorkbookExporter.losses(lossRepository.findAll());
+        return MasterDataEditWorkbookExporter.losses(lossRepository.findByBuyerKey(buyer));
     }
 
     /**
      * Edited-workbook upload. Existing L key updates that exact row. Blank key
      * creates a new Loss row and receives the next L key automatically.
      */
-    public MasterDataImportResult uploadEdited(MultipartFile file) {
+    public MasterDataImportResult uploadEdited(MultipartFile file, String buyerKey) {
+        String buyer = buyerAccess.requireBuyer(buyerKey);
         List<ImportRowError> errors = new ArrayList<>();
         List<ImportCandidate<KeyedLossRequest>> rows = new ArrayList<>();
         int totalRows = 0;
@@ -403,11 +427,11 @@ public class LossService {
         }
 
         int duplicateRows = deduplicateEditedLossRows(rows);
-        Map<String, Loss> existingByMaterialKey = lossRepository.findAll().stream()
+        Map<String, Loss> existingByMaterialKey = lossRepository.findByBuyerKey(buyer).stream()
                 .filter(item -> item.getMaterialGroupKey() != null)
                 .collect(Collectors.toMap(Loss::getMaterialGroupKey, item -> item, (a, b) -> a));
         int existingDuplicateRows = removeExistingEditedLossDuplicates(rows, existingByMaterialKey);
-        validateEditedRows(rows, errors);
+        validateEditedRows(buyer, rows, errors);
         if (!errors.isEmpty()) {
             return MasterDataImportResult.rejected(MASTER_DATA_NAME, ImportMode.UPSERT, totalRows, errors);
         }
@@ -424,7 +448,8 @@ public class LossService {
             KeyedLossRequest keyed = row.getValue();
             Optional<Loss> existing = keyed.masterKey == null
                     ? Optional.empty()
-                    : lossRepository.findByMasterKey(keyed.masterKey);
+                    : lossRepository.findByMasterKey(keyed.masterKey)
+                            .filter(item -> buyer.equals(BuyerKeys.legacyDefault(item.getBuyerKey())));
             Loss duplicate = existingByMaterialKey.get(materialGroupKey(keyed.request));
             if (duplicate != null && sameLossData(duplicate, keyed.request)) {
                 result.setSkipped(result.getSkipped() + 1);
@@ -438,6 +463,7 @@ public class LossService {
                 result.setUpdated(result.getUpdated() + 1);
             } else {
                 Loss entity = new Loss();
+                entity.setBuyerKey(buyer);
                 apply(entity, keyed.request);
                 entity.setMasterKey(keyed.masterKey);
                 assignMasterKeyIfMissing(entity);
@@ -538,12 +564,13 @@ public class LossService {
     }
 
     private void validateEditedRows(
+            String buyerKey,
             List<ImportCandidate<KeyedLossRequest>> rows,
             List<ImportRowError> errors
     ) {
         Map<String, Loss> existingByMasterKey = new HashMap<>();
         Map<String, Loss> existingByMaterialKey = new HashMap<>();
-        for (Loss item : lossRepository.findAll()) {
+        for (Loss item : lossRepository.findByBuyerKey(buyerKey)) {
             if (item.getMasterKey() != null && !item.getMasterKey().isBlank()) {
                 existingByMasterKey.put(item.getMasterKey().trim().toUpperCase(Locale.ROOT), item);
             }
@@ -564,6 +591,16 @@ public class LossService {
                 continue;
             }
 
+            Loss globalKeyOwner = keyed.masterKey == null ? null : lossRepository.findByMasterKey(keyed.masterKey).orElse(null);
+            if (globalKeyOwner != null && !buyerKey.equals(BuyerKeys.legacyDefault(globalKeyOwner.getBuyerKey()))) {
+                errors.add(new ImportRowError(
+                        row.getRowNumber(),
+                        "masterKey",
+                        "Loss Key belongs to another Buyer and cannot be reused: " + keyed.masterKey
+                ));
+                continue;
+            }
+
             Loss target = keyed.masterKey == null ? null : existingByMasterKey.get(keyed.masterKey);
             Loss duplicate = existingByMaterialKey.get(materialKey);
             if (duplicate != null
@@ -579,7 +616,7 @@ public class LossService {
             if (target != null
                     && target.getMaterialGroupKey() != null
                     && !target.getMaterialGroupKey().equals(materialKey)
-                    && isLossUsed(target.getMaterialGroupKey())) {
+                    && isLossUsed(buyerKey, target.getMaterialGroupKey())) {
                 errors.add(new ImportRowError(
                         row.getRowNumber(),
                         "materialGroup",
@@ -602,6 +639,7 @@ public class LossService {
     }
 
     private void validateBeforeApply(
+            String buyerKey,
             ImportMode mode,
             List<ImportCandidate<LossRequest>> rows,
             List<ImportRowError> errors
@@ -609,7 +647,7 @@ public class LossService {
         if (mode == ImportMode.CREATE_ONLY) {
             for (ImportCandidate<LossRequest> row : rows) {
                 String key = materialGroupKey(row.getValue());
-                Optional<Loss> existing = lossRepository.findByMaterialGroupKey(key);
+                Optional<Loss> existing = lossRepository.findByBuyerKeyAndMaterialGroupKey(buyerKey, key);
                 if (existing.isPresent() && !sameLossData(existing.get(), row.getValue())) {
                     errors.add(new ImportRowError(
                             row.getRowNumber(),
@@ -624,8 +662,8 @@ public class LossService {
             Set<String> incomingKeys = rows.stream()
                     .map(row -> materialGroupKey(row.getValue()))
                     .collect(Collectors.toSet());
-            for (Loss current : lossRepository.findAll()) {
-                if (isLossUsed(current.getMaterialGroupKey())
+            for (Loss current : lossRepository.findByBuyerKey(buyerKey)) {
+                if (isLossUsed(buyerKey, current.getMaterialGroupKey())
                         && !incomingKeys.contains(current.getMaterialGroupKey())) {
                     errors.add(new ImportRowError(
                             1,
@@ -757,20 +795,32 @@ public class LossService {
     }
 
     private Loss ensureMasterKeyPersisted(Loss entity) {
-        if (entity == null || (entity.getMasterKey() != null && !entity.getMasterKey().isBlank())) {
-            return entity;
+        if (entity == null) return null;
+        boolean changed = false;
+        if (entity.getBuyerKey() == null || entity.getBuyerKey().isBlank()) {
+            entity.setBuyerKey(BuyerKeys.LL_BEAN);
+            changed = true;
         }
-        assignMasterKeyIfMissing(entity);
-        return lossRepository.save(entity);
+        if (entity.getMasterKey() == null || entity.getMasterKey().isBlank()) {
+            assignMasterKeyIfMissing(entity);
+            changed = true;
+        }
+        return changed ? lossRepository.save(entity) : entity;
     }
 
     private void backfillMissingMasterKeys() {
         AtomicLong counter = masterKeyCounter();
         for (Loss entity : lossRepository.findAll()) {
+            boolean changed = false;
+            if (entity.getBuyerKey() == null || entity.getBuyerKey().isBlank()) {
+                entity.setBuyerKey(BuyerKeys.LL_BEAN);
+                changed = true;
+            }
             if (entity.getMasterKey() == null || entity.getMasterKey().isBlank()) {
                 MasterDataSequentialKey.ensure(entity::getMasterKey, entity::setMasterKey, counter, MASTER_KEY_PREFIX);
-                lossRepository.save(entity);
+                changed = true;
             }
+            if (changed) lossRepository.save(entity);
         }
     }
 
@@ -786,23 +836,24 @@ public class LossService {
      * BOM material lines, or a generated MPR snapshot. Deleting or renaming it
      * would otherwise make historical BOM/MPR calculations impossible to trace.
      */
-    private boolean isLossUsed(String materialGroupKey) {
+    private boolean isLossUsed(String buyerKey, String materialGroupKey) {
         if (materialGroupKey == null || materialGroupKey.isBlank()) {
             return false;
         }
 
-        if (matInfoRepository.countByMaterialTypeKey(materialGroupKey) > 0) {
+        if (matInfoRepository.countByBuyerKeyAndMaterialTypeKey(buyerKey, materialGroupKey) > 0) {
             return true;
         }
 
         // Protect legacy MAT_INFO rows that do not yet have materialTypeKey.
-        if (matInfoRepository.findAll().stream()
+        if (matInfoRepository.findByBuyerKey(buyerKey).stream()
                 .map(item -> MasterDataTextNormalizer.materialGroupKey(item.getMaterialType()))
                 .anyMatch(materialGroupKey::equals)) {
             return true;
         }
 
         for (BomDocument storedBom : bomDocumentRepository.findAll()) {
+            if (!buyerKey.equals(BuyerKeys.legacyDefault(storedBom.getBuyerKey()))) continue;
             BomDocument bom = lineStore.hydrate(storedBom);
             if (containsMaterialType(bom.getCoreLines(), materialGroupKey)) {
                 return true;
@@ -820,6 +871,7 @@ public class LossService {
         }
 
         for (MprDocument mpr : mprDocumentRepository.findAll()) {
+            if (!buyerKey.equals(BuyerKeys.legacyDefault(mpr.getBuyerKey()))) continue;
             if (containsMaterialType(mpr.getLines(), materialGroupKey)) {
                 return true;
             }

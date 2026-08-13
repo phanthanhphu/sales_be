@@ -4,7 +4,10 @@ import org.bsl.sales.model.BomLine;
 
 import java.util.List;
 
-/** Page response used by the BOM table; image bytes are loaded lazily by URL. */
+/**
+ * Paginated response used by the BOM detail screen when loading Core/Packing
+ * material lines incrementally.
+ */
 public record BomLinePageResponse(
         List<BomLine> items,
         int page,
@@ -13,4 +16,8 @@ public record BomLinePageResponse(
         int totalPages,
         boolean first,
         boolean last
-) { }
+) {
+    public BomLinePageResponse {
+        items = items == null ? List.of() : List.copyOf(items);
+    }
+}

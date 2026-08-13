@@ -29,6 +29,7 @@ public final class AuditActionResolver {
         if (path.contains("/master-data/currencies")) return "CURRENCY";
         if (path.contains("/master-data/vendor-codes") || path.contains("/suppliers")) return "VENDOR_CODE";
         if (path.contains("/master-data/mat-infos")) return "MAT_INFO";
+        if (path.contains("/master-data/material-ship-to-mappings")) return "MATERIAL_SHIP_TO";
         if (path.contains("/master-data/loss")) return "LOSS";
         if (path.contains("/master-data/ship-tos")) return "SHIP_TO";
         if (path.contains("/master-data/product-colors")) return "PRODUCT_COLOR";
@@ -102,7 +103,7 @@ public final class AuditActionResolver {
             String value = segments.get(index);
             String normalized = lower(value);
             if (normalized.equals("api") || ACTION_SEGMENTS.contains(normalized)) continue;
-            if (normalized.matches("users|departments|buyers|orders|boms|mpr|lines|batches|packings|product-colors|attachments|master-data|currencies|vendor-codes|mat-infos|loss|ship-tos|audit-logs|auth")) continue;
+            if (normalized.matches("users|departments|buyers|orders|boms|mpr|lines|batches|packings|product-colors|attachments|master-data|currencies|vendor-codes|mat-infos|material-ship-to-mappings|loss|ship-tos|audit-logs|auth")) continue;
             return value.length() > 120 ? value.substring(0, 120) : value;
         }
         return null;

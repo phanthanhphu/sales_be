@@ -555,6 +555,10 @@ public class BomService {
                     "Product Color images must be uploaded in Product Color Master. BOM only uses the saved Product Color image through its master link."
             );
         }
+        if ("BOM".equals(normalizedScope)
+                && !isImage(file.getOriginalFilename(), file.getContentType())) {
+            throw new OrderBomMprValidationException("Whole BOM upload supports one image file only");
+        }
         String normalizedProductColorId = trim(productColorId);
         String normalizedColorKey = trim(colorKey);
 
@@ -707,6 +711,13 @@ public class BomService {
                 }
                 ensureAttachments(bom).add(attachment);
             }
+            case "BOM" -> {
+                // The BOM header owns one Whole BOM image. A new upload replaces every previous BOM-level image.
+                if (isImageAttachment(attachment)) {
+                    removeExistingWholeBomImages(bom);
+                }
+                ensureAttachments(bom).add(attachment);
+            }
             default -> ensureAttachments(bom).add(attachment);
         }
     }
@@ -808,6 +819,18 @@ public class BomService {
         for (BomLine line : ensureCoreLines(bom)) {
             ensureAttachments(line).removeIf(item -> attachmentId.equals(item.getId()));
         }
+    }
+
+    private void removeExistingWholeBomImages(BomDocument bom) {
+        List<BomAttachment> rootAttachments = ensureAttachments(bom);
+        List<BomAttachment> existing = rootAttachments.stream()
+                .filter(item -> "BOM".equalsIgnoreCase(item.getScope()) || trim(item.getScope()).isBlank())
+                .filter(this::isImageAttachment)
+                .toList();
+        for (BomAttachment attachment : existing) {
+            fileStorage.deleteQuietly(attachment.getStoredFileName());
+        }
+        rootAttachments.removeIf(existing::contains);
     }
 
     private void removeExistingProductColorImages(BomDocument bom, String productColorId) {
@@ -1445,10 +1468,11 @@ public class BomService {
     private void validateDecimal(BigDecimal value, String label) {
         if (value == null) return;
         if (value.signum() < 0) throw new OrderBomMprValidationException(label + " must not be negative");
+
+        // Preserve the decimal precision supplied by Excel or the UI.
+        // Do not reject or round values because they contain more than 6 decimal places.
         BigDecimal normalized = value.stripTrailingZeros();
-        int scale = Math.max(0, normalized.scale());
         int integerDigits = Math.max(0, normalized.precision() - normalized.scale());
-        if (scale > 6) throw new OrderBomMprValidationException(label + " supports at most 6 decimal places");
         if (integerDigits > 18) throw new OrderBomMprValidationException(label + " is too large");
     }
 

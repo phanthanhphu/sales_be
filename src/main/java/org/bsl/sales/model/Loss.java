@@ -2,6 +2,7 @@ package org.bsl.sales.model;
 
 import com.fasterxml.jackson.annotation.JsonIgnore;
 import org.springframework.data.annotation.Id;
+import org.springframework.data.mongodb.core.index.CompoundIndex;
 import org.springframework.data.mongodb.core.index.Indexed;
 import org.springframework.data.mongodb.core.mapping.Document;
 
@@ -9,13 +10,16 @@ import java.math.BigDecimal;
 import java.time.LocalDateTime;
 
 @Document(collection = "loss_master")
+@CompoundIndex(name = "uk_loss_buyer_material_group", def = "{'buyerKey': 1, 'materialGroupKey': 1}", unique = true)
 public class Loss {
 
     @Id
     private String id;
 
+    @Indexed
+    private String buyerKey;
+
     @JsonIgnore
-    @Indexed(unique = true)
     private String materialGroupKey;
 
     @Indexed(unique = true, sparse = true)
@@ -55,6 +59,14 @@ public class Loss {
 
     public void setId(String id) {
         this.id = id;
+    }
+
+    public String getBuyerKey() {
+        return buyerKey;
+    }
+
+    public void setBuyerKey(String buyerKey) {
+        this.buyerKey = buyerKey;
     }
 
     public String getMaterialGroupKey() {

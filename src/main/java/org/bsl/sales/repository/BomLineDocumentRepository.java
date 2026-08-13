@@ -5,11 +5,13 @@ import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.mongodb.repository.MongoRepository;
 
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 
 public interface BomLineDocumentRepository extends MongoRepository<BomLineDocument, String> {
     List<BomLineDocument> findByBomIdOrderBySortOrderAsc(String bomId);
+    List<BomLineDocument> findByBomIdInOrderByBomIdAscSortOrderAsc(Collection<String> bomIds);
     Page<BomLineDocument> findByBomIdAndPackingIdOrderBySortOrderAsc(String bomId, String packingId, Pageable pageable);
     Page<BomLineDocument> findByBomIdAndPackingIdIsNullOrderBySortOrderAsc(String bomId, Pageable pageable);
     Optional<BomLineDocument> findByBomIdAndId(String bomId, String id);

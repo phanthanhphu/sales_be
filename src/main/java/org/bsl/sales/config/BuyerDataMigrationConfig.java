@@ -3,6 +3,8 @@ package org.bsl.sales.config;
 import jakarta.annotation.PostConstruct;
 import org.bsl.sales.model.BomDocument;
 import org.bsl.sales.model.MatInfo;
+import org.bsl.sales.model.Loss;
+import org.bsl.sales.model.MaterialShipToMapping;
 import org.bsl.sales.model.MprDocument;
 import org.bsl.sales.model.ProductColorMaster;
 import org.bsl.sales.model.SalesOrder;
@@ -34,6 +36,8 @@ public class BuyerDataMigrationConfig {
         backfillBuyerKey(MprDocument.class);
         backfillBuyerKey(MatInfo.class);
         backfillBuyerKey(ProductColorMaster.class);
+        backfillBuyerKey(Loss.class);
+        backfillBuyerKey(MaterialShipToMapping.class);
 
         Query legacyUsers = new Query(new Criteria().orOperator(
                 Criteria.where("buyerKeys").exists(false),
@@ -80,6 +84,16 @@ public class BuyerDataMigrationConfig {
                 .on("masterKey", Sort.Direction.ASC)
                 .unique()
                 .named("uk_product_color_buyer_key"));
+
+        IndexOperations loss = mongoTemplate.indexOps(Loss.class);
+        dropQuietly(loss, "materialGroupKey");
+        dropQuietly(loss, "materialGroupKey_1");
+        dropQuietly(loss, "uk_loss_buyer_material_group");
+        loss.ensureIndex(new Index()
+                .on("buyerKey", Sort.Direction.ASC)
+                .on("materialGroupKey", Sort.Direction.ASC)
+                .unique()
+                .named("uk_loss_buyer_material_group"));
     }
 
     private void dropQuietly(IndexOperations operations, String name) {

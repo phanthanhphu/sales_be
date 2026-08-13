@@ -8,12 +8,14 @@ import org.bsl.sales.exception.MasterDataValidationException;
 import org.bsl.sales.model.BomAttachment;
 import org.bsl.sales.model.BomDocument;
 import org.bsl.sales.model.BomLine;
+import org.bsl.sales.model.BomLineDocument;
 import org.bsl.sales.model.BomLineColorValue;
 import org.bsl.sales.model.BomPacking;
 import org.bsl.sales.model.BomProductColor;
 import org.bsl.sales.model.ProductColorAttribute;
 import org.bsl.sales.model.ProductColorMaster;
 import org.bsl.sales.repository.BomDocumentRepository;
+import org.bsl.sales.repository.BomLineDocumentRepository;
 import org.bsl.sales.repository.ProductColorMasterRepository;
 import org.bsl.sales.security.BuyerAccessService;
 import org.bsl.sales.support.BuyerKeys;
@@ -47,17 +49,20 @@ import java.util.UUID;
 public class ProductColorMasterService {
     private final ProductColorMasterRepository repository;
     private final BomDocumentRepository bomRepository;
+    private final BomLineDocumentRepository bomLineRepository;
     private final BomFileStorageService fileStorage;
     private final BuyerAccessService buyerAccess;
 
     public ProductColorMasterService(
             ProductColorMasterRepository repository,
             BomDocumentRepository bomRepository,
+            BomLineDocumentRepository bomLineRepository,
             BomFileStorageService fileStorage,
             BuyerAccessService buyerAccess
     ) {
         this.repository = repository;
         this.bomRepository = bomRepository;
+        this.bomLineRepository = bomLineRepository;
         this.fileStorage = fileStorage;
         this.buyerAccess = buyerAccess;
     }
@@ -94,6 +99,14 @@ public class ProductColorMasterService {
      * the final BOM link is removed.
      */
     private ProductColorMaster withUsageState(ProductColorMaster entity) {
+        return withUsageState(entity, false);
+    }
+
+    /**
+     * Adds Product Color usage state. Child Color usage is loaded only for the
+     * detail response because it requires checking material lines in linked BOMs.
+     */
+    private ProductColorMaster withUsageState(ProductColorMaster entity, boolean includeChildColorUsage) {
         if (entity == null) return null;
         ensureChildColorIds(entity);
         long linkedBomCount = blank(entity.getId())
@@ -101,6 +114,8 @@ public class ProductColorMasterService {
                 : bomRepository.countByProductColorsProductColorMasterId(entity.getId());
         entity.setLinkedBomCount(linkedBomCount);
         entity.setDeleteLocked(linkedBomCount > 0);
+        resetChildColorUsage(entity);
+        if (includeChildColorUsage && linkedBomCount > 0) annotateChildColorUsage(entity);
         return entity;
     }
 
@@ -117,7 +132,7 @@ public class ProductColorMasterService {
                 .orElseThrow(() -> new MasterDataNotFoundException("Product Color Master not found"));
         buyerAccess.requireEntityAccess(entity.getBuyerKey());
         if (entity.getBuyerKey() == null || entity.getBuyerKey().isBlank()) entity.setBuyerKey(BuyerKeys.LL_BEAN);
-        return withUsageState(entity);
+        return withUsageState(entity, true);
     }
 
     public ProductColorMaster create(ProductColorMasterRequest request) {
@@ -130,11 +145,12 @@ public class ProductColorMasterService {
         LocalDateTime now = LocalDateTime.now();
         entity.setCreatedAt(now);
         entity.setUpdatedAt(now);
-        return withUsageState(repository.save(entity));
+        return withUsageState(repository.save(entity), true);
     }
 
     public ProductColorMaster update(String id, ProductColorMasterRequest request) {
         ProductColorMaster entity = get(id);
+        List<ProductColorAttribute> previousChildColors = normalizeChildColors(entity.getChildColors());
         String previousIdentityKey = keyFor(entity);
         String currentBuyer = BuyerKeys.legacyDefault(entity.getBuyerKey());
         String buyerKey = request == null || blank(request.buyerKey())
@@ -156,8 +172,12 @@ public class ProductColorMasterService {
                 .ifPresent(item -> {
                     throw new MasterDataConflictException("The same Pattern Number, Product Color, Season and Style Number already exists.");
                 });
+
+        validateRemovedChildColors(entity.getId(), previousChildColors, entity.getChildColors());
         entity.setUpdatedAt(LocalDateTime.now());
-        return withUsageState(repository.save(entity));
+        ProductColorMaster saved = repository.save(entity);
+        synchronizeLinkedBomChildColorValues(saved.getId(), previousChildColors, saved.getChildColors());
+        return withUsageState(saved, true);
     }
 
     public void delete(String id) {
@@ -192,7 +212,7 @@ public class ProductColorMasterService {
 
         ProductColorMaster saved = repository.save(entity);
         fileStorage.deleteQuietly(previousStoredFileName);
-        return withUsageState(saved);
+        return withUsageState(saved, true);
     }
 
     public ProductColorImageResource downloadImage(String id) {
@@ -498,6 +518,298 @@ public class ProductColorMasterService {
     }
 
 
+    private void resetChildColorUsage(ProductColorMaster entity) {
+        for (ProductColorAttribute childColor : safe(entity == null ? null : entity.getChildColors())) {
+            if (childColor == null) continue;
+            childColor.setDeleteLocked(false);
+            childColor.setUsageCount(0);
+            childColor.setUsageMessage("");
+        }
+    }
+
+    /**
+     * Marks every Child Color that is referenced by a Core or Packing material
+     * line. The database validation below remains the final authority; these
+     * fields allow the UI to disable Delete before the user submits the form.
+     */
+    private void annotateChildColorUsage(ProductColorMaster entity) {
+        if (entity == null || blank(entity.getId()) || safe(entity.getChildColors()).isEmpty()) return;
+
+        Map<String, ProductColorAttribute> childColorsById = new LinkedHashMap<>();
+        Map<String, String> childColorIdsByName = new LinkedHashMap<>();
+        Map<String, ChildColorUsage> usageById = new LinkedHashMap<>();
+        for (ProductColorAttribute childColor : safe(entity.getChildColors())) {
+            if (childColor == null || blank(childColor.getId())) continue;
+            String id = trim(childColor.getId());
+            childColorsById.put(id, childColor);
+            childColorIdsByName.put(normalize(childColor.getChildColor()), id);
+            usageById.put(id, new ChildColorUsage());
+        }
+        if (usageById.isEmpty()) return;
+
+        LinkedHashSet<String> countedReferences = new LinkedHashSet<>();
+        for (BomDocument bom : bomRepository.findByProductColorsProductColorMasterId(entity.getId())) {
+            Map<String, String> productColorNames = linkedProductColorNames(bom, entity.getId());
+            if (productColorNames.isEmpty()) continue;
+            String bomLabel = firstNonBlank(bom.getBomNo(), bom.getBomName(), bom.getId());
+
+            for (BomLineDocument document : bomLineRepository.findByBomIdOrderBySortOrderAsc(bom.getId())) {
+                BomLine line = document == null ? null : document.getLine();
+                collectChildColorUsage(
+                        line, productColorNames, childColorsById, childColorIdsByName, usageById,
+                        countedReferences, bom.getId(), bomLabel,
+                        firstNonBlank(document == null ? null : document.getId(), lineIdentity(line))
+                );
+            }
+            for (BomLine line : safe(bom.getCoreLines())) {
+                collectChildColorUsage(
+                        line, productColorNames, childColorsById, childColorIdsByName, usageById,
+                        countedReferences, bom.getId(), bomLabel, lineIdentity(line)
+                );
+            }
+            for (BomPacking packing : safe(bom.getPackings())) {
+                for (BomLine line : safe(packing == null ? null : packing.getLines())) {
+                    collectChildColorUsage(
+                            line, productColorNames, childColorsById, childColorIdsByName, usageById,
+                            countedReferences, bom.getId(), bomLabel, lineIdentity(line)
+                    );
+                }
+            }
+        }
+
+        for (Map.Entry<String, ChildColorUsage> entry : usageById.entrySet()) {
+            ProductColorAttribute childColor = childColorsById.get(entry.getKey());
+            ChildColorUsage usage = entry.getValue();
+            if (childColor == null || usage.count == 0) continue;
+            childColor.setDeleteLocked(true);
+            childColor.setUsageCount(usage.count);
+            String bomList = String.join(", ", usage.bomLabels.stream().limit(3).toList());
+            if (usage.bomLabels.size() > 3) bomList += ", ...";
+            childColor.setUsageMessage(
+                    "Used by " + usage.count + " material line(s)"
+                            + (bomList.isBlank() ? "" : " in BOM " + bomList)
+                            + ". Change those lines to another Child Color before deleting it."
+            );
+        }
+    }
+
+    private void collectChildColorUsage(
+            BomLine line,
+            Map<String, String> linkedProductColorNames,
+            Map<String, ProductColorAttribute> childColorsById,
+            Map<String, String> childColorIdsByName,
+            Map<String, ChildColorUsage> usageById,
+            LinkedHashSet<String> countedReferences,
+            String bomId,
+            String bomLabel,
+            String lineIdentity
+    ) {
+        if (line == null) return;
+        LinkedHashSet<String> usedIds = new LinkedHashSet<>();
+
+        for (BomLineColorValue value : safe(line.getProductColorValues())) {
+            if (value == null || !linkedProductColorNames.containsKey(trim(value.getProductColorId()))) continue;
+            String childColorId = trim(value.getChildColorId());
+            if (childColorsById.containsKey(childColorId)) {
+                usedIds.add(childColorId);
+                continue;
+            }
+            String matchedByName = childColorIdsByName.get(normalize(value.getValue()));
+            if (!blank(matchedByName)) usedIds.add(matchedByName);
+        }
+
+        // Older BOM rows may contain only a readable map instead of childColorId.
+        for (String productColorName : linkedProductColorNames.values()) {
+            String legacyValue = line.getColorValues() == null ? "" : trim(line.getColorValues().get(productColorName));
+            String matchedByName = childColorIdsByName.get(normalize(legacyValue));
+            if (!blank(matchedByName)) usedIds.add(matchedByName);
+        }
+
+        for (String usedId : usedIds) {
+            String referenceKey = trim(bomId) + "|" + trim(lineIdentity) + "|" + usedId;
+            if (!countedReferences.add(referenceKey)) continue;
+            ChildColorUsage usage = usageById.get(usedId);
+            if (usage == null) continue;
+            usage.count++;
+            if (!blank(bomLabel)) usage.bomLabels.add(trim(bomLabel));
+        }
+    }
+
+    private String lineIdentity(BomLine line) {
+        if (line == null) return "unknown-line";
+        return firstNonBlank(
+                line.getId(),
+                line.getSourceRowNumber() == null ? "" : "row-" + line.getSourceRowNumber(),
+                line.getDetailNo(),
+                line.getMaterialGroupNo() == null ? "" : "material-" + line.getMaterialGroupNo(),
+                line.getPosition(),
+                UUID.randomUUID().toString()
+        );
+    }
+
+
+    /**
+     * A Child Color row owns a stable id used by BOM material lines. Removing an
+     * id that is still referenced would leave the BOM with an invalid link, so
+     * that operation is rejected with a clear message. Renaming is allowed and
+     * is synchronized to every linked BOM line after the master is saved.
+     */
+    private void validateRemovedChildColors(
+            String masterId,
+            List<ProductColorAttribute> previous,
+            List<ProductColorAttribute> next
+    ) {
+        if (blank(masterId)) return;
+
+        Map<String, String> previousNames = childColorNamesById(previous);
+        LinkedHashSet<String> nextIds = new LinkedHashSet<>(childColorNamesById(next).keySet());
+        LinkedHashSet<String> removedIds = new LinkedHashSet<>(previousNames.keySet());
+        removedIds.removeAll(nextIds);
+        if (removedIds.isEmpty()) return;
+
+        for (BomDocument bom : bomRepository.findByProductColorsProductColorMasterId(masterId)) {
+            Map<String, String> productColorNames = linkedProductColorNames(bom, masterId);
+            if (productColorNames.isEmpty()) continue;
+
+            for (BomLineDocument document : bomLineRepository.findByBomIdOrderBySortOrderAsc(bom.getId())) {
+                String usedId = removedChildColorId(document == null ? null : document.getLine(), productColorNames, removedIds, previousNames);
+                if (!blank(usedId)) {
+                    throw childColorInUse(previousNames.get(usedId), bom);
+                }
+            }
+
+            for (BomLine line : safe(bom.getCoreLines())) {
+                String usedId = removedChildColorId(line, productColorNames, removedIds, previousNames);
+                if (!blank(usedId)) throw childColorInUse(previousNames.get(usedId), bom);
+            }
+            for (BomPacking packing : safe(bom.getPackings())) {
+                for (BomLine line : safe(packing == null ? null : packing.getLines())) {
+                    String usedId = removedChildColorId(line, productColorNames, removedIds, previousNames);
+                    if (!blank(usedId)) throw childColorInUse(previousNames.get(usedId), bom);
+                }
+            }
+        }
+    }
+
+    private MasterDataConflictException childColorInUse(String childColor, BomDocument bom) {
+        String bomLabel = firstNonBlank(bom == null ? null : bom.getBomNo(), bom == null ? null : bom.getBomName(), bom == null ? null : bom.getId());
+        return new MasterDataConflictException(
+                "Child Color '" + firstNonBlank(childColor, "Unknown")
+                        + "' is still used by BOM " + bomLabel
+                        + ". Change the material line to another Child Color before removing it."
+        );
+    }
+
+    private String removedChildColorId(
+            BomLine line,
+            Map<String, String> linkedProductColorNames,
+            LinkedHashSet<String> removedIds,
+            Map<String, String> previousNames
+    ) {
+        if (line == null) return "";
+        for (BomLineColorValue value : safe(line.getProductColorValues())) {
+            if (value == null || !linkedProductColorNames.containsKey(trim(value.getProductColorId()))) continue;
+            String childColorId = trim(value.getChildColorId());
+            if (removedIds.contains(childColorId)) return childColorId;
+        }
+
+        // Older BOM rows may have only the readable legacy map and no id.
+        for (String productColorName : linkedProductColorNames.values()) {
+            String legacyValue = line.getColorValues() == null ? "" : trim(line.getColorValues().get(productColorName));
+            if (legacyValue.isBlank()) continue;
+            for (String removedId : removedIds) {
+                if (normalize(legacyValue).equals(normalize(previousNames.get(removedId)))) return removedId;
+            }
+        }
+        return "";
+    }
+
+    private void synchronizeLinkedBomChildColorValues(
+            String masterId,
+            List<ProductColorAttribute> previous,
+            List<ProductColorAttribute> next
+    ) {
+        if (blank(masterId)) return;
+        Map<String, String> previousNames = childColorNamesById(previous);
+        Map<String, String> nextNames = childColorNamesById(next);
+        if (previousNames.equals(nextNames)) return;
+
+        for (BomDocument bom : bomRepository.findByProductColorsProductColorMasterId(masterId)) {
+            Map<String, String> productColorNames = linkedProductColorNames(bom, masterId);
+            if (productColorNames.isEmpty()) continue;
+
+            List<BomLineDocument> changedDocuments = new ArrayList<>();
+            for (BomLineDocument document : bomLineRepository.findByBomIdOrderBySortOrderAsc(bom.getId())) {
+                if (document != null && synchronizeLineChildColors(document.getLine(), productColorNames, nextNames)) {
+                    changedDocuments.add(document);
+                }
+            }
+            if (!changedDocuments.isEmpty()) bomLineRepository.saveAll(changedDocuments);
+
+            boolean embeddedChanged = false;
+            for (BomLine line : safe(bom.getCoreLines())) {
+                embeddedChanged |= synchronizeLineChildColors(line, productColorNames, nextNames);
+            }
+            for (BomPacking packing : safe(bom.getPackings())) {
+                for (BomLine line : safe(packing == null ? null : packing.getLines())) {
+                    embeddedChanged |= synchronizeLineChildColors(line, productColorNames, nextNames);
+                }
+            }
+            if (embeddedChanged) {
+                bom.setUpdatedAt(LocalDateTime.now());
+                bomRepository.save(bom);
+            }
+        }
+    }
+
+    private boolean synchronizeLineChildColors(
+            BomLine line,
+            Map<String, String> linkedProductColorNames,
+            Map<String, String> nextNames
+    ) {
+        if (line == null) return false;
+        boolean changed = false;
+        for (BomLineColorValue value : safe(line.getProductColorValues())) {
+            if (value == null) continue;
+            String productColorId = trim(value.getProductColorId());
+            String childColorId = trim(value.getChildColorId());
+            if (!linkedProductColorNames.containsKey(productColorId) || !nextNames.containsKey(childColorId)) continue;
+
+            String nextName = nextNames.get(childColorId);
+            if (!Objects.equals(trim(value.getValue()), nextName)) {
+                value.setValue(nextName);
+                changed = true;
+            }
+
+            String productColorName = linkedProductColorNames.get(productColorId);
+            if (!blank(productColorName)) {
+                if (line.getColorValues() == null) line.setColorValues(new LinkedHashMap<>());
+                if (!Objects.equals(trim(line.getColorValues().get(productColorName)), nextName)) {
+                    line.getColorValues().put(productColorName, nextName);
+                    changed = true;
+                }
+            }
+        }
+        return changed;
+    }
+
+    private Map<String, String> linkedProductColorNames(BomDocument bom, String masterId) {
+        Map<String, String> result = new LinkedHashMap<>();
+        for (BomProductColor productColor : safe(bom == null ? null : bom.getProductColors())) {
+            if (productColor == null || !trim(masterId).equals(trim(productColor.getProductColorMasterId()))) continue;
+            if (!blank(productColor.getId())) result.put(trim(productColor.getId()), trim(productColor.getColorName()));
+        }
+        return result;
+    }
+
+    private Map<String, String> childColorNamesById(List<ProductColorAttribute> colors) {
+        Map<String, String> result = new LinkedHashMap<>();
+        for (ProductColorAttribute color : normalizeChildColors(colors)) {
+            if (color != null && !blank(color.getId())) result.put(trim(color.getId()), trim(color.getChildColor()));
+        }
+        return result;
+    }
+
     private ProductColorMaster fromRequest(ProductColorMaster entity, ProductColorMasterRequest request) {
         if (request == null) throw new MasterDataValidationException("Product Color data is required");
         entity.setPatternNumber(trim(request.patternNumber()));
@@ -625,6 +937,11 @@ public class ProductColorMasterService {
     private String trim(String value) { return value == null ? "" : value.trim(); }
     private String normalize(String value) { return trim(value).replaceAll("\\s+", " ").toUpperCase(Locale.ROOT); }
     private <T> List<T> safe(List<T> values) { return values == null ? List.of() : values; }
+
+    private static final class ChildColorUsage {
+        private long count;
+        private final LinkedHashSet<String> bomLabels = new LinkedHashSet<>();
+    }
 
     public record ProductColorImageResource(Resource resource, String fileName, String contentType) { }
 }

@@ -14,6 +14,7 @@ import org.apache.poi.ss.usermodel.Workbook;
 import org.apache.poi.xssf.usermodel.XSSFWorkbook;
 import org.bsl.sales.model.Loss;
 import org.bsl.sales.model.MatInfo;
+import org.bsl.sales.model.MaterialShipToMapping;
 import org.bsl.sales.model.ShipTo;
 import org.bsl.sales.model.VendorCode;
 
@@ -140,6 +141,70 @@ public final class MasterDataEditWorkbookExporter {
             return toBytes(workbook);
         } catch (IOException ex) {
             throw new IllegalStateException("Cannot export Ship To edit workbook", ex);
+        }
+    }
+
+    public static byte[] materialShipToMappings(List<MaterialShipToMapping> rows) {
+        try (Workbook workbook = new XSSFWorkbook()) {
+            Sheet sheet = workbook.createSheet("MATERIAL SHIP TO");
+            Styles styles = new Styles(workbook);
+            writeHeader(sheet, styles.header, 0,
+                    "Key", "Action", "SAP Code", "Material Type", "MAT FULL DESCRIPTION", "MAT COLOR", "MAT UNIT",
+                    "Ship To Code", "Ship To Name", "Active", "Remark");
+            sheet.createFreezePane(0, 1);
+
+            List<MaterialShipToMapping> sorted = rows == null ? Collections.emptyList() : rows.stream()
+                    .sorted(Comparator.comparing(MaterialShipToMapping::getMasterKey, Comparator.nullsLast(String.CASE_INSENSITIVE_ORDER)))
+                    .collect(Collectors.toList());
+
+            int rowIndex = 1;
+            for (MaterialShipToMapping item : sorted) {
+                Row row = sheet.createRow(rowIndex++);
+                write(row, 0, item.getMasterKey(), styles.lockedText);
+                write(row, 1, "UPDATE", styles.text);
+                write(row, 2, item.getSapCode(), styles.text);
+                write(row, 3, item.getMaterialType(), styles.text);
+                write(row, 4, item.getMatFullDescription(), styles.textWrap);
+                write(row, 5, item.getMatColor(), styles.textWrap);
+                write(row, 6, item.getMatUnit(), styles.text);
+                write(row, 7, item.getShipToCode(), styles.text);
+                write(row, 8, item.getShipToName(), styles.text);
+                write(row, 9, item.isActive() ? "TRUE" : "FALSE", styles.text);
+                write(row, 10, item.getRemark(), styles.textWrap);
+            }
+            setWidths(sheet, 16, 12, 18, 20, 48, 28, 12, 18, 34, 12, 40);
+            addActionValidation(sheet, 1, Math.max(5000, rowIndex + 100));
+            protectIdentityColumns(sheet, 0);
+            return toBytes(workbook);
+        } catch (IOException ex) {
+            throw new IllegalStateException("Cannot export Material Ship To edit workbook", ex);
+        }
+    }
+
+    public static byte[] materialShipToTemplate(List<ShipTo> shipTos) {
+        try (Workbook workbook = new XSSFWorkbook()) {
+            Styles styles = new Styles(workbook);
+            Sheet sheet = workbook.createSheet("MATERIAL SHIP TO");
+            writeHeader(sheet, styles.header, 0,
+                    "SAP Code", "Material Type", "MAT FULL DESCRIPTION", "MAT COLOR", "MAT UNIT",
+                    "Ship To Code", "Ship To Name", "Active", "Remark");
+            sheet.createFreezePane(0, 1);
+            setWidths(sheet, 18, 20, 48, 28, 12, 18, 34, 12, 40);
+
+            Sheet reference = workbook.createSheet("SHIP TO REFERENCE");
+            writeHeader(reference, styles.header, 0, "Ship To Code", "Ship To Name");
+            int rowIndex = 1;
+            for (ShipTo item : shipTos == null ? Collections.<ShipTo>emptyList() : shipTos) {
+                if (item == null || !item.isActive()) continue;
+                Row row = reference.createRow(rowIndex++);
+                write(row, 0, item.getShipToCode(), styles.text);
+                write(row, 1, item.getShipToName(), styles.text);
+            }
+            setWidths(reference, 20, 40);
+            reference.createFreezePane(0, 1);
+            return toBytes(workbook);
+        } catch (IOException ex) {
+            throw new IllegalStateException("Cannot export Material Ship To template", ex);
         }
     }
 

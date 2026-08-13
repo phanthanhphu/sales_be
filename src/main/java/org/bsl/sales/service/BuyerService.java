@@ -8,6 +8,8 @@ import org.bsl.sales.exception.MasterDataValidationException;
 import org.bsl.sales.model.Buyer;
 import org.bsl.sales.model.BomDocument;
 import org.bsl.sales.model.MatInfo;
+import org.bsl.sales.model.Loss;
+import org.bsl.sales.model.MaterialShipToMapping;
 import org.bsl.sales.model.MprDocument;
 import org.bsl.sales.model.ProductColorMaster;
 import org.bsl.sales.model.SalesOrder;
@@ -45,26 +47,35 @@ public class BuyerService {
 
     @PostConstruct
     public void seedDefaultBuyers() {
+        // Legacy bootstrap only. Once Buyer Master exists, it is the source of truth:
+        // deleted/inactive Buyers must never be recreated or reactivated on restart.
+        // A completely clean installation starts with an empty Buyer Master and
+        // the administrator can create the required Buyers from the UI.
+        if (repository.count() > 0 || !hasLegacyBusinessData()) return;
+
         int sequence = 1;
         for (Map.Entry<String, String> entry : BuyerKeys.DEFAULT_BUYERS.entrySet()) {
-            Buyer buyer = repository.findByBuyerKey(entry.getKey()).orElse(null);
-            if (buyer == null) {
-                buyer = new Buyer();
-                buyer.setBuyerKey(entry.getKey());
-                buyer.setBuyerName(entry.getValue());
-                buyer.setActive(true);
-                buyer.setSequence(sequence);
-                buyer.setCreatedAt(LocalDateTime.now());
-                buyer.setUpdatedAt(LocalDateTime.now());
-                repository.save(buyer);
-            } else if (!buyer.isActive()) {
-                // The six core Buyers are permanent application modules.
-                buyer.setActive(true);
-                buyer.setUpdatedAt(LocalDateTime.now());
-                repository.save(buyer);
-            }
-            sequence++;
+            Buyer buyer = new Buyer();
+            buyer.setBuyerKey(entry.getKey());
+            buyer.setBuyerName(entry.getValue());
+            buyer.setActive(true);
+            buyer.setSequence(sequence++);
+            buyer.setCreatedAt(LocalDateTime.now());
+            buyer.setUpdatedAt(LocalDateTime.now());
+            repository.save(buyer);
         }
+    }
+
+
+    private boolean hasLegacyBusinessData() {
+        Query any = new Query().limit(1);
+        return mongoTemplate.exists(any, SalesOrder.class)
+                || mongoTemplate.exists(any, BomDocument.class)
+                || mongoTemplate.exists(any, MprDocument.class)
+                || mongoTemplate.exists(any, MatInfo.class)
+                || mongoTemplate.exists(any, ProductColorMaster.class)
+                || mongoTemplate.exists(any, Loss.class)
+                || mongoTemplate.exists(any, MaterialShipToMapping.class);
     }
 
     public List<Buyer> list(String keyword, Boolean active) {
@@ -136,8 +147,9 @@ public class BuyerService {
     }
 
     public Buyer create(BuyerRequest request) {
-        String key = BuyerKeys.normalize(request.buyerKey());
-        if (key.isBlank()) throw new MasterDataValidationException("Buyer Key is required");
+        String rawKey = request == null || request.buyerKey() == null ? "" : request.buyerKey().trim();
+        if (rawKey.isBlank()) throw new MasterDataValidationException("Buyer Key is required");
+        String key = BuyerKeys.normalize(rawKey);
         if (repository.existsByBuyerKey(key)) {
             throw new MasterDataConflictException("Buyer Key already exists: " + key);
         }
@@ -151,13 +163,11 @@ public class BuyerService {
 
     public Buyer update(String id, BuyerRequest request) {
         Buyer buyer = get(id);
-        String newKey = BuyerKeys.normalize(request.buyerKey());
-        if (newKey.isBlank()) throw new MasterDataValidationException("Buyer Key is required");
+        String rawKey = request == null || request.buyerKey() == null ? "" : request.buyerKey().trim();
+        if (rawKey.isBlank()) throw new MasterDataValidationException("Buyer Key is required");
+        String newKey = BuyerKeys.normalize(rawKey);
         if (!newKey.equals(buyer.getBuyerKey())) {
             throw new MasterDataValidationException("Buyer Key cannot be changed after creation");
-        }
-        if (BuyerKeys.DEFAULT_KEYS.contains(newKey) && Boolean.FALSE.equals(request.active())) {
-            throw new MasterDataValidationException("Core Buyer cannot be deactivated");
         }
         apply(buyer, request);
         buyer.setUpdatedAt(LocalDateTime.now());
@@ -166,9 +176,6 @@ public class BuyerService {
 
     public void delete(String id) {
         Buyer buyer = get(id);
-        if (BuyerKeys.DEFAULT_KEYS.contains(buyer.getBuyerKey())) {
-            throw new MasterDataValidationException("Core Buyer cannot be deleted or deactivated.");
-        }
         if (isReferenced(buyer.getBuyerKey())) {
             throw new MasterDataValidationException(
                     "Buyer is already assigned to users or business data. Remove those references before deleting it."
@@ -184,7 +191,13 @@ public class BuyerService {
         if (mongoTemplate.exists(entityQuery, MprDocument.class)) return true;
         if (mongoTemplate.exists(entityQuery, MatInfo.class)) return true;
         if (mongoTemplate.exists(entityQuery, ProductColorMaster.class)) return true;
-        return mongoTemplate.exists(Query.query(Criteria.where("buyerKeys").is(buyerKey)), User.class);
+        if (mongoTemplate.exists(entityQuery, Loss.class)) return true;
+        if (mongoTemplate.exists(entityQuery, MaterialShipToMapping.class)) return true;
+        Query userAssignment = Query.query(new Criteria().andOperator(
+                Criteria.where("buyerKeys").is(buyerKey),
+                Criteria.where("role").nin(User.ROLE_ADMIN, "ROLE_ADMIN", "ADMINISTRATOR")
+        ));
+        return mongoTemplate.exists(userAssignment, User.class);
     }
 
     private void apply(Buyer buyer, BuyerRequest request) {

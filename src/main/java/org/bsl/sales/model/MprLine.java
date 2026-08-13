@@ -18,6 +18,10 @@ public class MprLine {
     /* Internal traceability fields. */
     private String id;
     private String bomId;
+    private String bomNo;
+    private String bomName;
+    /** Original 1-based BOM Excel row retained for source traceability; it is not used to re-sort MPR rows. */
+    private Integer sourceRowNumber;
     private String sourceLineId;
     private String packingId;
     private String packingName;
@@ -26,8 +30,8 @@ public class MprLine {
 
     /**
      * Stable source identity for BOM + Product Color + Core/Packing + source row.
-     * It prevents re-adding the exact same source row while retaining distinct
-     * rows that happen to contain identical material values.
+     * It prevents re-adding the exact same physical source row. Distinct source
+     * rows can later be consolidated while remaining traceable in sourceTraces.
      */
     private String sourceBomDedupKey;
 
@@ -36,6 +40,21 @@ public class MprLine {
      * It makes it possible to trace which user selection produced this row.
      */
     private String generationBatchId;
+
+    /**
+     * Every physical Core/Packing source row represented by this MPR row.
+     * Older saved records may have an empty list and are handled through the
+     * legacy traceability fields above.
+     */
+    private List<MprSourceTrace> sourceTraces = new ArrayList<>();
+
+    /** Source CONS. value from the BOM, used in the duplicate signature. */
+    private BigDecimal sourceDetailConsumption;
+
+    /** Duplicate consolidation metadata shown by the UI and Excel export. */
+    private boolean duplicateHighlighted;
+    private int removedDuplicateCount;
+    private String duplicateNote;
 
     /**
      * Sales edits to BOM-backed MPR values are held here until BOM approves
@@ -58,6 +77,8 @@ public class MprLine {
     private String sapCode;
     private Integer bomLineNo;
     private String materialType;
+    /** BOM POSITION copied from the selected Core/Packing source row. */
+    private String position;
     private String matFullDescription;
     private String matColor;
     private String matUnit;

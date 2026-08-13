@@ -127,24 +127,14 @@ public class BomExcelParser {
             if (currentBoundary != null) currentBoundary.endRow = sheet.getLastRowNum() + 1;
 
             /*
-             * Some BOM Detail workbooks do not contain a PACKING title. MPR
-             * generation always works from Packing rows, so move every parsed
-             * line into one first/default Packing instead of leaving it in
-             * Core Lines.
+             * Packing is explicit source structure. If the workbook does not
+             * contain a real PACKING title, keep every parsed material in
+             * Core Materials. Do not invent PACKING 1 / PACKING 2 / ...
+             * because that changes the meaning of the customer's BOM.
+             *
+             * MPR generation already supports Core rows directly, so an
+             * empty packings list is valid and intentional.
              */
-            if (packings.isEmpty() && !coreLines.isEmpty()) {
-                BomPacking firstPacking = new BomPacking();
-                firstPacking.setId(UUID.randomUUID().toString());
-                firstPacking.setPackingName("PACKING 1");
-                firstPacking.setSequence(1);
-                firstPacking.getLines().addAll(coreLines);
-                packings.add(firstPacking);
-                coreLines.clear();
-
-                PackingBoundary defaultBoundary = new PackingBoundary(firstPacking.getId(), layout.dataStartRow(headerRow) + 1);
-                defaultBoundary.endRow = sheet.getLastRowNum() + 1;
-                packingBoundaries.add(defaultBoundary);
-            }
 
             List<ParsedAttachment> importedAttachments = extractImages(
                     sheet,
@@ -297,14 +287,17 @@ public class BomExcelParser {
 
         for (int column = layout.firstColorColumn(); column <= layout.lastColorColumn(); column++) {
             String colorName = text(sheet.getRow(layout.colorNameRow(headerRow)), column, formatter, evaluator);
-            if (!hasText(colorName)) continue;
+            if (!hasText(colorName) || isBomTemplatePlaceholder(colorName)) continue;
 
-            String patternNumber = text(sheet.getRow(layout.patternNumberRow(headerRow)), column, formatter, evaluator);
-            String season = text(sheet.getRow(layout.seasonRow(headerRow)), column, formatter, evaluator);
+            String patternNumber = templateValue(text(sheet.getRow(layout.patternNumberRow(headerRow)), column, formatter, evaluator), "PATTERNNUMBER");
+            String season = templateValue(text(sheet.getRow(layout.seasonRow(headerRow)), column, formatter, evaluator), "SEASON");
             String styleNumber = layout.styleNumberRow(headerRow) < 0
                     ? ""
-                    : text(sheet.getRow(layout.styleNumberRow(headerRow)), column, formatter, evaluator);
-            Integer sequence = layout.sequenceRow(headerRow) < 0
+                    : templateValue(text(sheet.getRow(layout.styleNumberRow(headerRow)), column, formatter, evaluator), "STYLENUMBER");
+            String sequenceText = layout.sequenceRow(headerRow) < 0
+                    ? ""
+                    : text(sheet.getRow(layout.sequenceRow(headerRow)), column, formatter, evaluator);
+            Integer sequence = layout.sequenceRow(headerRow) < 0 || normalize(sequenceText).equals("SEQUENCE")
                     ? null
                     : integer(sheet.getRow(layout.sequenceRow(headerRow)), column, formatter, evaluator);
 
@@ -335,6 +328,19 @@ public class BomExcelParser {
             result.put(column, productColor);
         }
         return result;
+    }
+
+
+    private String templateValue(String value, String placeholder) {
+        return normalize(value).equals(placeholder) ? "" : value;
+    }
+
+    /** The downloadable BOM template uses visible key labels only. They must not become real Product Colors. */
+    private boolean isBomTemplatePlaceholder(String value) {
+        String normalized = normalize(value);
+        return normalized.equals("PRODUCTCOLOR")
+                || normalized.startsWith("PRODUCTCOLOR")
+                || normalized.equals("ENTERPRODUCTCOLOR");
     }
 
     private List<BomProductColor> distinctProductColors(Collection<BomProductColor> productColors) {
@@ -468,6 +474,7 @@ public class BomExcelParser {
          * When two shapes overlap in the same color column, the later Excel shape is the visible one.
          */
         Map<String, ParsedAttachment> productImageByColorId = new LinkedHashMap<>();
+        Map<String, Integer> productImageStartRowByColorId = new LinkedHashMap<>();
 
         /*
          * A cropped Excel collage normally reuses the same source picture for several Product Color
@@ -501,26 +508,37 @@ public class BomExcelParser {
                 boolean anchoredInsideOneColumn = anchor != null && anchor.getCol1() == anchor.getCol2();
                 boolean standaloneProductImage = sourceUseCount == 1 || anchoredInsideOneColumn;
                 RenderedImage rendered = renderProductColorImage(picture, data, standaloneProductImage);
-                if (rendered != null) {
-                    String fileName = "imported-product-color-"
-                            + safeFilePart(productColor.getColorName())
-                            + "."
-                            + rendered.extension();
+                if (rendered != null && looksLikeProductColorImage(rendered, anchorRowIndex, headerRow)) {
+                    String productColorId = productColor.getId();
+                    Integer currentStartRow = productImageStartRowByColorId.get(productColorId);
 
-                    productImageByColorId.put(
-                            productColor.getId(),
-                            new ParsedAttachment(
-                                    rendered.bytes(),
-                                    fileName,
-                                    rendered.contentType(),
-                                    "COLOR",
-                                    productColor.getId(),
-                                    productColor.getColorName(),
-                                    null,
-                                    null,
-                                    excelRow
-                            )
-                    );
+                    // A color column may also contain small screenshots/swatches or copied
+                    // header snippets. The actual product picture is normally the uppermost
+                    // sizeable picture in that Product Color column. Keeping the earliest
+                    // valid picture prevents a later decorative screenshot from replacing the
+                    // real Product Color image in Master Data.
+                    if (currentStartRow == null || anchorRowIndex < currentStartRow) {
+                        String fileName = "imported-product-color-"
+                                + safeFilePart(productColor.getColorName())
+                                + "."
+                                + rendered.extension();
+
+                        productImageByColorId.put(
+                                productColorId,
+                                new ParsedAttachment(
+                                        rendered.bytes(),
+                                        fileName,
+                                        rendered.contentType(),
+                                        "COLOR",
+                                        productColorId,
+                                        productColor.getColorName(),
+                                        null,
+                                        null,
+                                        excelRow
+                                )
+                        );
+                        productImageStartRowByColorId.put(productColorId, anchorRowIndex);
+                    }
                 }
                 continue;
             }
@@ -655,6 +673,32 @@ public class BomExcelParser {
 
     private record CropRect(int x, int y, int width, int height, boolean hasCrop) { }
 
+
+    /**
+     * Product Color pictures belong to the upper image band above the color
+     * header. Small screenshots/swatches embedded lower in the same column are
+     * reference artwork, not the reusable Product Color image.
+     */
+    private boolean looksLikeProductColorImage(RenderedImage rendered, int anchorRowIndex, int headerRow) {
+        if (rendered == null || rendered.bytes() == null || rendered.bytes().length == 0) return false;
+
+        // In the approved L.L.Bean format the product-image band is the upper
+        // portion of the pre-header area. This still scales with other BOMs by
+        // using roughly the first half of the rows above the detail header.
+        int latestStartRow = Math.max(2, headerRow / 2);
+        if (anchorRowIndex > latestStartRow) return false;
+
+        try (ByteArrayInputStream input = new ByteArrayInputStream(rendered.bytes())) {
+            BufferedImage image = ImageIO.read(input);
+            if (image == null) return false;
+            // Reject tiny icon/swatch snippets which were previously mistaken
+            // for a Product Color image.
+            return image.getWidth() >= 80 && image.getHeight() >= 80;
+        } catch (IOException ignored) {
+            return false;
+        }
+    }
+
     private record RenderedImage(byte[] bytes, String extension, String contentType) { }
 
     private PackingBoundary findPackingBoundary(List<PackingBoundary> boundaries, int excelRow) {
@@ -705,19 +749,45 @@ public class BomExcelParser {
     }
 
     private BigDecimal decimal(Row row, int column, DataFormatter formatter, FormulaEvaluator evaluator) {
-        String visible = text(row, column, formatter, evaluator).trim();
+        if (row == null || column < 0) return null;
+        Cell cell = row.getCell(column, Row.MissingCellPolicy.RETURN_BLANK_AS_NULL);
+        if (cell == null) return null;
+
+        // Never parse a displayed/rounded Excel value for MPR calculations.
+        // DataFormatter follows the cell number format (for example 0.000),
+        // which previously changed 0.3816710411 into 0.382 in MongoDB.
+        try {
+            CellType type = cell.getCellType();
+            if (type == CellType.NUMERIC) {
+                return BigDecimal.valueOf(cell.getNumericCellValue());
+            }
+            if (type == CellType.FORMULA && evaluator != null) {
+                CellValue evaluated = evaluator.evaluate(cell);
+                if (evaluated == null || evaluated.getCellType() == CellType.BLANK) return null;
+                if (evaluated.getCellType() == CellType.NUMERIC) {
+                    return BigDecimal.valueOf(evaluated.getNumberValue());
+                }
+                if (evaluated.getCellType() == CellType.STRING) {
+                    return parseDecimalText(evaluated.getStringValue(), row, column);
+                }
+            }
+            return parseDecimalText(text(row, column, formatter, evaluator), row, column);
+        } catch (NumberFormatException ex) {
+            String visible = text(row, column, formatter, evaluator).trim();
+            throw new OrderBomMprValidationException(
+                    "Invalid number '" + visible + "' at row " + (row.getRowNum() + 1)
+                            + ", column " + excelColumn(column)
+            );
+        }
+    }
+
+    private BigDecimal parseDecimalText(String value, Row row, int column) {
+        String visible = value == null ? "" : value.trim();
         if (!hasText(visible) || "-".equals(visible)) return null;
         String raw = visible.replace(" ", "");
         if (raw.contains(",") && raw.contains(".")) raw = raw.replace(",", "");
         else if (raw.contains(",")) raw = raw.replace(",", ".");
-        try {
-            return new BigDecimal(raw);
-        } catch (NumberFormatException ex) {
-            throw new OrderBomMprValidationException(
-                    "Invalid number '" + visible + "' at row " + (row == null ? "?" : row.getRowNum() + 1)
-                            + ", column " + excelColumn(column)
-            );
-        }
+        return new BigDecimal(raw);
     }
 
     private Integer integer(Row row, int column, DataFormatter formatter, FormulaEvaluator evaluator) {

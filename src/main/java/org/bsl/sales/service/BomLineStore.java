@@ -38,10 +38,48 @@ public class BomLineStore {
     /** Loads all lines only for internal workflows such as MPR and Excel export. */
     public BomDocument hydrate(BomDocument bom) {
         if (bom == null || !isSeparate(bom)) return bom;
+        return hydrateRows(
+                bom,
+                repository.findByBomIdOrderBySortOrderAsc(bom.getId()),
+                true
+        );
+    }
+
+    /**
+     * Bulk MPR hydration. All selected BOM line documents are loaded in one
+     * MongoDB query instead of one query per BOM. Image URLs are intentionally
+     * not bound because MPR generation only needs material values.
+     */
+    public List<BomDocument> hydrateAllForMpr(List<BomDocument> boms) {
+        List<BomDocument> source = boms == null ? List.of() : boms;
+        Set<String> separateBomIds = source.stream()
+                .filter(this::isSeparate)
+                .map(BomDocument::getId)
+                .filter(id -> id != null && !id.isBlank())
+                .collect(java.util.stream.Collectors.toCollection(LinkedHashSet::new));
+
+        if (separateBomIds.isEmpty()) return source;
+
+        Map<String, List<BomLineDocument>> rowsByBom = new LinkedHashMap<>();
+        for (BomLineDocument row : repository.findByBomIdInOrderByBomIdAscSortOrderAsc(separateBomIds)) {
+            if (row == null || row.getBomId() == null) continue;
+            rowsByBom.computeIfAbsent(row.getBomId(), ignored -> new ArrayList<>()).add(row);
+        }
+
+        for (BomDocument bom : source) {
+            if (isSeparate(bom)) {
+                hydrateRows(bom, rowsByBom.getOrDefault(bom.getId(), List.of()), false);
+            }
+        }
+        return source;
+    }
+
+    private BomDocument hydrateRows(BomDocument bom, List<BomLineDocument> rows, boolean bindImageUrls) {
         List<BomLine> core = new ArrayList<>();
         Map<String, List<BomLine>> packingLines = new LinkedHashMap<>();
-        for (BomLineDocument row : repository.findByBomIdOrderBySortOrderAsc(bom.getId())) {
-            BomLine line = prepareHydrated(row.getLine(), bom.getId());
+        for (BomLineDocument row : safe(rows)) {
+            if (row == null) continue;
+            BomLine line = prepareHydrated(row.getLine(), bom.getId(), bindImageUrls);
             if (row.getPackingId() == null || row.getPackingId().isBlank()) core.add(line);
             else packingLines.computeIfAbsent(row.getPackingId(), ignored -> new ArrayList<>()).add(line);
         }
@@ -145,9 +183,13 @@ public class BomLineStore {
     }
 
     private BomLine prepareHydrated(BomLine line, String bomId) {
+        return prepareHydrated(line, bomId, true);
+    }
+
+    private BomLine prepareHydrated(BomLine line, String bomId, boolean bindImageUrls) {
         if (line == null) return null;
         line.setAttachmentCount(safe(line.getAttachments()).size());
-        imageStorage.bindUrls(line.getPrimaryImage(), bomId, line.getId());
+        if (bindImageUrls) imageStorage.bindUrls(line.getPrimaryImage(), bomId, line.getId());
         return line;
     }
 

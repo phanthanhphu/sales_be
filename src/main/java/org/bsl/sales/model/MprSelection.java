@@ -24,11 +24,14 @@ public class MprSelection {
     private List<String> colors = new ArrayList<>();
     private List<String> packingIds = new ArrayList<>();
 
-    /** PO Qty is entered by Sales for each selected Product Color. */
+    /** Total PO Qty per Product Color (sum of the selected Ship To quantities). */
     private Map<String, BigDecimal> poQtyByColor = new LinkedHashMap<>();
 
     /** Selected Ship To master IDs per Product Color. */
     private Map<String, List<String>> shipToIdsByColor = new LinkedHashMap<>();
+
+    /** Separate PO Qty entered for each selected Ship To, grouped by Product Color. */
+    private Map<String, Map<String, BigDecimal>> shipToQtyByColor = new LinkedHashMap<>();
 
     /** Readable snapshot used for the MPR line and export, e.g. "HN DC + HCM DC". */
     private Map<String, String> shipToByColor = new LinkedHashMap<>();
