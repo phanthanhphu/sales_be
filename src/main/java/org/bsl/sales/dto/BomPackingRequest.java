@@ -6,8 +6,9 @@ import jakarta.validation.constraints.Size;
 import java.util.List;
 
 /**
- * applicableProductColorIds is the source of truth. An empty list means the packing applies to all Product Colors.
- * applicableColors is kept only for backward compatibility with older frontend requests.
+ * Packing-level Product Color applicability is deprecated.
+ * applicableProductColorIds/applicableColors remain only for backward API compatibility and are ignored by the service.
+ * Product Color assignment is managed per BOM Line through Product Color Values.
  */
 public record BomPackingRequest(
         @NotBlank(message = "Packing name is required")

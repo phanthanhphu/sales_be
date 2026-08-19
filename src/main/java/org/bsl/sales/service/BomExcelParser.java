@@ -1,6 +1,7 @@
 package org.bsl.sales.service;
 
 import org.apache.poi.ss.usermodel.*;
+import org.apache.poi.ss.util.CellRangeAddress;
 import org.apache.poi.xssf.usermodel.XSSFClientAnchor;
 import org.apache.poi.xssf.usermodel.XSSFDrawing;
 import org.apache.poi.xssf.usermodel.XSSFPicture;
@@ -231,25 +232,50 @@ public class BomExcelParser {
                 String candidate = normalize(text(row, c, formatter, evaluator));
                 if (!candidate.contains(expected)) continue;
 
-                // Most header values are placed one to four cells to the right.
-                // Stop as soon as the next header label starts. Without this
-                // boundary, an empty Rev. Stage cell can incorrectly read the
-                // first Comments value as its own value.
-                for (int offset = 1; offset <= 4; offset++) {
-                    String value = text(row, c + offset, formatter, evaluator);
-                    if (!hasText(value)) continue;
-                    if (looksLikeHeaderLabel(value)) break;
-                    return value;
+                CellRangeAddress labelRegion = mergedRegionAt(sheet, r, c);
+                int labelFirstColumn = labelRegion == null ? c : labelRegion.getFirstColumn();
+                int labelLastColumn = labelRegion == null ? c : labelRegion.getLastColumn();
+                int labelLastRow = labelRegion == null ? r : labelRegion.getLastRow();
+
+                // COMMENTS in the simplified template is a wide merged label
+                // (normally I2:Q2) with its text in the merged row underneath
+                // (I3:Q3). Read that vertical value slot explicitly.
+                if (expected.equals("COMMENTS")) {
+                    int valueRow = labelLastRow + 1;
+                    Cell valueCell = mergedTopLeftCell(sheet, valueRow, labelFirstColumn);
+                    String value = valueCell == null ? text(sheet.getRow(valueRow), labelFirstColumn, formatter, evaluator)
+                            : formatter.formatCellValue(valueCell, evaluator).trim();
+                    return looksLikeHeaderLabel(value) ? "" : value;
                 }
 
-                // COMMENTS in the new/old templates is placed directly below its label.
-                for (int offset = 1; offset <= 2; offset++) {
-                    String value = text(sheet.getRow(r + offset), c, formatter, evaluator);
-                    if (hasText(value) && !looksLikeHeaderLabel(value)) return value;
-                }
+                // For all other header fields the logical value starts directly
+                // after the complete label range. Example: A2:B2 Buyer -> C2:D2
+                // value. Do not scan farther right when that slot is blank;
+                // otherwise a blank Pattern Date can accidentally read Comments.
+                int valueColumn = labelLastColumn + 1;
+                Cell valueCell = mergedTopLeftCell(sheet, r, valueColumn);
+                String value = valueCell == null ? text(row, valueColumn, formatter, evaluator)
+                        : formatter.formatCellValue(valueCell, evaluator).trim();
+                return looksLikeHeaderLabel(value) ? "" : value;
             }
         }
         return "";
+    }
+
+    private CellRangeAddress mergedRegionAt(Sheet sheet, int row, int column) {
+        for (int index = 0; index < sheet.getNumMergedRegions(); index++) {
+            CellRangeAddress region = sheet.getMergedRegion(index);
+            if (region != null && region.isInRange(row, column)) return region;
+        }
+        return null;
+    }
+
+    private Cell mergedTopLeftCell(Sheet sheet, int row, int column) {
+        CellRangeAddress region = mergedRegionAt(sheet, row, column);
+        if (region == null) return null;
+        Row topRow = sheet.getRow(region.getFirstRow());
+        if (topRow == null) return null;
+        return topRow.getCell(region.getFirstColumn(), Row.MissingCellPolicy.RETURN_BLANK_AS_NULL);
     }
 
     private boolean looksLikeHeaderLabel(String value) {

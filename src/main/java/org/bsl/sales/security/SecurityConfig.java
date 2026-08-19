@@ -106,7 +106,7 @@ public class SecurityConfig {
         CorsConfiguration configuration = new CorsConfiguration();
         configuration.setAllowedOrigins(List.of(
                 "http://localhost:3001", "http://127.0.0.1:3001", "http://127.0.0.1:8081",
-                "http://10.232.132.77:3001", "https://10.232.132.77:8081"
+                "http://10.232.132.72:3001", "https://10.232.132.72:8081"
         ));
         configuration.setAllowedMethods(List.of("GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"));
         configuration.setAllowedHeaders(List.of("*"));

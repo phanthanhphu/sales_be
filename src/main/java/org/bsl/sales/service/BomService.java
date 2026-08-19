@@ -338,7 +338,6 @@ public class BomService {
                 attachment.setColorKey(newColorName);
             }
         }
-        syncPackingColorNames(bom);
         syncLegacyColorNames(bom);
         return saveChanged(bom);
     }
@@ -350,7 +349,7 @@ public class BomService {
         BomProductColor productColor = resolveProductColor(bom, productColorId, "");
         if (isProductColorLinked(bom, productColor.getId())) {
             throw new OrderBomMprValidationException(
-                    "Cannot delete Product Color because it is linked to a Packing or a Material Line. Edit the Product Color instead."
+                    "Cannot delete Product Color because it is used by a Material Line. Remove the Product Color Value from that line first."
             );
         }
 
@@ -372,11 +371,14 @@ public class BomService {
         BomPacking packing = new BomPacking();
         packing.setId(UUID.randomUUID().toString());
         String packingName = required(request.packingName(), "Packing name is required");
-        int sequence = request.sequence() == null ? safe(bom.getPackings()).size() + 1 : request.sequence();
+        int sequence = nextPackingSequence(bom);
         validatePackingIdentity(bom, null, packingName, sequence);
         packing.setPackingName(packingName);
         packing.setSequence(sequence);
-        applyPackingProductColors(bom, packing, request.applicableProductColorIds(), request.applicableColors());
+        // Packing/Product Color applicability is no longer managed at Packing level.
+        // Product Color assignment belongs to each BOM Line via Product Color Values.
+        packing.setApplicableProductColorIds(new ArrayList<>());
+        packing.setApplicableColors(new ArrayList<>());
         ensurePackings(bom).add(packing);
         return saveChanged(bom);
     }
@@ -387,13 +389,13 @@ public class BomService {
 
         BomPacking packing = findPacking(bom, packingId);
         String packingName = required(request.packingName(), "Packing name is required");
-        int sequence = request.sequence() == null
-                ? (packing.getSequence() == null ? safe(bom.getPackings()).size() + 1 : packing.getSequence())
-                : request.sequence();
+        int sequence = packing.getSequence() == null ? nextPackingSequence(bom) : packing.getSequence();
         validatePackingIdentity(bom, packingId, packingName, sequence);
         packing.setPackingName(packingName);
         packing.setSequence(sequence);
-        applyPackingProductColors(bom, packing, request.applicableProductColorIds(), request.applicableColors());
+        // Keep legacy fields empty. Product Color assignment is managed on BOM Lines.
+        packing.setApplicableProductColorIds(new ArrayList<>());
+        packing.setApplicableColors(new ArrayList<>());
         return saveChanged(bom);
     }
 
@@ -875,7 +877,6 @@ public class BomService {
         for (BomPacking packing : ensurePackings(bom)) {
             for (BomLine line : ensureLines(packing)) synchronizeLineProductColorValues(bom, line, false);
         }
-        syncPackingColorNames(bom);
         syncLegacyColorNames(bom);
         return bom;
     }
@@ -1211,9 +1212,8 @@ public class BomService {
     }
 
     private boolean isProductColorLinked(BomDocument bom, String productColorId) {
-        for (BomPacking packing : ensurePackings(bom)) {
-            if (safe(packing.getApplicableProductColorIds()).contains(productColorId)) return true;
-        }
+        // Packing-level applicability was removed. A Product Color is considered in use
+        // only when a BOM material line references it through Product Color Values.
         final boolean[] linked = { false };
         forEachLine(bom, line -> {
             if (safe(line.getProductColorValues()).stream()
@@ -1389,6 +1389,16 @@ public class BomService {
                 throw new OrderBomMprValidationException("Product Color sequence already exists in this BOM: " + sequence);
             }
         }
+    }
+
+    private int nextPackingSequence(BomDocument bom) {
+        int maxSequence = 0;
+        for (BomPacking existing : ensurePackings(bom)) {
+            if (existing != null && existing.getSequence() != null) {
+                maxSequence = Math.max(maxSequence, existing.getSequence());
+            }
+        }
+        return maxSequence + 1;
     }
 
     private void validatePackingIdentity(BomDocument bom, String excludedPackingId, String packingName, int sequence) {

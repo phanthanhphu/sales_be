@@ -3,6 +3,7 @@ package org.bsl.sales.controller;
 import jakarta.validation.Valid;
 import org.bsl.sales.dto.MprGenerateRequest;
 import org.bsl.sales.dto.MprLineUpdateRequest;
+import org.bsl.sales.dto.MprValidationResult;
 import org.bsl.sales.dto.MprBatchDeleteResult;
 import org.bsl.sales.dto.MprBatchUpdateRequest;
 import org.bsl.sales.model.MprDocument;
@@ -33,6 +34,11 @@ public class MprController {
 
     @GetMapping
     public MprDocument get(@PathVariable String orderId) { return mprService.getByOrder(orderId); }
+
+    @PostMapping("/validate")
+    public MprValidationResult validate(@PathVariable String orderId, @Valid @RequestBody MprGenerateRequest request) {
+        return mprService.validateGeneration(orderId, request);
+    }
 
     @PostMapping("/preview")
     public MprDocument preview(@PathVariable String orderId, @Valid @RequestBody MprGenerateRequest request) { return mprService.preview(orderId, request); }
@@ -95,7 +101,7 @@ public class MprController {
         String buyer = safeBuyerPart(mpr == null ? null : mpr.getBuyerKey());
         String mprNo = safeFilePart(mpr == null ? null : mpr.getMprNo(), "MPR");
         String date = LocalDate.now(DOWNLOAD_TIME_ZONE).format(DOWNLOAD_DATE_FORMAT);
-        return "MPR_" + buyer + "_" + mprNo + "_" + date + ".xlsx";
+        return "MPR_FILE_" + buyer + "_" + mprNo + "_" + date + ".xlsx";
     }
 
     private String safeBuyerPart(String value) {

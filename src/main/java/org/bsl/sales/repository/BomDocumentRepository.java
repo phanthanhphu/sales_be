@@ -7,6 +7,7 @@ import java.util.List;
 
 public interface BomDocumentRepository extends MongoRepository<BomDocument, String> {
     List<BomDocument> findByOrderIdOrderByCreatedAtDescUpdatedAtDesc(String orderId);
+    List<BomDocument> findByOrderIdIn(List<String> orderIds);
     long countByOrderId(String orderId);
     boolean existsByProductColorsProductColorMasterId(String productColorMasterId);
     long countByProductColorsProductColorMasterId(String productColorMasterId);

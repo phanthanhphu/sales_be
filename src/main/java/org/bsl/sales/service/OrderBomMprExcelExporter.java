@@ -176,13 +176,11 @@ public class OrderBomMprExcelExporter {
     private void sanitizeBlankBomTemplate(Workbook workbook, Sheet sheet) {
         if (workbook == null || sheet == null) return;
 
-        // A blank upload template must never contain a BOM/product picture or other
-        // drawing that can cover the worksheet when opened in desktop Excel.
-        if (sheet instanceof XSSFSheet xssfSheet) {
-            if (xssfSheet.getCTWorksheet().isSetDrawing()) {
-                xssfSheet.getCTWorksheet().unsetDrawing();
-            }
-        }
+        // The approved template may be supplied from a real BOM workbook. Clear
+        // every business value/picture while preserving the customer's merged
+        // cells, borders, widths, heights and intentional non-picture shapes.
+        clearBomTemplateData(sheet, workbook);
+        keepOnlyBomSheet(workbook, sheet);
 
         FormulaEvaluator evaluator = workbook.getCreationHelper().createFormulaEvaluator();
         DataFormatter formatter = new DataFormatter(Locale.US);
@@ -218,6 +216,7 @@ public class OrderBomMprExcelExporter {
 
         BomExcelLayout layout = BomExcelLayout.detect(sheet, headerRow, formatter, evaluator);
         clearBomTemplateData(sheet, workbook);
+        keepOnlyBomSheet(workbook, sheet);
         patchHeader(sheet, bom == null ? null : bom.getHeader(), formatter, evaluator);
 
         List<BomProductColor> colors = productColors(bom);
@@ -590,7 +589,7 @@ public class OrderBomMprExcelExporter {
             if (row == null) continue;
             for (int column = 0; column < Math.min(Math.max(0, row.getLastCellNum()), 30); column++) {
                 if (!headerLabelMatches(text(row, column, formatter, evaluator), label)) continue;
-                blankTemplateCell(resolveHeaderValueCell(sheet, rowIndex, column, formatter, evaluator));
+                blankTemplateCell(resolveHeaderValueCell(sheet, rowIndex, column, label, formatter, evaluator));
                 return;
             }
         }
@@ -627,8 +626,28 @@ public class OrderBomMprExcelExporter {
 
         BomExcelLayout layout = BomExcelLayout.detect(sheet, headerRow, formatter, evaluator);
         Map<String, Integer> colorColumns = findColorColumns(sheet, headerRow, layout, formatter, evaluator);
+
+        // Some approved/customer BOM workbooks contain one or more large white
+        // rectangle AutoShapes covering the visible header/detail area. They are
+        // drawing overlays, not business content, and must never be carried into
+        // Export Original Format. Remove only very large worksheet-covering
+        // shapes; pictures and small intentional shapes/arrows remain untouched.
+        removeLargeWorksheetCoverShapes(sheet, headerRow);
+
         ensureCommentsValueLayout(sheet, headerRow, layout, formatter, evaluator);
         patchHeader(sheet, bom.getHeader(), formatter, evaluator);
+
+        // These two header rows were incomplete in several original L.L.Bean
+        // workbooks. Repair only the requested fields, preserving all other
+        // customer formatting in Export Original Format.
+        repairOriginalHeaderFieldBorders(
+                workbook,
+                sheet,
+                formatter,
+                evaluator,
+                List.of("PATTERN REVISED DATE", "PATTERN MAKER")
+        );
+
         patchProductColorHeaders(sheet, headerRow, layout, bom, colorColumns);
         normalizeOutsideBomTableArea(workbook, sheet, headerRow, layout, colorColumns);
         ensureProductColorImageSlots(workbook, sheet, headerRow, layout, colorColumns);
@@ -654,6 +673,18 @@ public class OrderBomMprExcelExporter {
         repairMissingBomTableBorders(workbook, sheet, bom, layout, colorColumns);
         embedPrimaryLineImages(workbook, sheet, bom, layout);
         embedManualImages(workbook, sheet, bom, layout, colorColumns);
+
+        // IMPORTANT: run this LAST. Some original-format normalization/image
+        // operations clone or replace cell styles. Re-applying these two
+        // requested borders at the very end guarantees that Excel receives
+        // complete borders in the final workbook, not an intermediate style.
+        repairOriginalHeaderFieldBorders(
+                workbook,
+                sheet,
+                formatter,
+                evaluator,
+                List.of("PATTERN REVISED DATE", "PATTERN MAKER")
+        );
 
         // Do NOT redraw a generic border grid on an uploaded workbook. Existing
         // rows already contain the customer's exact border styles, while newly
@@ -835,7 +866,7 @@ public class OrderBomMprExcelExporter {
             for (int column = 0; column < Math.min(Math.max(0, row.getLastCellNum()), 30); column++) {
                 if (!headerLabelMatches(text(row, column, formatter, evaluator), label)) continue;
 
-                Cell target = resolveHeaderValueCell(sheet, rowIndex, column, formatter, evaluator);
+                Cell target = resolveHeaderValueCell(sheet, rowIndex, column, label, formatter, evaluator);
                 if (target == null) target = getOrCreateCell(row, column + 1);
                 setCell(target, value);
                 return;
@@ -854,28 +885,45 @@ public class OrderBomMprExcelExporter {
             Sheet sheet,
             int labelRow,
             int labelColumn,
+            String label,
             DataFormatter formatter,
             FormulaEvaluator evaluator
     ) {
         Row row = getOrCreateRow(sheet, labelRow);
-        for (int offset = 1; offset <= 4; offset++) {
-            int column = labelColumn + offset;
-            Cell existing = row.getCell(column, Row.MissingCellPolicy.RETURN_BLANK_AS_NULL);
-            String value = existing == null ? "" : formatter.formatCellValue(existing, evaluator).trim();
-            if (looksLikeHeaderLabel(value)) break;
+        CellRangeAddress labelRegion = mergedRegionAt(sheet, labelRow, labelColumn);
+        int labelFirstColumn = labelRegion == null ? labelColumn : labelRegion.getFirstColumn();
+        int labelLastColumn = labelRegion == null ? labelColumn : labelRegion.getLastColumn();
+        int labelLastRow = labelRegion == null ? labelRow : labelRegion.getLastRow();
 
-            Cell mergedTopLeft = mergedTopLeftCell(sheet, labelRow, column);
-            if (mergedTopLeft != null) return mergedTopLeft;
-
-            // The first cell immediately after the label is the normal value
-            // slot even when it is blank. Keeping it avoids writing Comments,
-            // Rev. Stage and other values into a visually different row.
-            if (offset == 1) return getOrCreateCell(row, column);
-            if (existing != null) return existing;
+        // In the simplified BOM form COMMENTS is a wide merged label (normally
+        // I2:Q2) and its value is the merged row directly below (I3:Q3). Treat
+        // that as a vertical label/value pair instead of scanning into the next
+        // business field.
+        if ("COMMENTS".equals(normalize(label))) {
+            int valueRowIndex = labelLastRow + 1;
+            Row valueRow = getOrCreateRow(sheet, valueRowIndex);
+            Cell mergedValue = mergedTopLeftCell(sheet, valueRowIndex, labelFirstColumn);
+            if (mergedValue != null) return mergedValue;
+            return getOrCreateCell(valueRow, labelFirstColumn);
         }
 
-        Cell below = firstExistingValueCellBelow(sheet, labelRow, labelColumn, formatter, evaluator);
-        return below == null ? null : mergedTopLeftCellOrSelf(sheet, below);
+        // A merged header label such as A2:B2 owns the whole merged range. The
+        // value starts AFTER that range (C2...), not in B2. This keeps merged
+        // labels from being overwritten when exporting or clearing a template.
+        int valueColumn = labelLastColumn + 1;
+        Cell mergedValue = mergedTopLeftCell(sheet, labelRow, valueColumn);
+        if (mergedValue != null) return mergedValue;
+
+        Cell existing = row.getCell(valueColumn, Row.MissingCellPolicy.RETURN_BLANK_AS_NULL);
+        if (existing != null) {
+            String value = formatter.formatCellValue(existing, evaluator).trim();
+            if (!looksLikeHeaderLabel(value)) return existing;
+        }
+
+        // The immediate slot is authoritative even when blank. Do not scan
+        // several columns to the right, because a blank Pattern Date/Rev. Stage
+        // could otherwise incorrectly consume Comments or another header value.
+        return getOrCreateCell(row, valueColumn);
     }
 
     private Cell mergedTopLeftCell(Sheet sheet, int row, int column) {
@@ -1330,6 +1378,97 @@ public class OrderBomMprExcelExporter {
         return -1;
     }
 
+    /**
+     * Removes only huge drawing shapes that start at the worksheet origin and
+     * cover a substantial part of the BOM form. These are the accidental white
+     * overlay rectangles seen in Excel. Pictures and normal small shapes (for
+     * example the red direction arrows in the table header) are not removed.
+     */
+    private void removeLargeWorksheetCoverShapes(Sheet sheet, int headerRow) {
+        if (!(sheet instanceof XSSFSheet xssfSheet)) return;
+        XSSFDrawing drawing = xssfSheet.getDrawingPatriarch();
+        if (drawing == null) return;
+
+        var ctDrawing = drawing.getCTDrawing();
+        int minimumBottomRow = Math.max(20, headerRow + 8);
+
+        for (int index = ctDrawing.sizeOfTwoCellAnchorArray() - 1; index >= 0; index--) {
+            var anchor = ctDrawing.getTwoCellAnchorArray(index);
+            if (!anchor.isSetSp() || anchor.getFrom() == null || anchor.getTo() == null) continue;
+
+            int fromColumn = anchor.getFrom().getCol();
+            int fromRow = anchor.getFrom().getRow();
+            int toColumn = anchor.getTo().getCol();
+            int toRow = anchor.getTo().getRow();
+
+            // The bad overlays in the approved BOM start at A1 and cover roughly
+            // A1:K34. Using a size/location rule makes the cleanup independent of
+            // Excel's generated shape name while protecting small valid shapes.
+            boolean coversWorksheet = fromColumn <= 0
+                    && fromRow <= 0
+                    && toColumn >= 8
+                    && toRow >= minimumBottomRow;
+            if (coversWorksheet) ctDrawing.removeTwoCellAnchor(index);
+        }
+    }
+
+    /**
+     * Ensures a complete thin border around the label and value areas of selected
+     * original-format header fields. Merged label/value ranges are respected.
+     */
+    private void repairOriginalHeaderFieldBorders(
+            Workbook workbook,
+            Sheet sheet,
+            DataFormatter formatter,
+            FormulaEvaluator evaluator,
+            Collection<String> labels
+    ) {
+        if (workbook == null || sheet == null || labels == null || labels.isEmpty()) return;
+
+        for (String label : labels) {
+            boolean repaired = false;
+            for (int rowIndex = 0; rowIndex <= Math.min(sheet.getLastRowNum(), 18) && !repaired; rowIndex++) {
+                Row row = sheet.getRow(rowIndex);
+                if (row == null) continue;
+
+                for (int column = 0; column < Math.min(Math.max(0, row.getLastCellNum()), 30); column++) {
+                    if (!headerLabelMatches(text(row, column, formatter, evaluator), label)) continue;
+
+                    CellRangeAddress labelRegion = mergedRegionAt(sheet, rowIndex, column);
+                    int labelFirstRow = labelRegion == null ? rowIndex : labelRegion.getFirstRow();
+                    int labelLastRow = labelRegion == null ? rowIndex : labelRegion.getLastRow();
+                    int labelFirstColumn = labelRegion == null ? column : labelRegion.getFirstColumn();
+                    int labelLastColumn = labelRegion == null ? column : labelRegion.getLastColumn();
+                    applyAllBorders(
+                            workbook, sheet,
+                            labelFirstRow, labelLastRow,
+                            labelFirstColumn, labelLastColumn
+                    );
+
+                    Cell valueCell = resolveHeaderValueCell(
+                            sheet, rowIndex, column, label, formatter, evaluator
+                    );
+                    if (valueCell != null) {
+                        CellRangeAddress valueRegion = mergedRegionAt(
+                                sheet, valueCell.getRowIndex(), valueCell.getColumnIndex()
+                        );
+                        int valueFirstRow = valueRegion == null ? valueCell.getRowIndex() : valueRegion.getFirstRow();
+                        int valueLastRow = valueRegion == null ? valueCell.getRowIndex() : valueRegion.getLastRow();
+                        int valueFirstColumn = valueRegion == null ? valueCell.getColumnIndex() : valueRegion.getFirstColumn();
+                        int valueLastColumn = valueRegion == null ? valueCell.getColumnIndex() : valueRegion.getLastColumn();
+                        applyAllBorders(
+                                workbook, sheet,
+                                valueFirstRow, valueLastRow,
+                                valueFirstColumn, valueLastColumn
+                        );
+                    }
+                    repaired = true;
+                    break;
+                }
+            }
+        }
+    }
+
     private void removeReplacedOrDeletedLineImages(Sheet sheet, BomDocument bom, BomExcelLayout layout) {
         if (!layout.hasImageColumn() || !(sheet instanceof org.apache.poi.xssf.usermodel.XSSFSheet xssfSheet)) return;
         org.apache.poi.xssf.usermodel.XSSFDrawing drawing = xssfSheet.getDrawingPatriarch();
@@ -1518,7 +1657,6 @@ public class OrderBomMprExcelExporter {
         FormulaEvaluator evaluator = workbook.getCreationHelper().createFormulaEvaluator();
         DataFormatter formatter = new DataFormatter(Locale.US);
         int headerRow = findColumnHeaderRow(sheet, formatter, evaluator);
-        CellAddressRange productColorImageSlot = productColorImageSlot(headerRow);
         CellAddressRange commentsArea = commentsImageArea(sheet, headerRow, layout, formatter, evaluator);
 
         for (BomAttachment attachment : allAttachments(bom)) {
@@ -1539,7 +1677,9 @@ public class OrderBomMprExcelExporter {
                         : colorColumns.get(productColorName);
 
                 int outputPictureType = pictureType(attachment);
+                CellAddressRange productColorImageSlot = null;
                 if ("COLOR".equals(scope) && productColorColumn != null) {
+                    productColorImageSlot = productColorImageSlot(sheet, headerRow, productColorColumn);
                     PreparedPicture prepared = prepareProductColorPicture(
                             sheet, productColorImageSlot, productColorColumn, pictureBytes, outputPictureType
                     );
@@ -1713,7 +1853,6 @@ public class OrderBomMprExcelExporter {
     ) {
         if (workbook == null || sheet == null || headerRow < 2) return;
 
-        CellAddressRange slot = productColorImageSlot(headerRow);
         java.util.Set<Integer> columns = new LinkedHashSet<>();
         if (colorColumns != null) {
             for (Integer column : colorColumns.values()) {
@@ -1735,6 +1874,7 @@ public class OrderBomMprExcelExporter {
         Map<Short, CellStyle> whiteStyles = new LinkedHashMap<>();
         for (Integer column : columns) {
             if (column == null || column < 0) continue;
+            CellAddressRange slot = productColorImageSlot(sheet, headerRow, column);
             if (!isBlankImageSlot(sheet, slot, column)) continue;
 
             /*
@@ -1803,6 +1943,29 @@ public class OrderBomMprExcelExporter {
         return new CellAddressRange(firstRow, lastRowExclusive, -1, -1);
     }
 
+    private CellAddressRange productColorImageSlot(Sheet sheet, int headerRow, int column) {
+        CellRangeAddress best = null;
+        int latestAllowedRow = Math.max(0, headerRow - 2); // keep the guide row immediately above the detail header untouched
+        for (int index = 0; index < sheet.getNumMergedRegions(); index++) {
+            CellRangeAddress region = sheet.getMergedRegion(index);
+            if (region == null
+                    || region.getFirstColumn() != column
+                    || region.getLastColumn() != column
+                    || region.getLastRow() > latestAllowedRow
+                    || region.getFirstRow() >= headerRow) {
+                continue;
+            }
+            if (best == null || (region.getLastRow() - region.getFirstRow()) > (best.getLastRow() - best.getFirstRow())) {
+                best = region;
+            }
+        }
+        if (best != null) {
+            return new CellAddressRange(best.getFirstRow(), best.getLastRow() + 1, column, column + 1);
+        }
+        CellAddressRange fallback = productColorImageSlot(headerRow);
+        return new CellAddressRange(fallback.firstRow(), fallback.lastRowExclusive(), column, column + 1);
+    }
+
     private boolean isBlankImageSlot(Sheet sheet, CellAddressRange slot, int column) {
         DataFormatter formatter = new DataFormatter(Locale.US);
         for (int rowIndex = slot.firstRow(); rowIndex < slot.lastRowExclusive(); rowIndex++) {
@@ -1850,6 +2013,7 @@ public class OrderBomMprExcelExporter {
     ) {
         int commentsRow = 1;
         int commentsColumn = Math.max(0, Math.min(layout.firstColorColumn() - 1, 8));
+        CellRangeAddress commentsLabelRegion = null;
         for (int rowIndex = 0; rowIndex <= Math.min(Math.max(0, headerRow - 1), 18); rowIndex++) {
             Row row = sheet.getRow(rowIndex);
             if (row == null) continue;
@@ -1857,14 +2021,44 @@ public class OrderBomMprExcelExporter {
                 if (headerLabelMatches(text(row, column, formatter, evaluator), "COMMENTS")) {
                     commentsRow = rowIndex;
                     commentsColumn = column;
+                    commentsLabelRegion = mergedRegionAt(sheet, rowIndex, column);
                     break;
                 }
             }
+            if (commentsLabelRegion != null || commentsRow == rowIndex && commentsColumn >= 0) {
+                if (headerLabelMatches(text(sheet.getRow(commentsRow), commentsColumn, formatter, evaluator), "COMMENTS")) break;
+            }
         }
 
-        int firstColumn = commentsColumn + 1;
+        int labelFirstColumn = commentsLabelRegion == null ? commentsColumn : commentsLabelRegion.getFirstColumn();
+        int labelLastColumn = commentsLabelRegion == null ? commentsColumn : commentsLabelRegion.getLastColumn();
+        int labelLastRow = commentsLabelRegion == null ? commentsRow : commentsLabelRegion.getLastRow();
+
+        // Preferred simplified-template layout:
+        //   I2:Q2 = Comments label
+        //   I3:Q3 = Comments text
+        //   I4:Q10 = Whole BOM image
+        // If that explicit merged image slot exists, use it exactly.
+        int commentsValueRow = labelLastRow + 1;
+        CellRangeAddress commentsValueRegion = mergedRegionAt(sheet, commentsValueRow, labelFirstColumn);
+        int imageStartRow = commentsValueRegion == null ? commentsValueRow + 1 : commentsValueRegion.getLastRow() + 1;
+        CellRangeAddress explicitImageRegion = mergedRegionAt(sheet, imageStartRow, labelFirstColumn);
+        if (explicitImageRegion != null
+                && explicitImageRegion.getFirstColumn() <= labelFirstColumn
+                && explicitImageRegion.getLastColumn() >= Math.min(labelLastColumn, layout.firstColorColumn() - 1)) {
+            return new CellAddressRange(
+                    explicitImageRegion.getFirstRow(),
+                    explicitImageRegion.getLastRow() + 1,
+                    explicitImageRegion.getFirstColumn(),
+                    explicitImageRegion.getLastColumn() + 1
+            );
+        }
+
+        // Compatibility fallback for older layouts where Comments is a normal
+        // single-cell label with its value to the right.
+        int firstColumn = commentsLabelRegion == null ? commentsColumn + 1 : labelFirstColumn;
         int lastColumnExclusive = Math.max(firstColumn + 1, layout.firstColorColumn());
-        int firstRow = Math.min(Math.max(0, commentsRow + 1), Math.max(0, headerRow - 2));
+        int firstRow = Math.max(0, imageStartRow);
         int lastRowExclusive = Math.max(firstRow + 1, headerRow > 1 ? headerRow - 1 : firstRow + 7);
         return new CellAddressRange(firstRow, lastRowExclusive, firstColumn, lastColumnExclusive);
     }
@@ -2041,6 +2235,16 @@ public class OrderBomMprExcelExporter {
         ).toLowerCase(Locale.ROOT);
     }
 
+    private void keepOnlyBomSheet(Workbook workbook, Sheet sheet) {
+        if (workbook == null || sheet == null || workbook.getNumberOfSheets() <= 1) return;
+        int keepIndex = workbook.getSheetIndex(sheet);
+        for (int index = workbook.getNumberOfSheets() - 1; index >= 0; index--) {
+            if (index == keepIndex) continue;
+            workbook.removeSheetAt(index);
+            if (index < keepIndex) keepIndex--;
+        }
+    }
+
     private void renameBomSheet(Workbook workbook, Sheet sheet) {
         if (workbook == null || sheet == null || "BOM".equals(sheet.getSheetName())) return;
         int sheetIndex = workbook.getSheetIndex(sheet);
@@ -2143,6 +2347,24 @@ public class OrderBomMprExcelExporter {
             }
             writeMprImportMetadata(workbook, lines);
             applyMprVisualGrouping(workbook, sheet, lines);
+
+            // MPR export: apply All Borders to the complete visible table only.
+            // Keep the template's existing widths, wrapping, alignment and other formatting unchanged.
+            applyAllBorders(
+                    workbook,
+                    sheet,
+                    MPR_HEADER_ROW,
+                    Math.max(MPR_HEADER_ROW, lastDataRow),
+                    MPR_STYLE_COLOR_KEY_COL,
+                    MPR_LAST_COLUMN
+            );
+
+            // A highlighted BOM/Product Color row must be visually continuous
+            // across the complete MPR row, including blank cells such as
+            // Sales comment (E) and MAT DUE-DATE (AF). Re-apply only the row
+            // highlight after borders so blank/template cells cannot fall back
+            // to their original white fill.
+            ensureMprHighlightedRowsCoverAllColumns(workbook, sheet, lines);
 
             // Preserve template navigation/print behavior while applying the
             // actual exported data range.
@@ -2430,6 +2652,54 @@ public class OrderBomMprExcelExporter {
             previousBom = bomKey;
             previousColor = colorKey;
             previousSource = sourceKey;
+        }
+    }
+
+    /**
+     * Guarantees that the green BOM/Product Color group highlight covers every
+     * visible cell A:AG, even when a cell is blank in the exported row. This is
+     * intentionally applied after All Borders so border normalization can never
+     * expose the template's original white fill in blank columns.
+     */
+    private void ensureMprHighlightedRowsCoverAllColumns(
+            Workbook workbook,
+            Sheet sheet,
+            List<MprLine> lines
+    ) {
+        if (workbook == null || sheet == null || lines == null || lines.isEmpty()) return;
+
+        Map<Integer, CellStyle> greenStyles = new LinkedHashMap<>();
+        String previousBom = null;
+        String previousColor = null;
+
+        for (int index = 0; index < lines.size(); index++) {
+            MprLine line = lines.get(index);
+            if (line == null) continue;
+
+            String bomKey = normalize(line.getBomId());
+            String colorKey = bomKey + "|" + normalize(firstNonBlank(line.getStyleColor(), line.getProductColorId()));
+            boolean newBom = !Objects.equals(previousBom, bomKey);
+            boolean newColor = newBom || !Objects.equals(previousColor, colorKey);
+
+            if (newBom || newColor) {
+                Row row = getOrCreateRow(sheet, MPR_DATA_START_ROW + index);
+                for (int column = MPR_STYLE_COLOR_KEY_COL; column <= MPR_LAST_COLUMN; column++) {
+                    Cell cell = getOrCreateCell(row, column);
+                    CellStyle source = cell.getCellStyle();
+                    int styleKey = source.getIndex();
+                    CellStyle green = greenStyles.get(styleKey);
+                    if (green == null) {
+                        green = workbook.createCellStyle();
+                        green.cloneStyleFrom(source);
+                        applyMprFill(green, "92D050");
+                        greenStyles.put(styleKey, green);
+                    }
+                    cell.setCellStyle(green);
+                }
+            }
+
+            previousBom = bomKey;
+            previousColor = colorKey;
         }
     }
 

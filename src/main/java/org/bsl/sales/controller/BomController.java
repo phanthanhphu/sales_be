@@ -11,7 +11,6 @@ import org.bsl.sales.model.BomLine;
 import org.bsl.sales.service.BomService;
 import org.bsl.sales.service.OrderBomMprExcelExporter;
 import org.springframework.core.io.Resource;
-import org.springframework.core.io.ClassPathResource;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -42,15 +41,11 @@ public class BomController {
     }
 
     @GetMapping("/boms/template")
-    public ResponseEntity<Resource> downloadBomTemplate() {
-        Resource resource = new ClassPathResource("templates/BOM_Upload_Template.xlsx");
-        if (!resource.exists()) {
-            throw new IllegalStateException("BOM upload template is missing");
-        }
+    public ResponseEntity<byte[]> downloadBomTemplate() {
         return ResponseEntity.ok()
                 .contentType(MediaType.APPLICATION_OCTET_STREAM)
-                .header(HttpHeaders.CONTENT_DISPOSITION, contentDisposition("BOM_Template_" + timestamp() + ".xlsx"))
-                .body(resource);
+                .header(HttpHeaders.CONTENT_DISPOSITION, contentDisposition("BOM_Upload_Template_" + timestamp() + ".xlsx"))
+                .body(exporter.exportBomTemplate(null));
     }
 
     @GetMapping("/boms/{id}/template")

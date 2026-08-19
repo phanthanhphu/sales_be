@@ -3,6 +3,8 @@ package org.bsl.sales.service;
 import org.bsl.sales.dto.MprGenerateRequest;
 import org.bsl.sales.dto.MprSelectionRequest;
 import org.bsl.sales.dto.MprLineUpdateRequest;
+import org.bsl.sales.dto.MprValidationIssue;
+import org.bsl.sales.dto.MprValidationResult;
 import org.bsl.sales.dto.MprBatchDeleteResult;
 import org.bsl.sales.dto.MprBatchUpdateRequest;
 import org.bsl.sales.exception.OrderBomMprNotFoundException;
@@ -116,6 +118,173 @@ public class MprService {
             recalculateMprCalculations(candidate);
             return candidate;
         });
+    }
+
+
+    /**
+     * Read-only preflight used by the UI before Preview/Create MPR.
+     * It returns every dedicated Material -> Ship To mismatch in one pass so
+     * users can fix all Product Colors without retrying generation repeatedly.
+     */
+    public MprValidationResult validateGeneration(String orderId, MprGenerateRequest request) {
+        if (request == null || request.selections() == null || request.selections().isEmpty()) {
+            throw new OrderBomMprValidationException("Select at least one submitted BOM");
+        }
+
+        SalesOrder order = orderService.get(orderId);
+        String buyerKey = BuyerKeys.legacyDefault(order.getBuyerKey());
+        requireLlBeanImplementation(buyerKey, "MPR generation");
+
+        Map<String, MatInfo> matByKey = buildMatInfoCache(buyerKey);
+        Map<String, ShipTo> shipToById = buildShipToCache();
+        Map<String, MaterialShipToMapping> dedicatedShipToByMaterialKey = materialShipToMappingRepository
+                .findByBuyerKeyAndActiveTrue(buyerKey).stream()
+                .filter(Objects::nonNull)
+                .filter(item -> hasText(item.getMaterialKey()))
+                .collect(Collectors.toMap(
+                        MaterialShipToMapping::getMaterialKey,
+                        item -> item,
+                        (a, b) -> a,
+                        LinkedHashMap::new
+                ));
+
+        LinkedHashSet<String> requestedBomIds = new LinkedHashSet<>();
+        List<MprSelectionRequest> requestedSelections = new ArrayList<>();
+        for (MprSelectionRequest selectionRequest : request.selections()) {
+            if (selectionRequest == null || blank(selectionRequest.bomId())) {
+                throw new OrderBomMprValidationException("BOM id is required for every selection");
+            }
+            if (!requestedBomIds.add(selectionRequest.bomId())) {
+                throw new OrderBomMprValidationException("The same BOM can only be selected once");
+            }
+            requestedSelections.add(selectionRequest);
+        }
+
+        Map<String, BomDocument> selectedBomById = new LinkedHashMap<>();
+        for (BomDocument bom : bomRepository.findAllById(requestedBomIds)) {
+            if (bom != null && hasText(bom.getId())) selectedBomById.put(bom.getId(), bom);
+        }
+        List<BomDocument> selectedBoms = requestedBomIds.stream()
+                .map(selectedBomById::get)
+                .filter(Objects::nonNull)
+                .collect(Collectors.toCollection(ArrayList::new));
+        lineStore.hydrateAllForMpr(selectedBoms);
+
+        Map<String, ValidationIssueAccumulator> issueByKey = new LinkedHashMap<>();
+
+        for (MprSelectionRequest selectionRequest : requestedSelections) {
+            BomDocument bom = selectedBomById.get(selectionRequest.bomId());
+            if (bom == null) throw new OrderBomMprNotFoundException("Selected BOM not found");
+            if (!buyerKey.equals(BuyerKeys.legacyDefault(bom.getBuyerKey()))) {
+                throw new OrderBomMprValidationException("Selected BOM belongs to another Buyer");
+            }
+            if (!orderId.equals(bom.getOrderId())) {
+                throw new OrderBomMprValidationException("Selected BOM does not belong to this order");
+            }
+            if (!"SUBMITTED".equalsIgnoreCase(bom.getStatus())) {
+                throw new OrderBomMprValidationException("Only submitted BOM can be used to create MPR: " + bom.getBomNo());
+            }
+
+            List<String> colors = normalizeSelectionColors(selectionRequest.colors(), bom);
+            if (colors.isEmpty()) {
+                throw new OrderBomMprValidationException("Select at least one Product Color for BOM " + bom.getBomNo());
+            }
+
+            Map<String, BomPacking> packingById = safeList(bom.getPackings()).stream()
+                    .filter(Objects::nonNull)
+                    .filter(item -> hasText(item.getId()))
+                    .collect(Collectors.toMap(
+                            BomPacking::getId,
+                            item -> item,
+                            (left, right) -> left,
+                            LinkedHashMap::new
+                    ));
+            List<BomPacking> selectedPackings = new ArrayList<>();
+            for (String packingId : safeList(selectionRequest.packingIds())) {
+                if (blank(packingId)) continue;
+                BomPacking packing = packingById.get(packingId);
+                if (packing == null) {
+                    throw new OrderBomMprValidationException("Packing not found in BOM " + bom.getBomNo());
+                }
+                selectedPackings.add(packing);
+            }
+
+            Map<String, String> productColorIdByName = productColorIdsByName(bom);
+
+            for (String colorName : colors) {
+                List<String> selectedShipToIds = shipToIdsForColor(selectionRequest, bom, colorName, shipToById);
+                // Reuse the same quantity validation as real generation.
+                shipToQuantitiesForColor(selectionRequest, bom, colorName, selectedShipToIds, request.poQuantity());
+                String resolvedProductColorId = productColorIdByName.getOrDefault(normalize(colorName), "");
+                String uiProductColorId = hasText(resolvedProductColorId) ? resolvedProductColorId : colorName;
+
+                List<BomLine> sourceLines = new ArrayList<>(safeList(bom.getCoreLines()));
+                for (BomPacking packing : selectedPackings) sourceLines.addAll(safeList(packing.getLines()));
+
+                for (BomLine source : sourceLines) {
+                    if (!isPurchasableMaterialLine(source)) continue;
+
+                    String description = bomMaterialDescription(source);
+                    String materialColor = materialColorFor(source, colorName, resolvedProductColorId);
+                    MatInfo mat = findMatInfo(matByKey, source, materialColor);
+                    String materialType = trim(source.getMaterialType());
+                    String resolvedSapCode = firstNonBlank(source.getSapCode(), mat == null ? null : mat.getFlexId());
+                    String resolvedMatUnit = firstNonBlank(
+                            source.getConsumptionUnit(),
+                            source.getCostingUnit(),
+                            mat == null ? null : mat.getMatUnit()
+                    );
+                    String materialMappingKey = MaterialShipToMappingKeys.build(
+                            resolvedSapCode,
+                            materialType,
+                            description,
+                            firstNonBlank(source.getPosition(), source.getPositionDescription(), source.getPositionDescriptionExtra()),
+                            materialColor,
+                            resolvedMatUnit
+                    );
+                    MaterialShipToMapping mapping = dedicatedShipToByMaterialKey.get(materialMappingKey);
+                    if (mapping == null) continue;
+
+                    String requiredId = trim(mapping.getShipToId());
+                    if (selectedShipToIds.contains(requiredId)) continue;
+
+                    String materialLabel = firstNonBlank(resolvedSapCode, description, materialType);
+                    String issueKey = bom.getId() + "|" + uiProductColorId + "|" + normalize(colorName) + "|" + requiredId;
+                    ValidationIssueAccumulator accumulator = issueByKey.computeIfAbsent(issueKey, key -> new ValidationIssueAccumulator(
+                            bom.getId(),
+                            trim(bom.getBomNo()),
+                            trim(bom.getBomName()),
+                            uiProductColorId,
+                            colorName,
+                            requiredId,
+                            trim(mapping.getShipToCode()),
+                            trim(mapping.getShipToName())
+                    ));
+                    if (hasText(materialLabel)) accumulator.materials.add(materialLabel);
+                }
+            }
+        }
+
+        List<MprValidationIssue> issues = issueByKey.values().stream()
+                .map(item -> {
+                    String shipToLabel = firstNonBlank(item.requiredShipToCode, item.requiredShipToName, item.requiredShipToId);
+                    return new MprValidationIssue(
+                            "MISSING_DEDICATED_SHIP_TO",
+                            item.bomId,
+                            item.bomNo,
+                            item.bomName,
+                            item.productColorId,
+                            item.productColor,
+                            item.requiredShipToId,
+                            item.requiredShipToCode,
+                            item.requiredShipToName,
+                            new ArrayList<>(item.materials),
+                            "BOM " + item.bomNo + " · " + item.productColor + " → Missing Ship To " + shipToLabel
+                    );
+                })
+                .collect(Collectors.toCollection(ArrayList::new));
+
+        return new MprValidationResult(issues.isEmpty(), issues);
     }
 
     /**
@@ -2122,4 +2291,36 @@ public class MprService {
                 .map(String::trim)
                 .collect(Collectors.joining(" "));
     }
+    private static final class ValidationIssueAccumulator {
+        private final String bomId;
+        private final String bomNo;
+        private final String bomName;
+        private final String productColorId;
+        private final String productColor;
+        private final String requiredShipToId;
+        private final String requiredShipToCode;
+        private final String requiredShipToName;
+        private final LinkedHashSet<String> materials = new LinkedHashSet<>();
+
+        private ValidationIssueAccumulator(
+                String bomId,
+                String bomNo,
+                String bomName,
+                String productColorId,
+                String productColor,
+                String requiredShipToId,
+                String requiredShipToCode,
+                String requiredShipToName
+        ) {
+            this.bomId = bomId;
+            this.bomNo = bomNo;
+            this.bomName = bomName;
+            this.productColorId = productColorId;
+            this.productColor = productColor;
+            this.requiredShipToId = requiredShipToId;
+            this.requiredShipToCode = requiredShipToCode;
+            this.requiredShipToName = requiredShipToName;
+        }
+    }
+
 }
