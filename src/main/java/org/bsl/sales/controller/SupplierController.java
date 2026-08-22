@@ -42,12 +42,13 @@ public class SupplierController {
     }
 
     @PostMapping
-    public ResponseEntity<VendorCode> create(@Valid @RequestBody VendorCodeRequest request) {
-        return ResponseEntity.ok(vendorCodeService.create(request));
+    public ResponseEntity<VendorCode> create(@RequestParam(defaultValue = "LLBEAN") String buyerKey, @Valid @RequestBody VendorCodeRequest request) {
+        return ResponseEntity.ok(vendorCodeService.create(buyerKey, request));
     }
 
     @GetMapping
     public ResponseEntity<Page<VendorCode>> list(
+            @RequestParam(defaultValue = "LLBEAN") String buyerKey,
             @RequestParam(required = false) String keyword,
             @RequestParam(required = false) String masterKey,
             @RequestParam(required = false) String shortNameSupplier,
@@ -61,11 +62,12 @@ public class SupplierController {
         // for integrations while the main UI uses the explicit filters.
         if (keyword != null && masterKey == null && shortNameSupplier == null && vendorCode == null
                 && vendorName == null && matCharger == null) {
-            return ResponseEntity.ok(vendorCodeService.list(keyword, page, size));
+            return ResponseEntity.ok(vendorCodeService.list(buyerKey, keyword, page, size));
         }
 
         return ResponseEntity.ok(
                 vendorCodeService.list(
+                        buyerKey,
                         masterKey,
                         shortNameSupplier,
                         vendorCode,
@@ -78,26 +80,27 @@ public class SupplierController {
     }
 
     @GetMapping("/{id}")
-    public ResponseEntity<VendorCode> getById(@PathVariable String id) {
-        return ResponseEntity.ok(vendorCodeService.getById(id));
+    public ResponseEntity<VendorCode> getById(@PathVariable String id, @RequestParam(defaultValue = "LLBEAN") String buyerKey) {
+        return ResponseEntity.ok(vendorCodeService.getById(buyerKey, id));
     }
 
     @GetMapping("/resolve")
-    public ResponseEntity<VendorCode> resolve(@RequestParam String shortNameSupplier) {
-        return ResponseEntity.ok(vendorCodeService.resolve(shortNameSupplier));
+    public ResponseEntity<VendorCode> resolve(@RequestParam String shortNameSupplier, @RequestParam(defaultValue = "LLBEAN") String buyerKey) {
+        return ResponseEntity.ok(vendorCodeService.resolve(buyerKey, shortNameSupplier));
     }
 
     @PutMapping("/{id}")
     public ResponseEntity<VendorCode> update(
             @PathVariable String id,
+            @RequestParam(defaultValue = "LLBEAN") String buyerKey,
             @Valid @RequestBody VendorCodeRequest request
     ) {
-        return ResponseEntity.ok(vendorCodeService.update(id, request));
+        return ResponseEntity.ok(vendorCodeService.update(buyerKey, id, request));
     }
 
     @DeleteMapping("/{id}")
-    public ResponseEntity<Void> delete(@PathVariable String id) {
-        vendorCodeService.delete(id);
+    public ResponseEntity<Void> delete(@PathVariable String id, @RequestParam(defaultValue = "LLBEAN") String buyerKey) {
+        vendorCodeService.delete(buyerKey, id);
         return ResponseEntity.noContent().build();
     }
 
@@ -105,9 +108,10 @@ public class SupplierController {
     @PostMapping(value = "/upload", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     public ResponseEntity<MasterDataImportResult> upload(
             @RequestParam("file") MultipartFile file,
-            @RequestParam(defaultValue = "UPSERT") ImportMode mode
+            @RequestParam(defaultValue = "UPSERT") ImportMode mode,
+            @RequestParam(defaultValue = "LLBEAN") String buyerKey
     ) {
-        MasterDataImportResult result = vendorCodeService.upload(file, mode);
+        MasterDataImportResult result = vendorCodeService.upload(file, mode, buyerKey);
         return result.isApplied()
                 ? ResponseEntity.ok(result)
                 : ResponseEntity.badRequest().body(result);

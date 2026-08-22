@@ -92,7 +92,7 @@ public class MaterialShipToMappingService {
         if (repository.findByBuyerKeyAndMaterialKey(buyer, materialKey).isPresent()) {
             throw new MasterDataConflictException("This material already has a dedicated Ship To for Buyer " + buyer);
         }
-        ShipTo shipTo = requireActiveShipTo(request.shipToId());
+        ShipTo shipTo = requireActiveShipTo(buyer, request.shipToId());
         MaterialShipToMapping entity = new MaterialShipToMapping();
         entity.setMasterKey(nextMasterKey());
         apply(entity, buyer, request, shipTo);
@@ -156,7 +156,7 @@ public class MaterialShipToMappingService {
         if (duplicate.isPresent() && !duplicate.get().getId().equals(id)) {
             throw new MasterDataConflictException("This material already has a dedicated Ship To for Buyer " + buyer);
         }
-        ShipTo shipTo = requireActiveShipTo(request.shipToId());
+        ShipTo shipTo = requireActiveShipTo(buyer, request.shipToId());
         apply(entity, buyer, request, shipTo);
         entity.setUpdatedAt(LocalDateTime.now());
         return repository.save(entity);
@@ -171,22 +171,35 @@ public class MaterialShipToMappingService {
     }
 
     public byte[] template(String buyerKey) {
-        buyerKey(buyerKey);
-        return MasterDataEditWorkbookExporter.materialShipToTemplate(shipToRepository.findByActiveTrueOrderByShipToNameAsc());
+        String buyer = buyerKey(buyerKey);
+        List<ShipTo> activeShipTos = activeShipTosForWorkbook(buyer);
+        return MasterDataEditWorkbookExporter.materialShipToTemplate(activeShipTos);
     }
 
     public byte[] exportForEdit(String buyerKey) {
         backfillMissingMasterKeys();
+        String buyer = buyerKey(buyerKey);
         return MasterDataEditWorkbookExporter.materialShipToMappings(
-                repository.findByBuyerKeyOrderByUpdatedAtDesc(buyerKey(buyerKey))
+                repository.findByBuyerKeyOrderByUpdatedAtDesc(buyer),
+                activeShipTosForWorkbook(buyer)
         );
+    }
+
+    private List<ShipTo> activeShipTosForWorkbook(String buyer) {
+        List<ShipTo> activeShipTos = shipToRepository.findByBuyerKeyAndActiveTrueOrderByShipToNameAsc(buyer);
+        if (activeShipTos == null || activeShipTos.isEmpty()) {
+            throw new MasterDataValidationException(
+                    "Buyer " + buyer + " has no active Ship To. Add or activate a Ship To in Ship To Master before downloading this file."
+            );
+        }
+        return activeShipTos;
     }
 
     public MasterDataImportResult upload(String buyerKey, MultipartFile file, ImportMode mode) {
         String buyer = buyerKey(buyerKey);
         ImportMode effectiveMode = mode == null ? ImportMode.CREATE_ONLY : mode;
         List<ImportRowError> errors = new ArrayList<>();
-        List<ImportCandidate<MaterialShipToMappingRequest>> rows = parseStandardWorkbook(file, errors);
+        List<ImportCandidate<MaterialShipToMappingRequest>> rows = parseStandardWorkbook(buyer, file, errors);
         int totalRows = rows.size();
 
         validateIncomingDuplicates(rows, errors);
@@ -215,7 +228,7 @@ public class MaterialShipToMappingService {
                 MaterialShipToMapping entity = new MaterialShipToMapping();
                 entity.setMasterKey(keys.get(i));
                 entity.setCreatedAt(now);
-                apply(entity, buyer, request, requireActiveShipTo(request.shipToId()));
+                apply(entity, buyer, request, requireActiveShipTo(buyer, request.shipToId()));
                 entity.setUpdatedAt(now);
                 toSave.add(entity);
             }
@@ -240,7 +253,7 @@ public class MaterialShipToMappingService {
             } else {
                 result.setUpdated(result.getUpdated() + 1);
             }
-            apply(entity, buyer, request, requireActiveShipTo(request.shipToId()));
+            apply(entity, buyer, request, requireActiveShipTo(buyer, request.shipToId()));
             entity.setUpdatedAt(now);
             toSave.add(entity);
         }
@@ -251,7 +264,7 @@ public class MaterialShipToMappingService {
     public MasterDataImportResult uploadEdited(String buyerKey, MultipartFile file) {
         String buyer = buyerKey(buyerKey);
         List<ImportRowError> errors = new ArrayList<>();
-        List<ImportCandidate<KeyedRequest>> rows = parseEditedWorkbook(file, errors);
+        List<ImportCandidate<KeyedRequest>> rows = parseEditedWorkbook(buyer, file, errors);
         int totalRows = rows.size();
 
         Set<String> requestedKeys = rows.stream().map(row -> row.getValue().masterKey)
@@ -314,7 +327,7 @@ public class MaterialShipToMappingService {
                 entity = byKey.get(keyed.masterKey);
                 result.setUpdated(result.getUpdated() + 1);
             }
-            apply(entity, buyer, keyed.request, requireActiveShipTo(keyed.request.shipToId()));
+            apply(entity, buyer, keyed.request, requireActiveShipTo(buyer, keyed.request.shipToId()));
             entity.setUpdatedAt(now);
             toSave.add(entity);
         }
@@ -323,20 +336,20 @@ public class MaterialShipToMappingService {
         return result;
     }
 
-    private List<ImportCandidate<MaterialShipToMappingRequest>> parseStandardWorkbook(MultipartFile file, List<ImportRowError> errors) {
+    private List<ImportCandidate<MaterialShipToMappingRequest>> parseStandardWorkbook(String buyer, MultipartFile file, List<ImportRowError> errors) {
         List<ImportCandidate<MaterialShipToMappingRequest>> rows = new ArrayList<>();
         try (Workbook workbook = excelSupport.openWorkbook(file)) {
             Sheet sheet = excelSupport.requiredSheet(workbook, MASTER_DATA_NAME);
             FormulaEvaluator evaluator = excelSupport.evaluator(workbook);
-            requireDataHeaders(sheet, evaluator, 0);
+            DataColumns columns = requireDataHeaders(sheet, evaluator, 0);
             for (int rowIndex = sheet.getFirstRowNum() + 1; rowIndex <= sheet.getLastRowNum(); rowIndex++) {
                 Row row = sheet.getRow(rowIndex);
-                if (excelSupport.isBlank(row, 9, evaluator)) continue;
+                if (excelSupport.isBlank(row, columns.endExclusive, evaluator)) continue;
                 int excelRow = rowIndex + 1;
                 try {
-                    MaterialShipToMappingRequest request = request(row, evaluator, 0);
+                    MaterialShipToMappingRequest request = request(buyer, row, evaluator, 0, columns);
                     addBeanErrors(errors, excelRow, beanValidator.validate(request));
-                    validateRequestForImport(request, excelRow, errors);
+                    validateRequestForImport(buyer, request, excelRow, errors);
                     rows.add(new ImportCandidate<>(excelRow, request));
                 } catch (RuntimeException ex) {
                     errors.add(new ImportRowError(excelRow, "row", cleanMessage(ex)));
@@ -348,7 +361,7 @@ public class MaterialShipToMappingService {
         return rows;
     }
 
-    private List<ImportCandidate<KeyedRequest>> parseEditedWorkbook(MultipartFile file, List<ImportRowError> errors) {
+    private List<ImportCandidate<KeyedRequest>> parseEditedWorkbook(String buyer, MultipartFile file, List<ImportRowError> errors) {
         List<ImportCandidate<KeyedRequest>> rows = new ArrayList<>();
         try (Workbook workbook = excelSupport.openWorkbook(file)) {
             Sheet sheet = excelSupport.requiredSheet(workbook, MASTER_DATA_NAME);
@@ -356,20 +369,20 @@ public class MaterialShipToMappingService {
             excelSupport.requireHeaders(sheet, evaluator,
                     new MasterDataExcelSupport.HeaderRequirement(0, "Key"),
                     new MasterDataExcelSupport.HeaderRequirement(1, "Action"));
-            requireDataHeaders(sheet, evaluator, 2);
+            DataColumns columns = requireDataHeaders(sheet, evaluator, 2);
             Set<String> keys = new HashSet<>();
             for (int rowIndex = sheet.getFirstRowNum() + 1; rowIndex <= sheet.getLastRowNum(); rowIndex++) {
                 Row row = sheet.getRow(rowIndex);
-                if (excelSupport.isBlank(row, 11, evaluator)) continue;
+                if (excelSupport.isBlank(row, columns.endExclusive, evaluator)) continue;
                 int excelRow = rowIndex + 1;
                 try {
                     KeyedRequest keyed = new KeyedRequest();
                     keyed.masterKey = normalizeUploadedMasterKey(excelSupport.text(row, 0, evaluator));
                     keyed.action = normalizeAction(excelSupport.text(row, 1, evaluator), keyed.masterKey);
                     if (!"DELETE".equals(keyed.action)) {
-                        keyed.request = request(row, evaluator, 2);
+                        keyed.request = request(buyer, row, evaluator, 2, columns);
                         addBeanErrors(errors, excelRow, beanValidator.validate(keyed.request));
-                        validateRequestForImport(keyed.request, excelRow, errors);
+                        validateRequestForImport(buyer, keyed.request, excelRow, errors);
                     }
                     if (keyed.masterKey != null && !keys.add(keyed.masterKey)) {
                         errors.add(new ImportRowError(excelRow, "masterKey", "Duplicate Key inside uploaded file"));
@@ -385,31 +398,56 @@ public class MaterialShipToMappingService {
         return rows;
     }
 
-    private void requireDataHeaders(Sheet sheet, FormulaEvaluator evaluator, int offset) {
+    private DataColumns requireDataHeaders(Sheet sheet, FormulaEvaluator evaluator, int offset) {
+        Row header = sheet.getRow(sheet.getFirstRowNum());
+        String firstShipToHeader = header == null ? null : excelSupport.text(header, offset + 5, evaluator);
+        boolean legacyShipToCodeColumn = MasterDataTextNormalizer.headerKey("Ship To Code")
+                .equals(MasterDataTextNormalizer.headerKey(firstShipToHeader));
+
+        if (legacyShipToCodeColumn) {
+            excelSupport.requireHeaders(sheet, evaluator,
+                    new MasterDataExcelSupport.HeaderRequirement(offset, "SAP Code"),
+                    new MasterDataExcelSupport.HeaderRequirement(offset + 1, "Material Type"),
+                    new MasterDataExcelSupport.HeaderRequirement(offset + 2, "MAT FULL DESCRIPTION"),
+                    new MasterDataExcelSupport.HeaderRequirement(offset + 3, "MAT COLOR"),
+                    new MasterDataExcelSupport.HeaderRequirement(offset + 4, "MAT UNIT"),
+                    new MasterDataExcelSupport.HeaderRequirement(offset + 5, "Ship To Code"),
+                    new MasterDataExcelSupport.HeaderRequirement(offset + 6, "Ship To Name"),
+                    new MasterDataExcelSupport.HeaderRequirement(offset + 7, "Active"),
+                    new MasterDataExcelSupport.HeaderRequirement(offset + 8, "Remark"));
+            return new DataColumns(offset + 5, offset + 6, offset + 7, offset + 8, offset + 9);
+        }
+
         excelSupport.requireHeaders(sheet, evaluator,
                 new MasterDataExcelSupport.HeaderRequirement(offset, "SAP Code"),
                 new MasterDataExcelSupport.HeaderRequirement(offset + 1, "Material Type"),
                 new MasterDataExcelSupport.HeaderRequirement(offset + 2, "MAT FULL DESCRIPTION"),
                 new MasterDataExcelSupport.HeaderRequirement(offset + 3, "MAT COLOR"),
                 new MasterDataExcelSupport.HeaderRequirement(offset + 4, "MAT UNIT"),
-                new MasterDataExcelSupport.HeaderRequirement(offset + 5, "Ship To Code"),
-                new MasterDataExcelSupport.HeaderRequirement(offset + 6, "Ship To Name"),
-                new MasterDataExcelSupport.HeaderRequirement(offset + 7, "Active"),
-                new MasterDataExcelSupport.HeaderRequirement(offset + 8, "Remark"));
+                new MasterDataExcelSupport.HeaderRequirement(offset + 5, "Ship To Name"),
+                new MasterDataExcelSupport.HeaderRequirement(offset + 6, "Active"),
+                new MasterDataExcelSupport.HeaderRequirement(offset + 7, "Remark"));
+        return new DataColumns(-1, offset + 5, offset + 6, offset + 7, offset + 8);
     }
 
-    private MaterialShipToMappingRequest request(Row row, FormulaEvaluator evaluator, int offset) {
+    private MaterialShipToMappingRequest request(
+            String buyer,
+            Row row,
+            FormulaEvaluator evaluator,
+            int offset,
+            DataColumns columns
+    ) {
         String sapCode = excelSupport.text(row, offset, evaluator);
         String materialType = excelSupport.text(row, offset + 1, evaluator);
         String description = excelSupport.text(row, offset + 2, evaluator);
         String color = excelSupport.text(row, offset + 3, evaluator);
         String unit = excelSupport.text(row, offset + 4, evaluator);
-        String shipToCode = excelSupport.text(row, offset + 5, evaluator);
-        String shipToName = excelSupport.text(row, offset + 6, evaluator);
-        ShipTo shipTo = resolveShipTo(shipToCode, shipToName);
-        String activeText = MasterDataTextNormalizer.upper(excelSupport.text(row, offset + 7, evaluator));
+        String shipToCode = columns.shipToCode < 0 ? null : excelSupport.text(row, columns.shipToCode, evaluator);
+        String shipToName = excelSupport.text(row, columns.shipToName, evaluator);
+        ShipTo shipTo = resolveShipTo(buyer, shipToCode, shipToName);
+        String activeText = MasterDataTextNormalizer.upper(excelSupport.text(row, columns.active, evaluator));
         Boolean active = parseActive(activeText);
-        String remark = excelSupport.text(row, offset + 8, evaluator);
+        String remark = excelSupport.text(row, columns.remark, evaluator);
         return new MaterialShipToMappingRequest(sapCode, materialType, description, color, unit, shipTo.getId(), active, remark);
     }
 
@@ -430,10 +468,10 @@ public class MaterialShipToMappingService {
         }
     }
 
-    private void validateRequestForImport(MaterialShipToMappingRequest request, int row, List<ImportRowError> errors) {
+    private void validateRequestForImport(String buyer, MaterialShipToMappingRequest request, int row, List<ImportRowError> errors) {
         try {
             materialKey(request);
-            requireActiveShipTo(request.shipToId());
+            requireActiveShipTo(buyer, request.shipToId());
         } catch (RuntimeException ex) {
             errors.add(new ImportRowError(row, "material", cleanMessage(ex)));
         }
@@ -485,26 +523,29 @@ public class MaterialShipToMappingService {
         catch (RuntimeException ex) { return null; }
     }
 
-    private ShipTo requireActiveShipTo(String id) {
+    private ShipTo requireActiveShipTo(String buyer, String id) {
         String clean = MasterDataTextNormalizer.trimToNull(id);
         if (clean == null) throw new MasterDataValidationException("Ship To is required");
         ShipTo shipTo = shipToRepository.findById(clean)
                 .orElseThrow(() -> new MasterDataValidationException("Selected Ship To does not exist"));
+        if (!buyer.equals(BuyerKeys.legacyDefault(shipTo.getBuyerKey()))) {
+            throw new MasterDataValidationException("Selected Ship To does not belong to Buyer " + buyer);
+        }
         if (!shipTo.isActive()) throw new MasterDataValidationException("Selected Ship To is inactive");
         return shipTo;
     }
 
-    private ShipTo resolveShipTo(String code, String name) {
-        String codeKey = MasterDataTextNormalizer.key(code);
-        String nameKey = MasterDataTextNormalizer.key(name);
-        ShipTo byCode = codeKey == null ? null : shipToRepository.findByShipToCodeKey(codeKey).orElse(null);
-        ShipTo byName = nameKey == null ? null : shipToRepository.findByShipToNameKey(nameKey).orElse(null);
+    private ShipTo resolveShipTo(String buyer, String code, String name) {
+        String cleanCode = MasterDataTextNormalizer.trimToNull(code);
+        String cleanName = MasterDataTextNormalizer.trimToNull(name);
+        ShipTo byCode = cleanCode == null ? null : shipToRepository.findByBuyerKeyAndShipToCodeIgnoreCase(buyer, cleanCode).orElse(null);
+        ShipTo byName = cleanName == null ? null : shipToRepository.findByBuyerKeyAndShipToNameIgnoreCase(buyer, cleanName).orElse(null);
         if (byCode != null && byName != null && !byCode.getId().equals(byName.getId())) {
             throw new MasterDataValidationException("Ship To Code and Ship To Name refer to different records");
         }
         ShipTo shipTo = byCode != null ? byCode : byName;
         if (shipTo == null) {
-            throw new MasterDataValidationException("Ship To Code or Ship To Name must match an existing Ship To Master record");
+            throw new MasterDataValidationException("Ship To Code or Ship To Name must match an existing Ship To Master record for Buyer " + buyer);
         }
         if (!shipTo.isActive()) throw new MasterDataValidationException("Selected Ship To is inactive");
         return shipTo;
@@ -622,5 +663,21 @@ public class MaterialShipToMappingService {
         private String masterKey;
         private String action;
         private MaterialShipToMappingRequest request;
+    }
+
+    private static class DataColumns {
+        private final int shipToCode;
+        private final int shipToName;
+        private final int active;
+        private final int remark;
+        private final int endExclusive;
+
+        private DataColumns(int shipToCode, int shipToName, int active, int remark, int endExclusive) {
+            this.shipToCode = shipToCode;
+            this.shipToName = shipToName;
+            this.active = active;
+            this.remark = remark;
+            this.endExclusive = endExclusive;
+        }
     }
 }

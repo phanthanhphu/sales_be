@@ -46,6 +46,9 @@ public class MprController {
     @PostMapping("/generate")
     public MprDocument generate(@PathVariable String orderId, @Valid @RequestBody MprGenerateRequest request) { return mprService.generate(orderId, request); }
 
+    @PostMapping("/confirm")
+    public MprDocument confirm(@PathVariable String orderId) { return mprService.confirmCompletion(orderId); }
+
     @DeleteMapping
     public ResponseEntity<Void> delete(@PathVariable String orderId) { mprService.delete(orderId); return ResponseEntity.noContent().build(); }
 

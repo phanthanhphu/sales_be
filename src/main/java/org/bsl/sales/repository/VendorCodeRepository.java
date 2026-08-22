@@ -11,6 +11,8 @@ public interface VendorCodeRepository extends MongoRepository<VendorCode, String
 
     Optional<VendorCode> findByShortNameSupplierKey(String shortNameSupplierKey);
 
+    List<VendorCode> findByBuyerKey(String buyerKey);
+
     boolean existsByShortNameSupplierKey(String shortNameSupplierKey);
 
 

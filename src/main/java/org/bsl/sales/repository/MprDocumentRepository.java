@@ -10,7 +10,9 @@ public interface MprDocumentRepository extends MongoRepository<MprDocument, Stri
     Optional<MprDocument> findByOrderId(String orderId);
     List<MprDocument> findByOrderIdIn(List<String> orderIds);
     boolean existsByOrderId(String orderId);
+    boolean existsByBuyerKey(String buyerKey);
     boolean existsBySelectionsBomId(String bomId);
     boolean existsByLinesShortNameSupplierIgnoreCase(String shortNameSupplier);
+    boolean existsByBuyerKeyAndLinesShortNameSupplierIgnoreCase(String buyerKey, String shortNameSupplier);
     boolean existsByLinesShipToIdsContaining(String shipToId);
 }

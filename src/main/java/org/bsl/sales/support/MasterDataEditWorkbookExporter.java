@@ -11,6 +11,7 @@ import org.apache.poi.ss.usermodel.Row;
 import org.apache.poi.ss.usermodel.Sheet;
 import org.apache.poi.ss.usermodel.VerticalAlignment;
 import org.apache.poi.ss.usermodel.Workbook;
+import org.apache.poi.ss.util.CellRangeAddressList;
 import org.apache.poi.xssf.usermodel.XSSFWorkbook;
 import org.bsl.sales.model.Loss;
 import org.bsl.sales.model.MatInfo;
@@ -31,6 +32,9 @@ import java.util.stream.Collectors;
 public final class MasterDataEditWorkbookExporter {
 
     private static final DateTimeFormatter DATE_FORMAT = DateTimeFormatter.ISO_LOCAL_DATE;
+    private static final int MATERIAL_SHIP_TO_MIN_INPUT_ROWS = 5000;
+    private static final String SHIP_TO_REFERENCE_SHEET = "SHIP TO REFERENCE";
+    private static final String SHIP_TO_NAME_RANGE = "SHIP_TO_NAMES";
 
     private MasterDataEditWorkbookExporter() {
     }
@@ -144,13 +148,13 @@ public final class MasterDataEditWorkbookExporter {
         }
     }
 
-    public static byte[] materialShipToMappings(List<MaterialShipToMapping> rows) {
+    public static byte[] materialShipToMappings(List<MaterialShipToMapping> rows, List<ShipTo> shipTos) {
         try (Workbook workbook = new XSSFWorkbook()) {
             Sheet sheet = workbook.createSheet("MATERIAL SHIP TO");
             Styles styles = new Styles(workbook);
             writeHeader(sheet, styles.header, 0,
                     "Key", "Action", "SAP Code", "Material Type", "MAT FULL DESCRIPTION", "MAT COLOR", "MAT UNIT",
-                    "Ship To Code", "Ship To Name", "Active", "Remark");
+                    "Ship To Name", "Active", "Remark");
             sheet.createFreezePane(0, 1);
 
             List<MaterialShipToMapping> sorted = rows == null ? Collections.emptyList() : rows.stream()
@@ -167,13 +171,14 @@ public final class MasterDataEditWorkbookExporter {
                 write(row, 4, item.getMatFullDescription(), styles.textWrap);
                 write(row, 5, item.getMatColor(), styles.textWrap);
                 write(row, 6, item.getMatUnit(), styles.text);
-                write(row, 7, item.getShipToCode(), styles.text);
-                write(row, 8, item.getShipToName(), styles.text);
-                write(row, 9, item.isActive() ? "TRUE" : "FALSE", styles.text);
-                write(row, 10, item.getRemark(), styles.textWrap);
+                write(row, 7, item.getShipToName(), styles.text);
+                write(row, 8, item.isActive() ? "TRUE" : "FALSE", styles.text);
+                write(row, 9, item.getRemark(), styles.textWrap);
             }
-            setWidths(sheet, 16, 12, 18, 20, 48, 28, 12, 18, 34, 12, 40);
-            addActionValidation(sheet, 1, Math.max(5000, rowIndex + 100));
+            setWidths(sheet, 16, 12, 18, 20, 48, 28, 12, 34, 12, 40);
+            int lastInputRow = Math.max(MATERIAL_SHIP_TO_MIN_INPUT_ROWS, rowIndex + 100);
+            addActionValidation(sheet, 1, lastInputRow);
+            addMaterialShipToControls(workbook, sheet, styles, shipTos, 7, 8, lastInputRow);
             protectIdentityColumns(sheet, 0);
             return toBytes(workbook);
         } catch (IOException ex) {
@@ -187,21 +192,18 @@ public final class MasterDataEditWorkbookExporter {
             Sheet sheet = workbook.createSheet("MATERIAL SHIP TO");
             writeHeader(sheet, styles.header, 0,
                     "SAP Code", "Material Type", "MAT FULL DESCRIPTION", "MAT COLOR", "MAT UNIT",
-                    "Ship To Code", "Ship To Name", "Active", "Remark");
+                    "Ship To Name", "Active", "Remark");
             sheet.createFreezePane(0, 1);
-            setWidths(sheet, 18, 20, 48, 28, 12, 18, 34, 12, 40);
-
-            Sheet reference = workbook.createSheet("SHIP TO REFERENCE");
-            writeHeader(reference, styles.header, 0, "Ship To Code", "Ship To Name");
-            int rowIndex = 1;
-            for (ShipTo item : shipTos == null ? Collections.<ShipTo>emptyList() : shipTos) {
-                if (item == null || !item.isActive()) continue;
-                Row row = reference.createRow(rowIndex++);
-                write(row, 0, item.getShipToCode(), styles.text);
-                write(row, 1, item.getShipToName(), styles.text);
-            }
-            setWidths(reference, 20, 40);
-            reference.createFreezePane(0, 1);
+            setWidths(sheet, 18, 20, 48, 28, 12, 34, 12, 40);
+            addMaterialShipToControls(
+                    workbook,
+                    sheet,
+                    styles,
+                    shipTos,
+                    5,
+                    6,
+                    MATERIAL_SHIP_TO_MIN_INPUT_ROWS
+            );
             return toBytes(workbook);
         } catch (IOException ex) {
             throw new IllegalStateException("Cannot export Material Ship To template", ex);
@@ -245,12 +247,100 @@ public final class MasterDataEditWorkbookExporter {
     }
 
     private static void addActionValidation(Sheet sheet, int actionColumn, int lastRow) {
+        addExplicitListValidation(
+                sheet,
+                actionColumn,
+                lastRow,
+                new String[]{"CREATE", "UPDATE", "DELETE"},
+                "Select Action",
+                "Choose CREATE, UPDATE or DELETE from the list.",
+                "Invalid Action",
+                "Use CREATE, UPDATE or DELETE."
+        );
+    }
+
+    private static void addMaterialShipToControls(
+            Workbook workbook,
+            Sheet sheet,
+            Styles styles,
+            List<ShipTo> shipTos,
+            int shipToNameColumn,
+            int activeColumn,
+            int lastRow
+    ) {
+        List<ShipTo> options = shipTos == null
+                ? Collections.emptyList()
+                : shipTos.stream()
+                .filter(item -> item != null && item.isActive() && item.getShipToName() != null
+                        && !item.getShipToName().trim().isEmpty())
+                .sorted(Comparator.comparing(ShipTo::getShipToName, String.CASE_INSENSITIVE_ORDER))
+                .collect(Collectors.toList());
+        if (options.isEmpty()) {
+            throw new IllegalArgumentException("At least one active Ship To is required to create this workbook");
+        }
+
+        Sheet reference = workbook.createSheet(SHIP_TO_REFERENCE_SHEET);
+        writeHeader(reference, styles.header, 0, "Ship To Name");
+        int referenceRow = 1;
+        for (ShipTo item : options) {
+            Row row = reference.createRow(referenceRow++);
+            write(row, 0, item.getShipToName(), styles.text);
+        }
+        setWidths(reference, 40);
+        reference.createFreezePane(0, 1);
+
+        int lastReferenceRow = referenceRow;
+        var nameRange = workbook.createName();
+        nameRange.setNameName(SHIP_TO_NAME_RANGE);
+        nameRange.setRefersToFormula("'" + SHIP_TO_REFERENCE_SHEET + "'!$A$2:$A$" + lastReferenceRow);
+
         var helper = sheet.getDataValidationHelper();
-        var constraint = helper.createExplicitListConstraint(new String[]{"CREATE", "UPDATE", "DELETE"});
-        var range = new org.apache.poi.ss.util.CellRangeAddressList(1, lastRow, actionColumn, actionColumn);
+        var shipToConstraint = helper.createFormulaListConstraint(SHIP_TO_NAME_RANGE);
+        var shipToRange = new CellRangeAddressList(1, lastRow, shipToNameColumn, shipToNameColumn);
+        var shipToValidation = helper.createValidation(shipToConstraint, shipToRange);
+        shipToValidation.setShowErrorBox(true);
+        shipToValidation.setShowPromptBox(true);
+        shipToValidation.createPromptBox(
+                "Select Ship To",
+                "Choose an active Ship To for this Buyer. Add new values in Ship To Master first."
+        );
+        shipToValidation.createErrorBox(
+                "Invalid Ship To",
+                "Select a Ship To from the list. Add new values in Ship To Master first."
+        );
+        sheet.addValidationData(shipToValidation);
+
+        addExplicitListValidation(
+                sheet,
+                activeColumn,
+                lastRow,
+                new String[]{"TRUE", "FALSE"},
+                "Select Status",
+                "Choose TRUE for Active or FALSE for Inactive.",
+                "Invalid Active value",
+                "Use TRUE or FALSE."
+        );
+        workbook.setSheetHidden(workbook.getSheetIndex(reference), true);
+    }
+
+    private static void addExplicitListValidation(
+            Sheet sheet,
+            int column,
+            int lastRow,
+            String[] values,
+            String promptTitle,
+            String prompt,
+            String errorTitle,
+            String error
+    ) {
+        var helper = sheet.getDataValidationHelper();
+        var constraint = helper.createExplicitListConstraint(values);
+        var range = new CellRangeAddressList(1, lastRow, column, column);
         var validation = helper.createValidation(constraint, range);
         validation.setShowErrorBox(true);
-        validation.createErrorBox("Invalid Action", "Use CREATE, UPDATE or DELETE.");
+        validation.setShowPromptBox(true);
+        validation.createPromptBox(promptTitle, prompt);
+        validation.createErrorBox(errorTitle, error);
         sheet.addValidationData(validation);
     }
 

@@ -12,6 +12,7 @@ public interface MatInfoRepository extends MongoRepository<MatInfo, String> {
     boolean existsByBuyerKeyAndCheckingKey(String buyerKey, String checkingKey);
     List<MatInfo> findByBuyerKey(String buyerKey);
     boolean existsByShortNameSupplierKey(String shortNameSupplierKey);
+    boolean existsByBuyerKeyAndShortNameSupplierKey(String buyerKey, String shortNameSupplierKey);
     boolean existsByCurrency(String currency);
     long countByBuyerKeyAndMaterialTypeKey(String buyerKey, String materialTypeKey);
     long countByMaterialTypeKey(String materialTypeKey);

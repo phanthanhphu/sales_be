@@ -28,16 +28,19 @@ public class AuditLogController {
             @RequestParam(required = false) String keyword,
             @RequestParam(required = false) String username,
             @RequestParam(required = false) String action,
+            @RequestParam(required = false) String buyerKey,
             @RequestParam(required = false) String module,
             @RequestParam(required = false) String status,
             @RequestParam(required = false) String httpMethod,
             @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME) LocalDateTime from,
             @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME) LocalDateTime to,
             @RequestParam(defaultValue = "0") int page,
-            @RequestParam(defaultValue = "25") int size
+            @RequestParam(defaultValue = "25") int size,
+            @RequestParam(defaultValue = "createdAt") String sortBy,
+            @RequestParam(defaultValue = "desc") String sortDir
     ) {
         return ResponseEntity.ok(auditLogService.search(
-                keyword, username, action, module, status, httpMethod, from, to, page, size
+                keyword, username, action, buyerKey, module, status, httpMethod, from, to, page, size, sortBy, sortDir
         ));
     }
 }

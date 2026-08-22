@@ -21,6 +21,9 @@ public class VendorCode {
     @Indexed(unique = true, sparse = true)
     private String masterKey;
 
+    @Indexed
+    private String buyerKey;
+
     private String shortNameSupplier;
     private String vendorCode;
     private String vendorName;
@@ -63,6 +66,9 @@ public class VendorCode {
     public void setMasterKey(String masterKey) {
         this.masterKey = masterKey;
     }
+
+    public String getBuyerKey() { return buyerKey; }
+    public void setBuyerKey(String buyerKey) { this.buyerKey = buyerKey; }
 
     public String getShortNameSupplier() {
         return shortNameSupplier;

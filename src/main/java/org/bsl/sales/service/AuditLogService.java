@@ -3,6 +3,7 @@ package org.bsl.sales.service;
 import org.bsl.sales.model.AuditLog;
 import org.bsl.sales.repository.AuditLogRepository;
 import org.bsl.sales.support.AuditActionResolver;
+import org.bsl.sales.support.BuyerKeys;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.data.domain.Page;
@@ -49,17 +50,20 @@ public class AuditLogService {
             String keyword,
             String username,
             String action,
+            String buyerKey,
             String module,
             String status,
             String httpMethod,
             LocalDateTime from,
             LocalDateTime to,
             int page,
-            int size
+            int size,
+            String sortBy,
+            String sortDir
     ) {
         int safePage = Math.max(0, page);
         int safeSize = Math.min(200, Math.max(10, size));
-        Pageable pageable = PageRequest.of(safePage, safeSize, Sort.by(Sort.Direction.DESC, "createdAt"));
+        Pageable pageable = PageRequest.of(safePage, safeSize, resolveSort(sortBy, sortDir));
 
         List<Criteria> filters = new ArrayList<>();
         filters.add(Criteria.where("action").in("ADD", "EDIT", "DELETE"));
@@ -69,6 +73,7 @@ public class AuditLogService {
                     Criteria.where("username").regex(pattern, "i"),
                     Criteria.where("userEmail").regex(pattern, "i"),
                     Criteria.where("description").regex(pattern, "i"),
+                    Criteria.where("buyerKey").regex(pattern, "i"),
                     Criteria.where("resourceId").regex(pattern, "i"),
                     Criteria.where("fileName").regex(pattern, "i"),
                     Criteria.where("endpoint").regex(pattern, "i")
@@ -82,6 +87,7 @@ public class AuditLogService {
             ));
         }
         if (StringUtils.hasText(action)) filters.add(Criteria.where("action").is(action.trim().toUpperCase()));
+        if (StringUtils.hasText(buyerKey)) filters.add(Criteria.where("buyerKey").is(BuyerKeys.normalize(buyerKey)));
         if (StringUtils.hasText(module)) filters.add(Criteria.where("module").is(module.trim().toUpperCase()));
         if (StringUtils.hasText(status)) filters.add(Criteria.where("status").is(status.trim().toUpperCase()));
         if (StringUtils.hasText(httpMethod)) filters.add(Criteria.where("httpMethod").is(httpMethod.trim().toUpperCase()));
@@ -102,7 +108,28 @@ public class AuditLogService {
     }
 
     public Page<AuditLog> getAll(int page, int size) {
-        return search(null, null, null, null, null, null, null, null, page, size);
+        return search(null, null, null, null, null, null, null, null, null, page, size, "createdAt", "desc");
+    }
+
+    private Sort resolveSort(String sortBy, String sortDir) {
+        String requested = sortBy == null ? "" : sortBy.trim().toLowerCase();
+        String field = switch (requested) {
+            case "user", "username" -> "username";
+            case "buyer", "buyerkey" -> "buyerKey";
+            case "module" -> "module";
+            case "action" -> "action";
+            case "result", "status" -> "status";
+            case "resource", "resourceid" -> "resourceId";
+            case "duration", "durationms" -> "durationMs";
+            case "createdat", "time" -> "createdAt";
+            default -> "createdAt";
+        };
+        Sort.Direction direction = "asc".equalsIgnoreCase(sortDir) ? Sort.Direction.ASC : Sort.Direction.DESC;
+        Sort sort = Sort.by(direction, field);
+        if (!"createdAt".equals(field)) {
+            sort = sort.and(Sort.by(Sort.Direction.DESC, "createdAt"));
+        }
+        return sort;
     }
 
     private String escapeRegex(String value) {

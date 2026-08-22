@@ -101,7 +101,7 @@ public class MatInfoService {
         String buyer = buyerAccess.requireBuyer(request.getBuyerKey());
         request.setBuyerKey(buyer);
         validateRequest(request);
-        VendorCode vendor = requireVendor(request.getShortNameSupplier());
+        VendorCode vendor = requireVendor(request.getBuyerKey(), request.getShortNameSupplier());
         CurrencyMaster currency = requireCurrency(request.getCurrency());
 
         Optional<MatInfo> duplicate = findExisting(request);
@@ -176,7 +176,7 @@ public class MatInfoService {
         if (!currentBuyer.equals(targetBuyer)) throw new MasterDataValidationException("MAT_INFO cannot be moved to another Buyer");
         request.setBuyerKey(currentBuyer);
         validateRequest(request);
-        VendorCode vendor = requireVendor(request.getShortNameSupplier());
+        VendorCode vendor = requireVendor(currentBuyer, request.getShortNameSupplier());
         CurrencyMaster currency = requireCurrency(request.getCurrency());
 
         Optional<MatInfo> duplicate = findExisting(request);
@@ -215,7 +215,7 @@ public class MatInfoService {
         );
         if (!errors.isEmpty()) return MasterDataImportResult.rejected(MASTER_DATA_NAME, effectiveMode, totalRows, errors);
 
-        Map<String, VendorCode> vendors = vendorMap(rows.stream()
+        Map<String, VendorCode> vendors = vendorMap(buyer, rows.stream()
                 .map(row -> row.getValue().getShortNameSupplier()).collect(Collectors.toSet()));
         MasterDataImportResult result = baseResult(effectiveMode, totalRows);
         result.setSkipped(duplicateRows);
@@ -294,7 +294,7 @@ public class MatInfoService {
         validateEditedRows(rows, buyer, allTargets, existingByIdentity, currencies, errors);
         if (!errors.isEmpty()) return MasterDataImportResult.rejected(MASTER_DATA_NAME, ImportMode.UPSERT, totalRows, errors);
 
-        Map<String, VendorCode> vendors = vendorMap(rows.stream()
+        Map<String, VendorCode> vendors = vendorMap(buyer, rows.stream()
                 .filter(row -> row.getValue().request != null && !"DELETE".equals(row.getValue().action))
                 .map(row -> row.getValue().request.getShortNameSupplier())
                 .collect(Collectors.toSet()));
@@ -577,8 +577,8 @@ public class MatInfoService {
         return MasterDataTextNormalizer.normalizeMoney(price);
     }
 
-    private VendorCode requireVendor(String supplierName) {
-        return vendorCodeService.resolveOrCreateFromMatInfo(supplierName);
+    private VendorCode requireVendor(String buyerKey, String supplierName) {
+        return vendorCodeService.resolveOrCreateFromMatInfo(buyerKey, supplierName);
     }
 
     private CurrencyMaster requireCurrency(String currencyCode) {
@@ -586,8 +586,8 @@ public class MatInfoService {
         catch (RuntimeException ex) { throw new MasterDataValidationException("Currency does not exist in Currency Master: " + currencyCode); }
     }
 
-    private Map<String, VendorCode> vendorMap(Set<String> supplierNames) {
-        return vendorCodeService.resolveOrCreateFromMatInfo(supplierNames);
+    private Map<String, VendorCode> vendorMap(String buyerKey, Set<String> supplierNames) {
+        return vendorCodeService.resolveOrCreateFromMatInfo(buyerKey, supplierNames);
     }
 
     private String identityKey(MatInfoRequest request) {

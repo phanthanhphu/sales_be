@@ -22,8 +22,10 @@ public class OrderController {
             @RequestParam(required = false) String season,
             @RequestParam(required = false) String status,
             @RequestParam(defaultValue = "0") int page,
-            @RequestParam(defaultValue = "25") int size
-    ) { return orderService.list(buyerKey, keyword, season, status, page, size); }
+            @RequestParam(defaultValue = "25") int size,
+            @RequestParam(required = false) String sortBy,
+            @RequestParam(defaultValue = "desc") String sortDir
+    ) { return orderService.list(buyerKey, keyword, season, status, page, size, sortBy, sortDir); }
 
     @GetMapping("/{id}")
     public SalesOrder get(

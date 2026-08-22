@@ -1,5 +1,6 @@
 package org.bsl.sales.service;
 
+import jakarta.annotation.PostConstruct;
 import org.apache.poi.ss.usermodel.FormulaEvaluator;
 import org.apache.poi.ss.usermodel.Row;
 import org.apache.poi.ss.usermodel.Sheet;
@@ -15,6 +16,8 @@ import org.bsl.sales.model.VendorCode;
 import org.bsl.sales.repository.MatInfoRepository;
 import org.bsl.sales.repository.MprDocumentRepository;
 import org.bsl.sales.repository.VendorCodeRepository;
+import org.bsl.sales.security.BuyerAccessService;
+import org.bsl.sales.support.BuyerKeys;
 import org.bsl.sales.support.ImportCandidate;
 import org.bsl.sales.support.MasterDataBeanValidator;
 import org.bsl.sales.support.MasterDataEditWorkbookExporter;
@@ -54,6 +57,7 @@ public class VendorCodeService {
     private static final String MASTER_KEY_PREFIX = "VC";
     private static final String SEQUENCE_NAME = "vendor_code";
     private static final String AUTO_CREATED_REMARK = "Auto-created from MAT_INFO. Please complete Vendor Code, Vendor Name and Mat Charger.";
+    private static final String BUYER_KEY_SEPARATOR = "\u001F";
 
     private final VendorCodeRepository vendorCodeRepository;
     private final MatInfoRepository matInfoRepository;
@@ -62,7 +66,9 @@ public class VendorCodeService {
     private final MasterDataExcelSupport excelSupport;
     private final MongoTemplate mongoTemplate;
     private final MasterDataSequenceService sequenceService;
+    private final BuyerAccessService buyerAccess;
     private volatile boolean masterKeysBackfilled;
+    private volatile boolean buyerScopeBackfilled;
 
     public VendorCodeService(
             VendorCodeRepository vendorCodeRepository,
@@ -71,7 +77,8 @@ public class VendorCodeService {
             MasterDataBeanValidator beanValidator,
             MasterDataExcelSupport excelSupport,
             MongoTemplate mongoTemplate,
-            MasterDataSequenceService sequenceService
+            MasterDataSequenceService sequenceService,
+            BuyerAccessService buyerAccess
     ) {
         this.vendorCodeRepository = vendorCodeRepository;
         this.matInfoRepository = matInfoRepository;
@@ -80,14 +87,24 @@ public class VendorCodeService {
         this.excelSupport = excelSupport;
         this.mongoTemplate = mongoTemplate;
         this.sequenceService = sequenceService;
+        this.buyerAccess = buyerAccess;
     }
 
-    public VendorCode create(VendorCodeRequest request) {
-        String key = requireSupplierKey(request);
-        if (vendorCodeRepository.existsByShortNameSupplierKey(key)) {
-            throw new MasterDataConflictException("Short name supplier already exists: " + request.getShortNameSupplier());
+    @PostConstruct
+    public void initializeBuyerScope() {
+        backfillLegacyBuyerScope();
+    }
+
+    public VendorCode create(String buyerKey, VendorCodeRequest request) {
+        String buyer = buyerAccess.requireBuyer(buyerKey);
+        backfillLegacyBuyerScope();
+        String rawKey = requireSupplierKey(request);
+        String scopedKey = scopedSupplierKey(buyer, rawKey);
+        if (vendorCodeRepository.existsByShortNameSupplierKey(scopedKey)) {
+            throw new MasterDataConflictException("Short name supplier already exists for Buyer " + buyer + ": " + request.getShortNameSupplier());
         }
         VendorCode entity = new VendorCode();
+        entity.setBuyerKey(buyer);
         apply(entity, request);
         entity.setMasterKey(nextMasterKey());
         LocalDateTime now = LocalDateTime.now();
@@ -97,6 +114,7 @@ public class VendorCodeService {
     }
 
     public Page<VendorCode> list(
+            String buyerKey,
             String masterKey,
             String shortNameSupplier,
             String vendorCode,
@@ -105,9 +123,11 @@ public class VendorCodeService {
             int page,
             int size
     ) {
+        String buyer = buyerAccess.requireBuyer(buyerKey);
+        backfillLegacyBuyerScope();
         backfillMissingMasterKeys();
         Pageable pageable = toPageable(page, size);
-        Query query = new Query();
+        Query query = new Query(Criteria.where("buyerKey").is(buyer));
         addContainsFilter(query, "masterKey", masterKey);
         addContainsFilter(query, "shortNameSupplier", shortNameSupplier);
         addContainsFilter(query, "vendorCode", vendorCode);
@@ -119,18 +139,23 @@ public class VendorCodeService {
         return new PageImpl<>(mongoTemplate.find(query, VendorCode.class), pageable, total);
     }
 
-    public Page<VendorCode> list(String keyword, int page, int size) {
+    public Page<VendorCode> list(String buyerKey, String keyword, int page, int size) {
         String clean = MasterDataTextNormalizer.trimToNull(keyword);
-        if (clean == null) return list(null, null, null, null, null, page, size);
+        if (clean == null) return list(buyerKey, null, null, null, null, null, page, size);
+        String buyer = buyerAccess.requireBuyer(buyerKey);
+        backfillLegacyBuyerScope();
         backfillMissingMasterKeys();
         Pageable pageable = toPageable(page, size);
         Pattern pattern = containsPattern(clean);
-        Query query = Query.query(new Criteria().orOperator(
-                Criteria.where("masterKey").regex(pattern),
-                Criteria.where("shortNameSupplier").regex(pattern),
-                Criteria.where("vendorCode").regex(pattern),
-                Criteria.where("vendorName").regex(pattern),
-                Criteria.where("matCharger").regex(pattern)
+        Query query = Query.query(new Criteria().andOperator(
+                Criteria.where("buyerKey").is(buyer),
+                new Criteria().orOperator(
+                        Criteria.where("masterKey").regex(pattern),
+                        Criteria.where("shortNameSupplier").regex(pattern),
+                        Criteria.where("vendorCode").regex(pattern),
+                        Criteria.where("vendorName").regex(pattern),
+                        Criteria.where("matCharger").regex(pattern)
+                )
         ));
         long total = mongoTemplate.count(query, VendorCode.class);
         query.with(NewestFirstSort.mongo());
@@ -139,9 +164,11 @@ public class VendorCodeService {
     }
 
     /** Lightweight lookup used by MAT_INFO and MPR Vendor Code selectors. */
-    public List<VendorCode> options(String keyword, int limit) {
+    public List<VendorCode> options(String buyerKey, String keyword, int limit) {
+        String buyer = buyerAccess.requireBuyer(buyerKey);
+        backfillLegacyBuyerScope();
         int safeLimit = Math.max(1, Math.min(limit, 5000));
-        Query query = new Query();
+        Query query = new Query(Criteria.where("buyerKey").is(buyer));
         String clean = MasterDataTextNormalizer.trimToNull(keyword);
         if (clean != null) {
             Pattern pattern = containsPattern(clean);
@@ -155,6 +182,7 @@ public class VendorCodeService {
         query.with(Sort.by(Sort.Order.asc("pendingCompletion"), Sort.Order.asc("shortNameSupplier")));
         query.limit(safeLimit);
         query.fields()
+                .include("buyerKey")
                 .include("masterKey")
                 .include("shortNameSupplier")
                 .include("vendorCode")
@@ -165,25 +193,34 @@ public class VendorCodeService {
         return mongoTemplate.find(query, VendorCode.class);
     }
 
-    public VendorCode getById(String id) {
+    public VendorCode getById(String buyerKey, String id) {
+        String buyer = buyerAccess.requireBuyer(buyerKey);
+        backfillLegacyBuyerScope();
         VendorCode entity = vendorCodeRepository.findById(id)
                 .orElseThrow(() -> new MasterDataNotFoundException("Vendor Code not found"));
+        if (!buyer.equals(BuyerKeys.legacyDefault(entity.getBuyerKey()))) {
+            throw new MasterDataNotFoundException("Vendor Code not found for Buyer " + buyer);
+        }
         return ensureMasterKeyPersisted(entity);
     }
 
-    public VendorCode resolve(String shortNameSupplier) {
-        String key = MasterDataTextNormalizer.key(shortNameSupplier);
-        if (key == null) throw new MasterDataValidationException("shortNameSupplier is required");
-        VendorCode entity = vendorCodeRepository.findByShortNameSupplierKey(key)
-                .orElseThrow(() -> new MasterDataNotFoundException("Supplier not found: " + shortNameSupplier));
+    public VendorCode resolve(String buyerKey, String shortNameSupplier) {
+        String buyer = buyerAccess.requireBuyer(buyerKey);
+        backfillLegacyBuyerScope();
+        String rawKey = MasterDataTextNormalizer.key(shortNameSupplier);
+        if (rawKey == null) throw new MasterDataValidationException("shortNameSupplier is required");
+        VendorCode entity = vendorCodeRepository.findByShortNameSupplierKey(scopedSupplierKey(buyer, rawKey))
+                .orElseThrow(() -> new MasterDataNotFoundException("Supplier not found for Buyer " + buyer + ": " + shortNameSupplier));
         return ensureMasterKeyPersisted(entity);
     }
 
     /**
-     * MAT_INFO is allowed to introduce a new supplier name. Missing suppliers are created
-     * in one batch with a generated VC key and marked as pending completion.
+     * MAT_INFO is allowed to introduce a new supplier name inside the current Buyer.
+     * Missing suppliers are created in one batch with a generated VC key and marked as pending completion.
      */
-    public Map<String, VendorCode> resolveOrCreateFromMatInfo(Collection<String> supplierNames) {
+    public Map<String, VendorCode> resolveOrCreateFromMatInfo(String buyerKey, Collection<String> supplierNames) {
+        String buyer = buyerAccess.requireBuyer(buyerKey);
+        backfillLegacyBuyerScope();
         LinkedHashMap<String, String> requested = new LinkedHashMap<>();
         if (supplierNames != null) {
             for (String supplierName : supplierNames) {
@@ -194,15 +231,13 @@ public class VendorCodeService {
         }
         if (requested.isEmpty()) return Map.of();
 
+        Set<String> scopedKeys = requested.keySet().stream()
+                .map(key -> scopedSupplierKey(buyer, key))
+                .collect(Collectors.toSet());
         final Map<String, VendorCode> result = new LinkedHashMap<>();
-        putVendorsBySupplierKey(
-                result,
-                vendorCodeRepository.findAllByShortNameSupplierKeyIn(requested.keySet())
-        );
+        putVendorsBySupplierKey(result, vendorCodeRepository.findAllByShortNameSupplierKeyIn(scopedKeys));
 
-        List<String> missingKeys = requested.keySet().stream()
-                .filter(key -> !result.containsKey(key))
-                .toList();
+        List<String> missingKeys = requested.keySet().stream().filter(key -> !result.containsKey(key)).toList();
         if (!missingKeys.isEmpty()) {
             List<String> masterKeys = reserveMasterKeys(missingKeys.size());
             LocalDateTime now = LocalDateTime.now();
@@ -210,9 +245,10 @@ public class VendorCodeService {
             for (int index = 0; index < missingKeys.size(); index++) {
                 String supplierKey = missingKeys.get(index);
                 VendorCode vendor = new VendorCode();
+                vendor.setBuyerKey(buyer);
                 vendor.setMasterKey(masterKeys.get(index));
                 vendor.setShortNameSupplier(requested.get(supplierKey));
-                vendor.setShortNameSupplierKey(supplierKey);
+                vendor.setShortNameSupplierKey(scopedSupplierKey(buyer, supplierKey));
                 vendor.setPendingCompletion(true);
                 vendor.setAutoCreatedFromMatInfo(true);
                 vendor.setRemark(AUTO_CREATED_REMARK);
@@ -223,26 +259,21 @@ public class VendorCodeService {
             try {
                 vendorCodeRepository.saveAll(newVendors);
             } catch (DuplicateKeyException ignored) {
-                // Another request may have created one of the same supplier names concurrently.
-                // Re-querying below returns the surviving records without failing MAT_INFO.
+                // Concurrent MAT_INFO requests may create the same Buyer/supplier pair.
             }
             result.clear();
-            putVendorsBySupplierKey(
-                    result,
-                    vendorCodeRepository.findAllByShortNameSupplierKeyIn(requested.keySet())
-            );
+            putVendorsBySupplierKey(result, vendorCodeRepository.findAllByShortNameSupplierKeyIn(scopedKeys));
 
-            List<String> remaining = requested.keySet().stream()
-                    .filter(key -> !result.containsKey(key))
-                    .toList();
+            List<String> remaining = requested.keySet().stream().filter(key -> !result.containsKey(key)).toList();
             if (!remaining.isEmpty()) {
                 List<String> retryMasterKeys = reserveMasterKeys(remaining.size());
                 for (int index = 0; index < remaining.size(); index++) {
                     String supplierKey = remaining.get(index);
                     VendorCode vendor = new VendorCode();
+                    vendor.setBuyerKey(buyer);
                     vendor.setMasterKey(retryMasterKeys.get(index));
                     vendor.setShortNameSupplier(requested.get(supplierKey));
-                    vendor.setShortNameSupplierKey(supplierKey);
+                    vendor.setShortNameSupplierKey(scopedSupplierKey(buyer, supplierKey));
                     vendor.setPendingCompletion(true);
                     vendor.setAutoCreatedFromMatInfo(true);
                     vendor.setRemark(AUTO_CREATED_REMARK);
@@ -252,7 +283,7 @@ public class VendorCodeService {
                         VendorCode saved = vendorCodeRepository.save(vendor);
                         result.put(supplierKey, saved);
                     } catch (DuplicateKeyException ignored) {
-                        vendorCodeRepository.findByShortNameSupplierKey(supplierKey)
+                        vendorCodeRepository.findByShortNameSupplierKey(scopedSupplierKey(buyer, supplierKey))
                                 .ifPresent(existing -> result.put(supplierKey, existing));
                     }
                 }
@@ -267,20 +298,22 @@ public class VendorCodeService {
         return result;
     }
 
-    public VendorCode resolveOrCreateFromMatInfo(String supplierName) {
+    public VendorCode resolveOrCreateFromMatInfo(String buyerKey, String supplierName) {
         String key = MasterDataTextNormalizer.key(supplierName);
         if (key == null) throw new MasterDataValidationException("Short name supplier is required");
-        return resolveOrCreateFromMatInfo(List.of(supplierName)).get(key);
+        return resolveOrCreateFromMatInfo(buyerKey, List.of(supplierName)).get(key);
     }
 
-    public VendorCode update(String id, VendorCodeRequest request) {
-        VendorCode existing = getById(id);
+    public VendorCode update(String buyerKey, String id, VendorCodeRequest request) {
+        String buyer = buyerAccess.requireBuyer(buyerKey);
+        VendorCode existing = getById(buyer, id);
         String nextKey = requireSupplierKey(request);
-        if (!nextKey.equals(existing.getShortNameSupplierKey())
-                && vendorCodeRepository.existsByShortNameSupplierKey(nextKey)) {
-            throw new MasterDataConflictException("Short name supplier already exists: " + request.getShortNameSupplier());
+        String currentKey = MasterDataTextNormalizer.key(existing.getShortNameSupplier());
+        if (!nextKey.equals(currentKey)
+                && vendorCodeRepository.existsByShortNameSupplierKey(scopedSupplierKey(buyer, nextKey))) {
+            throw new MasterDataConflictException("Short name supplier already exists for Buyer " + buyer + ": " + request.getShortNameSupplier());
         }
-        if (!nextKey.equals(existing.getShortNameSupplierKey()) && isVendorCodeUsed(existing)) {
+        if (!nextKey.equals(currentKey) && isVendorCodeUsed(existing)) {
             throw new MasterDataConflictException("Cannot change Short Name Supplier because MAT_INFO or MPR records are using it");
         }
         apply(existing, request);
@@ -288,32 +321,35 @@ public class VendorCodeService {
         return vendorCodeRepository.save(existing);
     }
 
-    public void delete(String id) {
-        VendorCode existing = getById(id);
+    public void delete(String buyerKey, String id) {
+        VendorCode existing = getById(buyerKey, id);
         if (isVendorCodeUsed(existing)) {
             throw new MasterDataConflictException("Cannot delete Vendor Code because MAT_INFO or MPR records are using it");
         }
         vendorCodeRepository.delete(existing);
     }
 
-    public MasterDataImportResult upload(MultipartFile file, ImportMode mode) {
+    public MasterDataImportResult upload(MultipartFile file, ImportMode mode, String buyerKey) {
+        String buyer = buyerAccess.requireBuyer(buyerKey);
+        backfillLegacyBuyerScope();
         ImportMode effectiveMode = mode == null ? ImportMode.UPSERT : mode;
         List<ImportRowError> errors = new ArrayList<>();
         List<ImportCandidate<VendorCodeRequest>> rows = parseStandardWorkbook(file, errors);
         int totalRows = rows.size();
         int duplicateRows = deduplicateVendorRows(rows);
 
-        Set<String> supplierKeys = rows.stream()
+        Set<String> rawSupplierKeys = rows.stream()
                 .map(row -> MasterDataTextNormalizer.key(row.getValue().getShortNameSupplier()))
                 .filter(value -> value != null)
                 .collect(Collectors.toSet());
-        Map<String, VendorCode> existingBySupplier = vendorCodeRepository.findAllByShortNameSupplierKeyIn(supplierKeys)
-                .stream().collect(Collectors.toMap(VendorCode::getShortNameSupplierKey, item -> item));
+        Set<String> scopedKeys = rawSupplierKeys.stream()
+                .map(key -> scopedSupplierKey(buyer, key))
+                .collect(Collectors.toSet());
+        Map<String, VendorCode> existingBySupplier = new LinkedHashMap<>();
+        putVendorsBySupplierKey(existingBySupplier, vendorCodeRepository.findAllByShortNameSupplierKeyIn(scopedKeys));
+
         int existingDuplicateRows;
         if (effectiveMode == ImportMode.CREATE_ONLY) {
-            // Upload New must never fail only because a supplier already exists.
-            // Existing suppliers are skipped regardless of whether the remaining Vendor fields differ,
-            // because CREATE_ONLY is not allowed to update an existing master record.
             existingDuplicateRows = removeExistingSuppliersForCreateOnly(rows, existingBySupplier);
         } else if (effectiveMode == ImportMode.REPLACE_ALL) {
             existingDuplicateRows = 0;
@@ -321,8 +357,9 @@ public class VendorCodeService {
             existingDuplicateRows = removeExistingVendorDuplicates(rows, existingBySupplier);
         }
 
-        if (effectiveMode == ImportMode.REPLACE_ALL && (matInfoRepository.count() > 0 || mprDocumentRepository.count() > 0)) {
-            errors.add(new ImportRowError(1, "mode", "Cannot use REPLACE_ALL while MAT_INFO or MPR data exists. Use UPSERT instead."));
+        if (effectiveMode == ImportMode.REPLACE_ALL
+                && (!matInfoRepository.findByBuyerKey(buyer).isEmpty() || mprDocumentRepository.existsByBuyerKey(buyer))) {
+            errors.add(new ImportRowError(1, "mode", "Cannot use REPLACE_ALL while MAT_INFO or MPR data exists for this Buyer. Use UPSERT instead."));
         }
         if (!errors.isEmpty()) return MasterDataImportResult.rejected(MASTER_DATA_NAME, effectiveMode, totalRows, errors);
 
@@ -336,8 +373,8 @@ public class VendorCodeService {
                     .map(row -> MasterDataTextNormalizer.key(row.getValue().getShortNameSupplier()))
                     .filter(value -> value != null)
                     .collect(Collectors.toSet());
-            List<VendorCode> toDelete = vendorCodeRepository.findAll().stream()
-                    .filter(item -> !incomingSupplierKeys.contains(item.getShortNameSupplierKey()))
+            List<VendorCode> toDelete = vendorCodeRepository.findByBuyerKey(buyer).stream()
+                    .filter(item -> !incomingSupplierKeys.contains(MasterDataTextNormalizer.key(item.getShortNameSupplier())))
                     .collect(Collectors.toList());
             if (!toDelete.isEmpty()) {
                 vendorCodeRepository.deleteAll(toDelete);
@@ -356,6 +393,7 @@ public class VendorCodeService {
             VendorCode entity = existingBySupplier.get(supplierKey);
             if (entity == null) {
                 entity = new VendorCode();
+                entity.setBuyerKey(buyer);
                 entity.setMasterKey(newKeys.get(keyIndex++));
                 entity.setCreatedAt(now);
                 result.setCreated(result.getCreated() + 1);
@@ -370,16 +408,20 @@ public class VendorCodeService {
             entity.setUpdatedAt(now);
             toSave.add(entity);
         }
-        vendorCodeRepository.saveAll(toSave);
+        if (!toSave.isEmpty()) vendorCodeRepository.saveAll(toSave);
         return result;
     }
 
-    public byte[] exportForEdit() {
+    public byte[] exportForEdit(String buyerKey) {
+        String buyer = buyerAccess.requireBuyer(buyerKey);
+        backfillLegacyBuyerScope();
         backfillMissingMasterKeys();
-        return MasterDataEditWorkbookExporter.vendorCodes(vendorCodeRepository.findAll());
+        return MasterDataEditWorkbookExporter.vendorCodes(vendorCodeRepository.findByBuyerKey(buyer));
     }
 
-    public MasterDataImportResult uploadEdited(MultipartFile file) {
+    public MasterDataImportResult uploadEdited(MultipartFile file, String buyerKey) {
+        String buyer = buyerAccess.requireBuyer(buyerKey);
+        backfillLegacyBuyerScope();
         List<ImportRowError> errors = new ArrayList<>();
         List<ImportCandidate<KeyedVendorCodeRequest>> rows = parseEditedWorkbook(file, errors);
         int totalRows = rows.size();
@@ -387,15 +429,19 @@ public class VendorCodeService {
 
         Set<String> masterKeys = rows.stream().map(row -> row.getValue().masterKey)
                 .filter(value -> value != null).collect(Collectors.toSet());
-        Map<String, VendorCode> existingByMasterKey = vendorCodeRepository.findAllByMasterKeyIn(masterKeys)
-                .stream().collect(Collectors.toMap(item -> normalizeMasterKey(item.getMasterKey()), item -> item));
+        Map<String, VendorCode> existingByMasterKey = vendorCodeRepository.findAllByMasterKeyIn(masterKeys).stream()
+                .filter(item -> buyer.equals(BuyerKeys.legacyDefault(item.getBuyerKey())))
+                .collect(Collectors.toMap(item -> normalizeMasterKey(item.getMasterKey()), item -> item));
 
-        Set<String> supplierKeys = rows.stream()
+        Set<String> rawSupplierKeys = rows.stream()
                 .filter(row -> row.getValue().request != null)
                 .map(row -> MasterDataTextNormalizer.key(row.getValue().request.getShortNameSupplier()))
                 .filter(value -> value != null).collect(Collectors.toSet());
-        Map<String, VendorCode> existingBySupplier = vendorCodeRepository.findAllByShortNameSupplierKeyIn(supplierKeys)
-                .stream().collect(Collectors.toMap(VendorCode::getShortNameSupplierKey, item -> item));
+        Set<String> scopedKeys = rawSupplierKeys.stream()
+                .map(key -> scopedSupplierKey(buyer, key))
+                .collect(Collectors.toSet());
+        Map<String, VendorCode> existingBySupplier = new LinkedHashMap<>();
+        putVendorsBySupplierKey(existingBySupplier, vendorCodeRepository.findAllByShortNameSupplierKeyIn(scopedKeys));
         int existingDuplicateRows = removeExistingEditedVendorDuplicates(rows, existingBySupplier);
 
         validateEditedRows(rows, existingByMasterKey, existingBySupplier, errors);
@@ -433,6 +479,7 @@ public class VendorCodeService {
             VendorCode entity;
             if ("CREATE".equals(keyed.action)) {
                 entity = new VendorCode();
+                entity.setBuyerKey(buyer);
                 entity.setMasterKey(newKeys.get(keyIndex++));
                 entity.setCreatedAt(now);
                 result.setCreated(result.getCreated() + 1);
@@ -585,7 +632,7 @@ public class VendorCodeService {
                     && !sameVendorData(duplicate, keyed.request)) {
                 errors.add(new ImportRowError(row.getRowNumber(), "shortNameSupplier", "Supplier already exists. Keep its Key to update the existing row."));
             }
-            if (target != null && !supplierKey.equals(target.getShortNameSupplierKey()) && isVendorCodeUsed(target)) {
+            if (target != null && !supplierKey.equals(MasterDataTextNormalizer.key(target.getShortNameSupplier())) && isVendorCodeUsed(target)) {
                 errors.add(new ImportRowError(row.getRowNumber(), "shortNameSupplier", "Cannot change Short Name Supplier because MAT_INFO or MPR records are using it"));
             }
         }
@@ -604,8 +651,10 @@ public class VendorCodeService {
     private void apply(VendorCode target, VendorCodeRequest request) {
         String shortName = MasterDataTextNormalizer.trimToNull(request == null ? null : request.getShortNameSupplier());
         if (shortName == null) throw new MasterDataValidationException("Short name supplier is required");
+        String buyer = BuyerKeys.legacyDefault(target.getBuyerKey());
+        target.setBuyerKey(buyer);
         target.setShortNameSupplier(shortName);
-        target.setShortNameSupplierKey(MasterDataTextNormalizer.key(shortName));
+        target.setShortNameSupplierKey(scopedSupplierKey(buyer, MasterDataTextNormalizer.key(shortName)));
         target.setVendorCode(vendorCodeText(request.getVendorCode()));
         target.setVendorName(MasterDataTextNormalizer.trimToNull(request.getVendorName()));
         target.setMatCharger(MasterDataTextNormalizer.trimToNull(request.getMatCharger()));
@@ -741,7 +790,7 @@ public class VendorCodeService {
         if (target == null || vendors == null) return;
         for (VendorCode vendor : vendors) {
             if (vendor == null) continue;
-            String supplierKey = vendor.getShortNameSupplierKey();
+            String supplierKey = MasterDataTextNormalizer.key(vendor.getShortNameSupplier());
             if (supplierKey != null && !supplierKey.isBlank()) {
                 target.putIfAbsent(supplierKey, vendor);
             }
@@ -750,10 +799,42 @@ public class VendorCodeService {
 
     private boolean isVendorCodeUsed(VendorCode vendor) {
         if (vendor == null) return false;
-        String key = vendor.getShortNameSupplierKey();
-        return (key != null && matInfoRepository.existsByShortNameSupplierKey(key))
-                || mprDocumentRepository.existsByLinesShortNameSupplierIgnoreCase(vendor.getShortNameSupplier())
+        String buyer = BuyerKeys.legacyDefault(vendor.getBuyerKey());
+        String key = MasterDataTextNormalizer.key(vendor.getShortNameSupplier());
+        return (key != null && matInfoRepository.existsByBuyerKeyAndShortNameSupplierKey(buyer, key))
+                || mprDocumentRepository.existsByBuyerKeyAndLinesShortNameSupplierIgnoreCase(buyer, vendor.getShortNameSupplier())
                 || (vendor.getId() != null && mprDocumentRepository.existsByLinesShipToIdsContaining(vendor.getId()));
+    }
+
+    private String scopedSupplierKey(String buyerKey, String supplierKey) {
+        String raw = MasterDataTextNormalizer.key(supplierKey);
+        if (raw == null) throw new MasterDataValidationException("Short name supplier is required");
+        return BuyerKeys.legacyDefault(buyerKey) + BUYER_KEY_SEPARATOR + raw;
+    }
+
+    private synchronized void backfillLegacyBuyerScope() {
+        if (buyerScopeBackfilled) return;
+        List<VendorCode> all = vendorCodeRepository.findAll();
+        List<VendorCode> changed = new ArrayList<>();
+        for (VendorCode item : all) {
+            if (item == null) continue;
+            String buyer = BuyerKeys.legacyDefault(item.getBuyerKey());
+            String supplierKey = MasterDataTextNormalizer.key(item.getShortNameSupplier());
+            boolean dirty = !buyer.equals(item.getBuyerKey());
+            if (supplierKey != null) {
+                String scoped = scopedSupplierKey(buyer, supplierKey);
+                if (!scoped.equals(item.getShortNameSupplierKey())) {
+                    item.setShortNameSupplierKey(scoped);
+                    dirty = true;
+                }
+            }
+            if (dirty) {
+                item.setBuyerKey(buyer);
+                changed.add(item);
+            }
+        }
+        if (!changed.isEmpty()) vendorCodeRepository.saveAll(changed);
+        buyerScopeBackfilled = true;
     }
 
     private synchronized void backfillMissingMasterKeys() {

@@ -17,6 +17,7 @@ import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
 import java.util.stream.Collectors;
@@ -40,7 +41,7 @@ public class OrderService {
         this.buyerAccess = buyerAccess;
     }
 
-    public Page<SalesOrder> list(String buyerKey, String keyword, String season, String status, int page, int size) {
+    public Page<SalesOrder> list(String buyerKey, String keyword, String season, String status, int page, int size, String sortBy, String sortDir) {
         String allowedBuyer = buyerAccess.requireBuyer(buyerKey);
         Pageable pageable = PageRequest.of(Math.max(0, page), Math.max(1, Math.min(size, 200)));
         String keywordKey = key(keyword);
@@ -53,12 +54,54 @@ public class OrderService {
                         || contains(order.getCustomer(), keywordKey))
                 .filter(order -> seasonKey == null || contains(order.getSeason(), seasonKey))
                 .filter(order -> statusKey == null || statusKey.equals(key(order.getStatus())))
-                .sorted(NewestFirstSort.comparator(SalesOrder::getCreatedAt, SalesOrder::getUpdatedAt, SalesOrder::getId))
+                .sorted(orderComparator(sortBy, sortDir))
                 .collect(Collectors.toList());
 
         int from = Math.min((int) pageable.getOffset(), rows.size());
         int to = Math.min(from + pageable.getPageSize(), rows.size());
         return new PageImpl<>(rows.subList(from, to), pageable, rows.size());
+    }
+
+    private Comparator<SalesOrder> orderComparator(String sortBy, String sortDir) {
+        String field = sortBy == null ? "" : sortBy.trim().toLowerCase(Locale.ROOT);
+        int direction = "desc".equalsIgnoreCase(sortDir) ? -1 : 1;
+        Comparator<SalesOrder> newestFirst = NewestFirstSort.comparator(
+                SalesOrder::getCreatedAt,
+                SalesOrder::getUpdatedAt,
+                SalesOrder::getId
+        );
+
+        if (field.isBlank()) return newestFirst;
+
+        return (left, right) -> {
+            int compared = switch (field) {
+                case "orderno" -> compareText(left.getOrderNo(), right.getOrderNo(), direction);
+                case "style" -> compareText(left.getStyle(), right.getStyle(), direction);
+                case "customer" -> compareText(left.getCustomer(), right.getCustomer(), direction);
+                case "season" -> compareText(left.getSeason(), right.getSeason(), direction);
+                case "status" -> compareText(left.getStatus(), right.getStatus(), direction);
+                case "createdat" -> compareComparable(left.getCreatedAt(), right.getCreatedAt(), direction);
+                case "updatedat" -> compareComparable(left.getUpdatedAt(), right.getUpdatedAt(), direction);
+                default -> 0;
+            };
+            return compared != 0 ? compared : newestFirst.compare(left, right);
+        };
+    }
+
+    private int compareText(String left, String right, int direction) {
+        String leftValue = left == null ? null : left.trim();
+        String rightValue = right == null ? null : right.trim();
+        if ((leftValue == null || leftValue.isEmpty()) && (rightValue == null || rightValue.isEmpty())) return 0;
+        if (leftValue == null || leftValue.isEmpty()) return 1;
+        if (rightValue == null || rightValue.isEmpty()) return -1;
+        return leftValue.compareToIgnoreCase(rightValue) * direction;
+    }
+
+    private <T extends Comparable<? super T>> int compareComparable(T left, T right, int direction) {
+        if (left == null && right == null) return 0;
+        if (left == null) return 1;
+        if (right == null) return -1;
+        return left.compareTo(right) * direction;
     }
 
     public SalesOrder get(String id) {
@@ -157,6 +200,12 @@ public class OrderService {
     public void markMprDraft(String orderId) {
         SalesOrder order = get(orderId);
         order.setStatus("MPR_DRAFT");
+        touch(order);
+    }
+
+    public void markMprCompleted(String orderId) {
+        SalesOrder order = get(orderId);
+        order.setStatus("MPR_COMPLETED");
         touch(order);
     }
 

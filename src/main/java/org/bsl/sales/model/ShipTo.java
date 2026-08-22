@@ -21,6 +21,9 @@ public class ShipTo {
     @Indexed(unique = true, sparse = true)
     private String masterKey;
 
+    @Indexed
+    private String buyerKey;
+
     /** Normalised unique value so duplicated Ship To names cannot be created. */
     @JsonIgnore
     @Indexed(unique = true)

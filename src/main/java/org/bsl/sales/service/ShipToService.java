@@ -1,5 +1,6 @@
 package org.bsl.sales.service;
 
+import jakarta.annotation.PostConstruct;
 import org.apache.poi.ss.usermodel.FormulaEvaluator;
 import org.apache.poi.ss.usermodel.Row;
 import org.apache.poi.ss.usermodel.Sheet;
@@ -14,6 +15,8 @@ import org.bsl.sales.exception.MasterDataValidationException;
 import org.bsl.sales.model.ShipTo;
 import org.bsl.sales.repository.MprDocumentRepository;
 import org.bsl.sales.repository.ShipToRepository;
+import org.bsl.sales.security.BuyerAccessService;
+import org.bsl.sales.support.BuyerKeys;
 import org.bsl.sales.support.ImportCandidate;
 import org.bsl.sales.support.MasterDataBeanValidator;
 import org.bsl.sales.support.MasterDataEditWorkbookExporter;
@@ -49,6 +52,7 @@ public class ShipToService {
     private static final String MASTER_DATA_NAME = "SHIP TO";
     private static final String MASTER_KEY_PREFIX = "ST";
     private static final String SEQUENCE_NAME = "ship_to";
+    private static final String BUYER_KEY_SEPARATOR = "\u001F";
 
     private final ShipToRepository repository;
     private final MprDocumentRepository mprRepository;
@@ -56,7 +60,9 @@ public class ShipToService {
     private final MasterDataExcelSupport excelSupport;
     private final MongoTemplate mongoTemplate;
     private final MasterDataSequenceService sequenceService;
+    private final BuyerAccessService buyerAccess;
     private volatile boolean masterKeysBackfilled;
+    private volatile boolean buyerScopeBackfilled;
 
     public ShipToService(
             ShipToRepository repository,
@@ -64,7 +70,8 @@ public class ShipToService {
             MasterDataBeanValidator beanValidator,
             MasterDataExcelSupport excelSupport,
             MongoTemplate mongoTemplate,
-            MasterDataSequenceService sequenceService
+            MasterDataSequenceService sequenceService,
+            BuyerAccessService buyerAccess
     ) {
         this.repository = repository;
         this.mprRepository = mprRepository;
@@ -72,18 +79,27 @@ public class ShipToService {
         this.excelSupport = excelSupport;
         this.mongoTemplate = mongoTemplate;
         this.sequenceService = sequenceService;
+        this.buyerAccess = buyerAccess;
     }
 
-    public ShipTo create(ShipToRequest request) {
-        String nameKey = nameKey(request.shipToName());
-        String codeKey = codeKey(request.shipToCode());
-        if (repository.findByShipToNameKey(nameKey).isPresent()) {
-            throw new MasterDataConflictException("Ship To name already exists: " + request.shipToName());
+    @PostConstruct
+    public void initializeBuyerScope() {
+        backfillLegacyBuyerScope();
+    }
+
+    public ShipTo create(String buyerKey, ShipToRequest request) {
+        String buyer = buyerAccess.requireBuyer(buyerKey);
+        backfillLegacyBuyerScope();
+        String rawNameKey = nameKey(request.shipToName());
+        String rawCodeKey = codeKey(request.shipToCode());
+        if (repository.findByShipToNameKey(scopedNameKey(buyer, rawNameKey)).isPresent()) {
+            throw new MasterDataConflictException("Ship To name already exists for Buyer " + buyer + ": " + request.shipToName());
         }
-        if (codeKey != null && repository.findByShipToCodeKey(codeKey).isPresent()) {
-            throw new MasterDataConflictException("Ship To code already exists: " + request.shipToCode());
+        if (rawCodeKey != null && repository.findByShipToCodeKey(scopedCodeKey(buyer, rawCodeKey)).isPresent()) {
+            throw new MasterDataConflictException("Ship To code already exists for Buyer " + buyer + ": " + request.shipToCode());
         }
         ShipTo entity = new ShipTo();
+        entity.setBuyerKey(buyer);
         entity.setMasterKey(nextMasterKey());
         apply(entity, request);
         LocalDateTime now = LocalDateTime.now();
@@ -92,10 +108,12 @@ public class ShipToService {
         return repository.save(entity);
     }
 
-    public Page<ShipTo> list(String shipToName, String shipToCode, Boolean active, int page, int size) {
+    public Page<ShipTo> list(String buyerKey, String shipToName, String shipToCode, Boolean active, int page, int size) {
+        String buyer = buyerAccess.requireBuyer(buyerKey);
+        backfillLegacyBuyerScope();
         backfillMissingMasterKeys();
         Pageable pageable = pageable(page, size);
-        Query query = new Query();
+        Query query = new Query(Criteria.where("buyerKey").is(buyer));
         addContains(query, "shipToName", shipToName);
         addContains(query, "shipToCode", shipToCode);
         if (active != null) query.addCriteria(Criteria.where("active").is(active));
@@ -105,28 +123,36 @@ public class ShipToService {
         return new PageImpl<>(mongoTemplate.find(query, ShipTo.class), pageable, total);
     }
 
-    public List<ShipTo> listActive() {
-        return repository.findByActiveTrueOrderByShipToNameAsc();
+    public List<ShipTo> listActive(String buyerKey) {
+        String buyer = buyerAccess.requireBuyer(buyerKey);
+        backfillLegacyBuyerScope();
+        return repository.findByBuyerKeyAndActiveTrueOrderByShipToNameAsc(buyer);
     }
 
-    public ShipTo get(String id) {
+    public ShipTo get(String buyerKey, String id) {
+        String buyer = buyerAccess.requireBuyer(buyerKey);
+        backfillLegacyBuyerScope();
         ShipTo entity = repository.findById(id)
                 .orElseThrow(() -> new MasterDataNotFoundException("Ship To not found"));
+        if (!buyer.equals(BuyerKeys.legacyDefault(entity.getBuyerKey()))) {
+            throw new MasterDataNotFoundException("Ship To not found for Buyer " + buyer);
+        }
         return ensureMasterKeyPersisted(entity);
     }
 
-    public ShipTo update(String id, ShipToRequest request) {
-        ShipTo entity = get(id);
-        String nextNameKey = nameKey(request.shipToName());
+    public ShipTo update(String buyerKey, String id, ShipToRequest request) {
+        String buyer = buyerAccess.requireBuyer(buyerKey);
+        ShipTo entity = get(buyer, id);
+        String nextNameKey = scopedNameKey(buyer, nameKey(request.shipToName()));
         Optional<ShipTo> duplicateName = repository.findByShipToNameKey(nextNameKey);
         if (duplicateName.isPresent() && !duplicateName.get().getId().equals(id)) {
-            throw new MasterDataConflictException("Ship To name already exists: " + request.shipToName());
+            throw new MasterDataConflictException("Ship To name already exists for Buyer " + buyer + ": " + request.shipToName());
         }
-        String nextCodeKey = codeKey(request.shipToCode());
-        if (nextCodeKey != null) {
-            Optional<ShipTo> duplicateCode = repository.findByShipToCodeKey(nextCodeKey);
+        String rawCodeKey = codeKey(request.shipToCode());
+        if (rawCodeKey != null) {
+            Optional<ShipTo> duplicateCode = repository.findByShipToCodeKey(scopedCodeKey(buyer, rawCodeKey));
             if (duplicateCode.isPresent() && !duplicateCode.get().getId().equals(id)) {
-                throw new MasterDataConflictException("Ship To code already exists: " + request.shipToCode());
+                throw new MasterDataConflictException("Ship To code already exists for Buyer " + buyer + ": " + request.shipToCode());
             }
         }
         apply(entity, request);
@@ -134,15 +160,17 @@ public class ShipToService {
         return repository.save(entity);
     }
 
-    public void delete(String id) {
-        ShipTo entity = get(id);
+    public void delete(String buyerKey, String id) {
+        ShipTo entity = get(buyerKey, id);
         if (isUsed(entity)) {
             throw new MasterDataConflictException("Cannot delete Ship To because an MPR is using it. Set it to Inactive instead.");
         }
         repository.delete(entity);
     }
 
-    public MasterDataImportResult upload(MultipartFile file, ImportMode mode) {
+    public MasterDataImportResult upload(MultipartFile file, ImportMode mode, String buyerKey) {
+        String buyer = buyerAccess.requireBuyer(buyerKey);
+        backfillLegacyBuyerScope();
         ImportMode effectiveMode = mode == null ? ImportMode.CREATE_ONLY : mode;
         List<ImportRowError> errors = new ArrayList<>();
         List<ImportCandidate<ShipToRequest>> rows = parseStandardWorkbook(file, errors);
@@ -152,23 +180,25 @@ public class ShipToService {
                 .map(row -> nameKey(row.getValue().shipToName())).collect(Collectors.toSet());
         Set<String> incomingCodeKeys = rows.stream()
                 .map(row -> codeKey(row.getValue().shipToCode())).filter(value -> value != null).collect(Collectors.toSet());
-        Map<String, ShipTo> existingByName = repository.findAllByShipToNameKeyIn(incomingNameKeys).stream()
-                .collect(Collectors.toMap(ShipTo::getShipToNameKey, item -> item, (a, b) -> a));
-        Map<String, ShipTo> existingByCode = repository.findAllByShipToCodeKeyIn(incomingCodeKeys).stream()
-                .filter(item -> item.getShipToCodeKey() != null)
-                .collect(Collectors.toMap(ShipTo::getShipToCodeKey, item -> item, (a, b) -> a));
+        Set<String> scopedNameKeys = incomingNameKeys.stream().map(key -> scopedNameKey(buyer, key)).collect(Collectors.toSet());
+        Set<String> scopedCodeKeys = incomingCodeKeys.stream().map(key -> scopedCodeKey(buyer, key)).collect(Collectors.toSet());
+        Map<String, ShipTo> existingByName = repository.findAllByShipToNameKeyIn(scopedNameKeys).stream()
+                .collect(Collectors.toMap(item -> nameKey(item.getShipToName()), item -> item, (a, b) -> a));
+        Map<String, ShipTo> existingByCode = repository.findAllByShipToCodeKeyIn(scopedCodeKeys).stream()
+                .filter(item -> item.getShipToCode() != null)
+                .collect(Collectors.toMap(item -> codeKey(item.getShipToCode()), item -> item, (a, b) -> a));
 
-        if (effectiveMode == ImportMode.REPLACE_ALL && mprRepository.count() > 0) {
-            errors.add(new ImportRowError(1, "mode", "Cannot use REPLACE_ALL while MPR data exists. Use UPSERT instead."));
+        if (effectiveMode == ImportMode.REPLACE_ALL && mprRepository.existsByBuyerKey(buyer)) {
+            errors.add(new ImportRowError(1, "mode", "Cannot use REPLACE_ALL while MPR data exists for this Buyer. Use UPSERT instead."));
         }
         for (ImportCandidate<ShipToRequest> row : rows) {
-            String nameKey = nameKey(row.getValue().shipToName());
-            if (effectiveMode == ImportMode.CREATE_ONLY && existingByName.containsKey(nameKey)) {
+            String rawNameKey = nameKey(row.getValue().shipToName());
+            if (effectiveMode == ImportMode.CREATE_ONLY && existingByName.containsKey(rawNameKey)) {
                 errors.add(new ImportRowError(row.getRowNumber(), "shipToName", "Ship To already exists; CREATE_ONLY does not allow updates"));
             }
-            String codeKey = codeKey(row.getValue().shipToCode());
-            ShipTo duplicateCode = codeKey == null ? null : existingByCode.get(codeKey);
-            ShipTo target = existingByName.get(nameKey);
+            String rawCodeKey = codeKey(row.getValue().shipToCode());
+            ShipTo duplicateCode = rawCodeKey == null ? null : existingByCode.get(rawCodeKey);
+            ShipTo target = existingByName.get(rawNameKey);
             if (duplicateCode != null && (target == null || !duplicateCode.getId().equals(target.getId()))) {
                 errors.add(new ImportRowError(row.getRowNumber(), "shipToCode", "Ship To code already exists"));
             }
@@ -182,14 +212,17 @@ public class ShipToService {
             List<String> keys = reserveMasterKeys(rows.size());
             for (int i = 0; i < rows.size(); i++) {
                 ShipTo entity = new ShipTo();
+                entity.setBuyerKey(buyer);
                 entity.setMasterKey(keys.get(i));
                 apply(entity, rows.get(i).getValue());
                 entity.setCreatedAt(now);
                 entity.setUpdatedAt(now);
                 toSave.add(entity);
             }
-            repository.deleteAll();
-            repository.saveAll(toSave);
+            List<ShipTo> currentBuyerRows = repository.findByBuyerKey(buyer);
+            if (!currentBuyerRows.isEmpty()) repository.deleteAll(currentBuyerRows);
+            if (!toSave.isEmpty()) repository.saveAll(toSave);
+            result.setDeleted(currentBuyerRows.size());
             result.setCreated(toSave.size());
             return result;
         }
@@ -200,10 +233,11 @@ public class ShipToService {
         List<String> newKeys = reserveMasterKeys(createCount);
         int keyIndex = 0;
         for (ImportCandidate<ShipToRequest> row : rows) {
-            String nameKey = nameKey(row.getValue().shipToName());
-            ShipTo entity = existingByName.get(nameKey);
+            String rawNameKey = nameKey(row.getValue().shipToName());
+            ShipTo entity = existingByName.get(rawNameKey);
             if (entity == null) {
                 entity = new ShipTo();
+                entity.setBuyerKey(buyer);
                 entity.setMasterKey(newKeys.get(keyIndex++));
                 entity.setCreatedAt(now);
                 result.setCreated(result.getCreated() + 1);
@@ -214,16 +248,20 @@ public class ShipToService {
             entity.setUpdatedAt(now);
             toSave.add(entity);
         }
-        repository.saveAll(toSave);
+        if (!toSave.isEmpty()) repository.saveAll(toSave);
         return result;
     }
 
-    public byte[] exportForEdit() {
+    public byte[] exportForEdit(String buyerKey) {
+        String buyer = buyerAccess.requireBuyer(buyerKey);
+        backfillLegacyBuyerScope();
         backfillMissingMasterKeys();
-        return MasterDataEditWorkbookExporter.shipTos(repository.findAll());
+        return MasterDataEditWorkbookExporter.shipTos(repository.findByBuyerKey(buyer));
     }
 
-    public MasterDataImportResult uploadEdited(MultipartFile file) {
+    public MasterDataImportResult uploadEdited(MultipartFile file, String buyerKey) {
+        String buyer = buyerAccess.requireBuyer(buyerKey);
+        backfillLegacyBuyerScope();
         List<ImportRowError> errors = new ArrayList<>();
         List<ImportCandidate<KeyedShipToRequest>> rows = parseEditedWorkbook(file, errors);
         int totalRows = rows.size();
@@ -233,13 +271,16 @@ public class ShipToService {
                 .map(row -> nameKey(row.getValue().request.shipToName())).collect(Collectors.toSet());
         Set<String> requestedCodeKeys = rows.stream().filter(row -> row.getValue().request != null)
                 .map(row -> codeKey(row.getValue().request.shipToCode())).filter(value -> value != null).collect(Collectors.toSet());
+        Set<String> scopedNameKeys = requestedNameKeys.stream().map(key -> scopedNameKey(buyer, key)).collect(Collectors.toSet());
+        Set<String> scopedCodeKeys = requestedCodeKeys.stream().map(key -> scopedCodeKey(buyer, key)).collect(Collectors.toSet());
         Map<String, ShipTo> byKey = repository.findAllByMasterKeyIn(requestedKeys).stream()
+                .filter(item -> buyer.equals(BuyerKeys.legacyDefault(item.getBuyerKey())))
                 .collect(Collectors.toMap(item -> normalizeMasterKey(item.getMasterKey()), item -> item, (a, b) -> a));
-        Map<String, ShipTo> byName = repository.findAllByShipToNameKeyIn(requestedNameKeys).stream()
-                .collect(Collectors.toMap(ShipTo::getShipToNameKey, item -> item, (a, b) -> a));
-        Map<String, ShipTo> byCode = repository.findAllByShipToCodeKeyIn(requestedCodeKeys).stream()
-                .filter(item -> item.getShipToCodeKey() != null)
-                .collect(Collectors.toMap(ShipTo::getShipToCodeKey, item -> item, (a, b) -> a));
+        Map<String, ShipTo> byName = repository.findAllByShipToNameKeyIn(scopedNameKeys).stream()
+                .collect(Collectors.toMap(item -> nameKey(item.getShipToName()), item -> item, (a, b) -> a));
+        Map<String, ShipTo> byCode = repository.findAllByShipToCodeKeyIn(scopedCodeKeys).stream()
+                .filter(item -> item.getShipToCode() != null)
+                .collect(Collectors.toMap(item -> codeKey(item.getShipToCode()), item -> item, (a, b) -> a));
 
         for (ImportCandidate<KeyedShipToRequest> row : rows) {
             KeyedShipToRequest keyed = row.getValue();
@@ -248,7 +289,7 @@ public class ShipToService {
                 if (keyed.masterKey != null) errors.add(new ImportRowError(row.getRowNumber(), "masterKey", "CREATE must have a blank Key"));
             } else {
                 if (keyed.masterKey == null) errors.add(new ImportRowError(row.getRowNumber(), "masterKey", keyed.action + " requires a Key"));
-                else if (target == null) errors.add(new ImportRowError(row.getRowNumber(), "masterKey", "Key does not exist: " + keyed.masterKey));
+                else if (target == null) errors.add(new ImportRowError(row.getRowNumber(), "masterKey", "Key does not exist for Buyer " + buyer + ": " + keyed.masterKey));
             }
             if (target != null && "DELETE".equals(keyed.action) && isUsed(target)) {
                 errors.add(new ImportRowError(row.getRowNumber(), "action", "Cannot delete Ship To because an MPR is using it"));
@@ -258,8 +299,8 @@ public class ShipToService {
             if (duplicateName != null && (target == null || !duplicateName.getId().equals(target.getId()))) {
                 errors.add(new ImportRowError(row.getRowNumber(), "shipToName", "Ship To name already exists"));
             }
-            String codeKey = codeKey(keyed.request.shipToCode());
-            ShipTo duplicateCode = codeKey == null ? null : byCode.get(codeKey);
+            String rawCodeKey = codeKey(keyed.request.shipToCode());
+            ShipTo duplicateCode = rawCodeKey == null ? null : byCode.get(rawCodeKey);
             if (duplicateCode != null && (target == null || !duplicateCode.getId().equals(target.getId()))) {
                 errors.add(new ImportRowError(row.getRowNumber(), "shipToCode", "Ship To code already exists"));
             }
@@ -283,6 +324,7 @@ public class ShipToService {
             ShipTo entity;
             if ("CREATE".equals(keyed.action)) {
                 entity = new ShipTo();
+                entity.setBuyerKey(buyer);
                 entity.setMasterKey(newKeys.get(keyIndex++));
                 entity.setCreatedAt(now);
                 result.setCreated(result.getCreated() + 1);
@@ -389,10 +431,12 @@ public class ShipToService {
         String name = MasterDataTextNormalizer.trimToNull(request == null ? null : request.shipToName());
         if (name == null) throw new MasterDataValidationException("Ship To name is required");
         String code = MasterDataTextNormalizer.trimToNull(request.shipToCode());
+        String buyer = BuyerKeys.legacyDefault(entity.getBuyerKey());
+        entity.setBuyerKey(buyer);
         entity.setShipToName(name);
-        entity.setShipToNameKey(MasterDataTextNormalizer.key(name));
+        entity.setShipToNameKey(scopedNameKey(buyer, nameKey(name)));
         entity.setShipToCode(code);
-        entity.setShipToCodeKey(codeKey(code));
+        entity.setShipToCodeKey(code == null ? null : scopedCodeKey(buyer, codeKey(code)));
         entity.setActive(request.active() == null || request.active());
         entity.setRemark(MasterDataTextNormalizer.trimToNull(request.remark()));
     }
@@ -409,6 +453,46 @@ public class ShipToService {
 
     private String codeKey(String value) {
         return MasterDataTextNormalizer.key(value);
+    }
+
+    private String scopedNameKey(String buyerKey, String rawNameKey) {
+        return BuyerKeys.legacyDefault(buyerKey) + BUYER_KEY_SEPARATOR + nameKey(rawNameKey);
+    }
+
+    private String scopedCodeKey(String buyerKey, String rawCodeKey) {
+        String raw = codeKey(rawCodeKey);
+        return raw == null ? null : BuyerKeys.legacyDefault(buyerKey) + BUYER_KEY_SEPARATOR + raw;
+    }
+
+    private synchronized void backfillLegacyBuyerScope() {
+        if (buyerScopeBackfilled) return;
+        List<ShipTo> all = repository.findAll();
+        List<ShipTo> changed = new ArrayList<>();
+        for (ShipTo item : all) {
+            if (item == null) continue;
+            String buyer = BuyerKeys.legacyDefault(item.getBuyerKey());
+            String rawNameKey = MasterDataTextNormalizer.key(item.getShipToName());
+            String rawCodeKey = MasterDataTextNormalizer.key(item.getShipToCode());
+            boolean dirty = !buyer.equals(item.getBuyerKey());
+            if (rawNameKey != null) {
+                String scopedName = scopedNameKey(buyer, rawNameKey);
+                if (!scopedName.equals(item.getShipToNameKey())) {
+                    item.setShipToNameKey(scopedName);
+                    dirty = true;
+                }
+            }
+            String scopedCode = rawCodeKey == null ? null : scopedCodeKey(buyer, rawCodeKey);
+            if (!java.util.Objects.equals(scopedCode, item.getShipToCodeKey())) {
+                item.setShipToCodeKey(scopedCode);
+                dirty = true;
+            }
+            if (dirty) {
+                item.setBuyerKey(buyer);
+                changed.add(item);
+            }
+        }
+        if (!changed.isEmpty()) repository.saveAll(changed);
+        buyerScopeBackfilled = true;
     }
 
     private Pageable pageable(int page, int size) {

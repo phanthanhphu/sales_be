@@ -136,7 +136,7 @@ public class MprService {
         requireLlBeanImplementation(buyerKey, "MPR generation");
 
         Map<String, MatInfo> matByKey = buildMatInfoCache(buyerKey);
-        Map<String, ShipTo> shipToById = buildShipToCache();
+        Map<String, ShipTo> shipToById = buildShipToCache(buyerKey);
         Map<String, MaterialShipToMapping> dedicatedShipToByMaterialKey = materialShipToMappingRepository
                 .findByBuyerKeyAndActiveTrue(buyerKey).stream()
                 .filter(Objects::nonNull)
@@ -345,6 +345,24 @@ public class MprService {
 
         orderService.markMprDraft(orderId);
         return candidate;
+    }
+
+    public MprDocument confirmCompletion(String orderId) {
+        MprDocument mpr = getByOrder(orderId);
+        if (safeList(mpr.getLines()).isEmpty()) {
+            throw new OrderBomMprValidationException("Cannot confirm an empty MPR");
+        }
+
+        if (!"COMPLETED".equalsIgnoreCase(mpr.getStatus())) {
+            mpr.setStatus("COMPLETED");
+            mpr.setUpdatedAt(LocalDateTime.now());
+            mpr.setUpdatedBy(RequestActor.current());
+            mpr = mprRepository.save(mpr);
+        }
+
+        // Keep Order and MPR completion status synchronized.
+        orderService.markMprCompleted(orderId);
+        return mpr;
     }
 
     private MprDocument mergeForPreview(MprDocument existing, MprDocument candidate) {
@@ -1400,7 +1418,7 @@ public class MprService {
                         (a, b) -> a,
                         LinkedHashMap::new
                 ));
-        Map<String, VendorCode> vendorByKey = vendorCodeRepository.findAll().stream()
+        Map<String, VendorCode> vendorByKey = vendorCodeRepository.findByBuyerKey(buyerKey).stream()
                 .filter(Objects::nonNull)
                 .collect(Collectors.toMap(
                         item -> normalize(item.getShortNameSupplier()),
@@ -1408,7 +1426,7 @@ public class MprService {
                         (a, b) -> a,
                         LinkedHashMap::new
                 ));
-        Map<String, ShipTo> shipToById = buildShipToCache();
+        Map<String, ShipTo> shipToById = buildShipToCache(buyerKey);
         Map<String, MaterialShipToMapping> dedicatedShipToByMaterialKey = materialShipToMappingRepository
                 .findByBuyerKeyAndActiveTrue(buyerKey).stream()
                 .filter(Objects::nonNull)
@@ -1982,10 +2000,10 @@ public class MprService {
         return result;
     }
 
-    private Map<String, ShipTo> buildShipToCache() {
+    private Map<String, ShipTo> buildShipToCache(String buyerKey) {
         Map<String, ShipTo> result = new LinkedHashMap<>();
-        for (ShipTo item : shipToRepository.findAll()) {
-            if (item == null || !item.isActive() || blank(item.getId())) continue;
+        for (ShipTo item : shipToRepository.findByBuyerKeyAndActiveTrueOrderByShipToNameAsc(buyerKey)) {
+            if (item == null || blank(item.getId())) continue;
             result.put(item.getId(), item);
         }
         return result;

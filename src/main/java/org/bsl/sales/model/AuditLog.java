@@ -30,6 +30,10 @@ public class AuditLog {
     @Indexed
     private String module;
 
+    /** Buyer workspace in which the audited action happened. Null means global/system action. */
+    @Indexed
+    private String buyerKey;
+
     private String resourceType;
     private String resourceId;
     private String description;
@@ -78,6 +82,9 @@ public class AuditLog {
 
     public String getModule() { return module; }
     public void setModule(String module) { this.module = module; }
+
+    public String getBuyerKey() { return buyerKey; }
+    public void setBuyerKey(String buyerKey) { this.buyerKey = buyerKey; }
 
     public String getResourceType() { return resourceType; }
     public void setResourceType(String resourceType) { this.resourceType = resourceType; }

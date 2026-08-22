@@ -7,6 +7,7 @@ import jakarta.servlet.http.HttpServletResponse;
 import org.bsl.sales.model.AuditLog;
 import org.bsl.sales.service.AuditLogService;
 import org.bsl.sales.support.AuditActionResolver;
+import org.bsl.sales.support.BuyerKeys;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Component;
@@ -31,6 +32,11 @@ public class AuditLogFilter extends OncePerRequestFilter {
 
     private static final Set<String> SENSITIVE_QUERY_KEYS = Set.of(
             "password", "token", "access_token", "refresh_token", "authorization", "secret"
+    );
+
+    private static final Set<String> BUYER_SCOPED_MODULES = Set.of(
+            "ORDER", "BOM", "MPR", "VENDOR_CODE", "MAT_INFO",
+            "MATERIAL_SHIP_TO", "LOSS", "SHIP_TO", "PRODUCT_COLOR"
     );
 
     private final AuditLogService auditLogService;
@@ -92,6 +98,7 @@ public class AuditLogFilter extends OncePerRequestFilter {
         log.setRole(identity.role());
         log.setAction(action);
         log.setModule(module);
+        log.setBuyerKey(resolveBuyerKey(request, module));
         log.setResourceType(AuditActionResolver.resolveResourceType(endpoint));
         log.setResourceId(resourceId);
         log.setDescription(AuditActionResolver.description(action, module, resourceId, success));
@@ -108,6 +115,36 @@ public class AuditLogFilter extends OncePerRequestFilter {
         log.setFileSize(parseLong(request.getHeader("X-File-Size")));
         log.setCreatedAt(LocalDateTime.now());
         return log;
+    }
+
+    private String resolveBuyerKey(HttpServletRequest request, String module) {
+        if (!BUYER_SCOPED_MODULES.contains(module)) return null;
+
+        String buyerKey = queryParameter(request.getQueryString(), "buyerKey");
+        if (!StringUtils.hasText(buyerKey)) buyerKey = request.getHeader("X-Buyer-Key");
+        if (!StringUtils.hasText(buyerKey)) return null;
+
+        return BuyerKeys.normalize(buyerKey);
+    }
+
+    private String queryParameter(String queryString, String targetKey) {
+        if (!StringUtils.hasText(queryString) || !StringUtils.hasText(targetKey)) return null;
+        for (String pair : queryString.split("&")) {
+            int separator = pair.indexOf('=');
+            String rawKey = separator >= 0 ? pair.substring(0, separator) : pair;
+            if (!targetKey.equalsIgnoreCase(decodeQueryValue(rawKey))) continue;
+            String rawValue = separator >= 0 ? pair.substring(separator + 1) : "";
+            return decodeQueryValue(rawValue);
+        }
+        return null;
+    }
+
+    private String decodeQueryValue(String value) {
+        try {
+            return URLDecoder.decode(value == null ? "" : value, StandardCharsets.UTF_8);
+        } catch (Exception ignored) {
+            return value;
+        }
     }
 
     private AuditIdentity resolveIdentity(HttpServletRequest request) {

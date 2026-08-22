@@ -11,15 +11,7 @@ import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.validation.annotation.Validated;
-import org.springframework.web.bind.annotation.DeleteMapping;
-import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.PathVariable;
-import org.springframework.web.bind.annotation.PostMapping;
-import org.springframework.web.bind.annotation.PutMapping;
-import org.springframework.web.bind.annotation.RequestBody;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RequestParam;
-import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.util.List;
@@ -36,12 +28,16 @@ public class VendorCodeController {
     }
 
     @PostMapping
-    public ResponseEntity<VendorCode> create(@Valid @RequestBody VendorCodeRequest request) {
-        return ResponseEntity.ok(vendorCodeService.create(request));
+    public ResponseEntity<VendorCode> create(
+            @RequestParam(defaultValue = "LLBEAN") String buyerKey,
+            @Valid @RequestBody VendorCodeRequest request
+    ) {
+        return ResponseEntity.ok(vendorCodeService.create(buyerKey, request));
     }
 
     @GetMapping
     public ResponseEntity<Page<VendorCode>> list(
+            @RequestParam(defaultValue = "LLBEAN") String buyerKey,
             @RequestParam(required = false) String masterKey,
             @RequestParam(required = false) String shortNameSupplier,
             @RequestParam(required = false) String vendorCode,
@@ -50,73 +46,76 @@ public class VendorCodeController {
             @RequestParam(defaultValue = "0") int page,
             @RequestParam(defaultValue = "50") int size
     ) {
-        return ResponseEntity.ok(
-                vendorCodeService.list(
-                        masterKey,
-                        shortNameSupplier,
-                        vendorCode,
-                        vendorName,
-                        matCharger,
-                        page,
-                        size
-                )
-        );
+        return ResponseEntity.ok(vendorCodeService.list(
+                buyerKey, masterKey, shortNameSupplier, vendorCode, vendorName, matCharger, page, size
+        ));
     }
 
     @GetMapping("/options")
     public ResponseEntity<List<VendorCode>> options(
+            @RequestParam(defaultValue = "LLBEAN") String buyerKey,
             @RequestParam(required = false) String keyword,
             @RequestParam(defaultValue = "50") int limit
     ) {
-        return ResponseEntity.ok(vendorCodeService.options(keyword, limit));
+        return ResponseEntity.ok(vendorCodeService.options(buyerKey, keyword, limit));
     }
 
     @GetMapping("/{id}")
-    public ResponseEntity<VendorCode> getById(@PathVariable String id) {
-        return ResponseEntity.ok(vendorCodeService.getById(id));
+    public ResponseEntity<VendorCode> getById(
+            @PathVariable String id,
+            @RequestParam(defaultValue = "LLBEAN") String buyerKey
+    ) {
+        return ResponseEntity.ok(vendorCodeService.getById(buyerKey, id));
     }
 
     @GetMapping("/resolve")
-    public ResponseEntity<VendorCode> resolve(@RequestParam String shortNameSupplier) {
-        return ResponseEntity.ok(vendorCodeService.resolve(shortNameSupplier));
+    public ResponseEntity<VendorCode> resolve(
+            @RequestParam(defaultValue = "LLBEAN") String buyerKey,
+            @RequestParam String shortNameSupplier
+    ) {
+        return ResponseEntity.ok(vendorCodeService.resolve(buyerKey, shortNameSupplier));
     }
 
     @PutMapping("/{id}")
     public ResponseEntity<VendorCode> update(
             @PathVariable String id,
+            @RequestParam(defaultValue = "LLBEAN") String buyerKey,
             @Valid @RequestBody VendorCodeRequest request
     ) {
-        return ResponseEntity.ok(vendorCodeService.update(id, request));
+        return ResponseEntity.ok(vendorCodeService.update(buyerKey, id, request));
     }
 
     @DeleteMapping("/{id}")
-    public ResponseEntity<Void> delete(@PathVariable String id) {
-        vendorCodeService.delete(id);
+    public ResponseEntity<Void> delete(
+            @PathVariable String id,
+            @RequestParam(defaultValue = "LLBEAN") String buyerKey
+    ) {
+        vendorCodeService.delete(buyerKey, id);
         return ResponseEntity.noContent().build();
     }
 
     @PostMapping(value = "/upload", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     public ResponseEntity<MasterDataImportResult> upload(
             @RequestParam("file") MultipartFile file,
-            @RequestParam(defaultValue = "CREATE_ONLY") ImportMode mode
+            @RequestParam(defaultValue = "CREATE_ONLY") ImportMode mode,
+            @RequestParam(defaultValue = "LLBEAN") String buyerKey
     ) {
-        MasterDataImportResult result = vendorCodeService.upload(file, mode);
-        return result.isApplied()
-                ? ResponseEntity.ok(result)
-                : ResponseEntity.badRequest().body(result);
+        MasterDataImportResult result = vendorCodeService.upload(file, mode, buyerKey);
+        return result.isApplied() ? ResponseEntity.ok(result) : ResponseEntity.badRequest().body(result);
     }
 
     @GetMapping("/export-edit")
-    public ResponseEntity<byte[]> exportForEdit() {
-        return excelResponse("vendor-code-master-edit.xlsx", vendorCodeService.exportForEdit());
+    public ResponseEntity<byte[]> exportForEdit(@RequestParam(defaultValue = "LLBEAN") String buyerKey) {
+        return excelResponse("vendor-code-" + buyerKey + "-edit.xlsx", vendorCodeService.exportForEdit(buyerKey));
     }
 
     @PostMapping(value = "/upload-edited", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
-    public ResponseEntity<MasterDataImportResult> uploadEdited(@RequestParam("file") MultipartFile file) {
-        MasterDataImportResult result = vendorCodeService.uploadEdited(file);
-        return result.isApplied()
-                ? ResponseEntity.ok(result)
-                : ResponseEntity.badRequest().body(result);
+    public ResponseEntity<MasterDataImportResult> uploadEdited(
+            @RequestParam("file") MultipartFile file,
+            @RequestParam(defaultValue = "LLBEAN") String buyerKey
+    ) {
+        MasterDataImportResult result = vendorCodeService.uploadEdited(file, buyerKey);
+        return result.isApplied() ? ResponseEntity.ok(result) : ResponseEntity.badRequest().body(result);
     }
 
     private ResponseEntity<byte[]> excelResponse(String filename, byte[] content) {
@@ -125,5 +124,4 @@ public class VendorCodeController {
                 .contentType(MediaType.parseMediaType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"))
                 .body(content);
     }
-
 }
