@@ -6,7 +6,6 @@ import org.bsl.sales.model.MatInfo;
 import org.bsl.sales.model.Loss;
 import org.bsl.sales.model.MaterialShipToMapping;
 import org.bsl.sales.model.MprDocument;
-import org.bsl.sales.model.ProductColorMaster;
 import org.bsl.sales.model.SalesOrder;
 import org.bsl.sales.model.User;
 import org.bsl.sales.support.BuyerKeys;
@@ -35,7 +34,6 @@ public class BuyerDataMigrationConfig {
         backfillBuyerKey(BomDocument.class);
         backfillBuyerKey(MprDocument.class);
         backfillBuyerKey(MatInfo.class);
-        backfillBuyerKey(ProductColorMaster.class);
         backfillBuyerKey(Loss.class);
         backfillBuyerKey(MaterialShipToMapping.class);
 
@@ -75,15 +73,6 @@ public class BuyerDataMigrationConfig {
                 .on("checkingKey", Sort.Direction.ASC)
                 .unique()
                 .named("uk_mat_info_buyer_identity"));
-
-        IndexOperations productColor = mongoTemplate.indexOps(ProductColorMaster.class);
-        dropQuietly(productColor, "masterKey");
-        dropQuietly(productColor, "masterKey_1");
-        productColor.ensureIndex(new Index()
-                .on("buyerKey", Sort.Direction.ASC)
-                .on("masterKey", Sort.Direction.ASC)
-                .unique()
-                .named("uk_product_color_buyer_key"));
 
         IndexOperations loss = mongoTemplate.indexOps(Loss.class);
         dropQuietly(loss, "materialGroupKey");

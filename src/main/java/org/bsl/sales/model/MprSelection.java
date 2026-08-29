@@ -2,6 +2,7 @@ package org.bsl.sales.model;
 
 import lombok.Data;
 import lombok.NoArgsConstructor;
+import org.springframework.data.annotation.Transient;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
@@ -21,6 +22,31 @@ public class MprSelection {
     private String bomId;
     private String bomNo;
     private String bomName;
+
+    /** BOM MPR-source revision captured when this batch was generated/refreshed. */
+    private Long bomSourceRevision;
+    private LocalDateTime bomSourceChangedAt;
+
+    /** Read-only current BOM state added by MprService for the UI. */
+    @Transient
+    private Long currentBomSourceRevision;
+    @Transient
+    private LocalDateTime currentBomSourceChangedAt;
+    @Transient
+    private String currentBomSourceChangedBy;
+    @Transient
+    private String currentBomSourceChangeSummary;
+    @Transient
+    private boolean bomSourceChanged;
+    @Transient
+    private boolean bomSourceMissing;
+
+    /**
+     * Stable BOM Product Color ids. Each id represents one exact business
+     * identity: Product/Style Color + Pattern Number + Season + Style Number.
+     * Older records may still contain readable color names and are migrated
+     * in-memory by MprService when the MPR is loaded.
+     */
     private List<String> colors = new ArrayList<>();
     private List<String> packingIds = new ArrayList<>();
 

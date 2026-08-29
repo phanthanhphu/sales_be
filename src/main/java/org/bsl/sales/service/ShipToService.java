@@ -13,6 +13,7 @@ import org.bsl.sales.exception.MasterDataConflictException;
 import org.bsl.sales.exception.MasterDataNotFoundException;
 import org.bsl.sales.exception.MasterDataValidationException;
 import org.bsl.sales.model.ShipTo;
+import org.bsl.sales.repository.MaterialShipToMappingRepository;
 import org.bsl.sales.repository.MprDocumentRepository;
 import org.bsl.sales.repository.ShipToRepository;
 import org.bsl.sales.security.BuyerAccessService;
@@ -55,6 +56,7 @@ public class ShipToService {
     private static final String BUYER_KEY_SEPARATOR = "\u001F";
 
     private final ShipToRepository repository;
+    private final MaterialShipToMappingRepository materialShipToMappingRepository;
     private final MprDocumentRepository mprRepository;
     private final MasterDataBeanValidator beanValidator;
     private final MasterDataExcelSupport excelSupport;
@@ -66,6 +68,7 @@ public class ShipToService {
 
     public ShipToService(
             ShipToRepository repository,
+            MaterialShipToMappingRepository materialShipToMappingRepository,
             MprDocumentRepository mprRepository,
             MasterDataBeanValidator beanValidator,
             MasterDataExcelSupport excelSupport,
@@ -74,6 +77,7 @@ public class ShipToService {
             BuyerAccessService buyerAccess
     ) {
         this.repository = repository;
+        this.materialShipToMappingRepository = materialShipToMappingRepository;
         this.mprRepository = mprRepository;
         this.beanValidator = beanValidator;
         this.excelSupport = excelSupport;
@@ -163,7 +167,7 @@ public class ShipToService {
     public void delete(String buyerKey, String id) {
         ShipTo entity = get(buyerKey, id);
         if (isUsed(entity)) {
-            throw new MasterDataConflictException("Cannot delete Ship To because an MPR is using it. Set it to Inactive instead.");
+            throw new MasterDataConflictException("Cannot delete Ship To because MPR or Material Ship To Mapping is using it.");
         }
         repository.delete(entity);
     }
@@ -188,8 +192,9 @@ public class ShipToService {
                 .filter(item -> item.getShipToCode() != null)
                 .collect(Collectors.toMap(item -> codeKey(item.getShipToCode()), item -> item, (a, b) -> a));
 
-        if (effectiveMode == ImportMode.REPLACE_ALL && mprRepository.existsByBuyerKey(buyer)) {
-            errors.add(new ImportRowError(1, "mode", "Cannot use REPLACE_ALL while MPR data exists for this Buyer. Use UPSERT instead."));
+        if (effectiveMode == ImportMode.REPLACE_ALL
+                && (mprRepository.existsByBuyerKey(buyer) || materialShipToMappingRepository.existsByBuyerKey(buyer))) {
+            errors.add(new ImportRowError(1, "mode", "Cannot use REPLACE_ALL while MPR or Material Ship To Mapping data exists for this Buyer. Use UPSERT instead."));
         }
         for (ImportCandidate<ShipToRequest> row : rows) {
             String rawNameKey = nameKey(row.getValue().shipToName());
@@ -199,6 +204,9 @@ public class ShipToService {
             String rawCodeKey = codeKey(row.getValue().shipToCode());
             ShipTo duplicateCode = rawCodeKey == null ? null : existingByCode.get(rawCodeKey);
             ShipTo target = existingByName.get(rawNameKey);
+            if (target != null && Boolean.FALSE.equals(row.getValue().active()) && isActivelyMapped(target)) {
+                errors.add(new ImportRowError(row.getRowNumber(), "active", "Remove this Ship To from active Material Ship To mappings before setting it to Inactive"));
+            }
             if (duplicateCode != null && (target == null || !duplicateCode.getId().equals(target.getId()))) {
                 errors.add(new ImportRowError(row.getRowNumber(), "shipToCode", "Ship To code already exists"));
             }
@@ -292,9 +300,12 @@ public class ShipToService {
                 else if (target == null) errors.add(new ImportRowError(row.getRowNumber(), "masterKey", "Key does not exist for Buyer " + buyer + ": " + keyed.masterKey));
             }
             if (target != null && "DELETE".equals(keyed.action) && isUsed(target)) {
-                errors.add(new ImportRowError(row.getRowNumber(), "action", "Cannot delete Ship To because an MPR is using it"));
+                errors.add(new ImportRowError(row.getRowNumber(), "action", "Cannot delete Ship To because MPR or Material Ship To Mapping is using it"));
             }
             if ("DELETE".equals(keyed.action) || keyed.request == null) continue;
+            if (target != null && Boolean.FALSE.equals(keyed.request.active()) && isActivelyMapped(target)) {
+                errors.add(new ImportRowError(row.getRowNumber(), "active", "Remove this Ship To from active Material Ship To mappings before setting it to Inactive"));
+            }
             ShipTo duplicateName = byName.get(nameKey(keyed.request.shipToName()));
             if (duplicateName != null && (target == null || !duplicateName.getId().equals(target.getId()))) {
                 errors.add(new ImportRowError(row.getRowNumber(), "shipToName", "Ship To name already exists"));
@@ -430,6 +441,9 @@ public class ShipToService {
     private void apply(ShipTo entity, ShipToRequest request) {
         String name = MasterDataTextNormalizer.trimToNull(request == null ? null : request.shipToName());
         if (name == null) throw new MasterDataValidationException("Ship To name is required");
+        if (entity != null && entity.getId() != null && Boolean.FALSE.equals(request.active()) && isActivelyMapped(entity)) {
+            throw new MasterDataConflictException("Remove this Ship To from active Material Ship To mappings before setting it to Inactive");
+        }
         String code = MasterDataTextNormalizer.trimToNull(request.shipToCode());
         String buyer = BuyerKeys.legacyDefault(entity.getBuyerKey());
         entity.setBuyerKey(buyer);
@@ -442,7 +456,21 @@ public class ShipToService {
     }
 
     private boolean isUsed(ShipTo entity) {
-        return entity != null && mprRepository.existsByLinesShipToIdsContaining(entity.getId());
+        return entity != null && (mprRepository.existsByLinesShipToIdsContaining(entity.getId()) || isMapped(entity));
+    }
+
+    private boolean isMapped(ShipTo entity) {
+        if (entity == null || entity.getId() == null) return false;
+        String buyer = BuyerKeys.legacyDefault(entity.getBuyerKey());
+        return materialShipToMappingRepository.existsListReference(buyer, entity.getId())
+                || materialShipToMappingRepository.existsLegacyReference(buyer, entity.getId());
+    }
+
+    private boolean isActivelyMapped(ShipTo entity) {
+        if (entity == null || entity.getId() == null) return false;
+        String buyer = BuyerKeys.legacyDefault(entity.getBuyerKey());
+        return materialShipToMappingRepository.existsActiveListReference(buyer, entity.getId())
+                || materialShipToMappingRepository.existsActiveLegacyReference(buyer, entity.getId());
     }
 
     private String nameKey(String value) {

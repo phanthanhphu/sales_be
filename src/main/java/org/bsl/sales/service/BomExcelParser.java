@@ -237,15 +237,31 @@ public class BomExcelParser {
                 int labelLastColumn = labelRegion == null ? c : labelRegion.getLastColumn();
                 int labelLastRow = labelRegion == null ? r : labelRegion.getLastRow();
 
-                // COMMENTS in the simplified template is a wide merged label
-                // (normally I2:Q2) with its text in the merged row underneath
-                // (I3:Q3). Read that vertical value slot explicitly.
                 if (expected.equals("COMMENTS")) {
-                    int valueRow = labelLastRow + 1;
-                    Cell valueCell = mergedTopLeftCell(sheet, valueRow, labelFirstColumn);
-                    String value = valueCell == null ? text(sheet.getRow(valueRow), labelFirstColumn, formatter, evaluator)
-                            : formatter.formatCellValue(valueCell, evaluator).trim();
-                    return looksLikeHeaderLabel(value) ? "" : value;
+                    // Approved/current form: I2:Q2 label and I3:Q4 content.
+                    if (labelRegion != null) {
+                        int valueRow = labelLastRow + 1;
+                        String value = cellValue(
+                                sheet, valueRow, labelFirstColumn, formatter, evaluator
+                        );
+                        return looksLikeHeaderLabel(value) ? "" : value;
+                    }
+
+                    // Legacy original form: unmerged I2 label and J2:Q2 value.
+                    String sameRowValue = cellValue(
+                            sheet, r, labelLastColumn + 1, formatter, evaluator
+                    );
+                    if (!sameRowValue.isBlank() && !looksLikeHeaderLabel(sameRowValue)) {
+                        return sameRowValue;
+                    }
+
+                    // Transitional files may put the value below an unmerged
+                    // Comments label. Read I3 only; never scan left into H3,
+                    // where Old Pattern Date belongs.
+                    String belowValue = cellValue(
+                            sheet, r + 1, labelFirstColumn, formatter, evaluator
+                    );
+                    return looksLikeHeaderLabel(belowValue) ? "" : belowValue;
                 }
 
                 // For all other header fields the logical value starts directly
@@ -260,6 +276,18 @@ public class BomExcelParser {
             }
         }
         return "";
+    }
+
+    private String cellValue(
+            Sheet sheet,
+            int row,
+            int column,
+            DataFormatter formatter,
+            FormulaEvaluator evaluator
+    ) {
+        Cell valueCell = mergedTopLeftCell(sheet, row, column);
+        if (valueCell != null) return formatter.formatCellValue(valueCell, evaluator).trim();
+        return text(sheet.getRow(row), column, formatter, evaluator);
     }
 
     private CellRangeAddress mergedRegionAt(Sheet sheet, int row, int column) {

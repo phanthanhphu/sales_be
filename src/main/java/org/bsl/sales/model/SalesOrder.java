@@ -17,6 +17,8 @@ import java.time.LocalDateTime;
 @Document(collection = "orders")
 @CompoundIndex(name = "uk_order_buyer_no", def = "{'buyerKey': 1, 'orderNoKey': 1}", unique = true)
 public class SalesOrder {
+    public static final String STATUS_MPR_IN_PROGRESS = "MPR_IN_PROGRESS";
+    public static final String STATUS_MPR_COMPLETED = "MPR_COMPLETED";
 
     @Id
     private String id;
@@ -35,7 +37,7 @@ public class SalesOrder {
     private String season;
     private String comment;
 
-    /** DRAFT | BOM_IN_PROGRESS | BOM_SUBMITTED | MPR_DRAFT | MPR_COMPLETED */
+    /** DRAFT | BOM_IN_PROGRESS | BOM_SUBMITTED | MPR_IN_PROGRESS | MPR_COMPLETED */
     private String status;
 
     private String createdBy;

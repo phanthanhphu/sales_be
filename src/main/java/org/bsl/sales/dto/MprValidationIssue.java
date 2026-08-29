@@ -12,6 +12,21 @@ public record MprValidationIssue(
         String requiredShipToId,
         String requiredShipToCode,
         String requiredShipToName,
+        List<String> allowedShipToIds,
+        List<String> allowedShipToCodes,
+        List<String> allowedShipToNames,
         List<String> materials,
-        String message
+        String message,
+        String severity,
+        boolean blocking,
+        String materialType,
+        String matFullDescription,
+        String matColor,
+        String matUnit,
+        String masterMaterialType,
+        String masterMatFullDescription,
+        String masterMatColor,
+        String masterMatUnit,
+        List<String> mismatchFields,
+        Integer sourceRowNumber
 ) { }

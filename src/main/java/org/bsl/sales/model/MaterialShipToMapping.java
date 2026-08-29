@@ -10,6 +10,8 @@ import org.springframework.data.mongodb.core.index.Indexed;
 import org.springframework.data.mongodb.core.mapping.Document;
 
 import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * Dedicated material delivery rule. UI may expose this under a Buyer (currently L.L.BEAN),
@@ -39,7 +41,13 @@ public class MaterialShipToMapping {
     private String matColor;
     private String matUnit;
 
+    /** Current multi-value mapping. IDs are authoritative; codes/names are display snapshots. */
     @Indexed
+    private List<String> shipToIds = new ArrayList<>();
+    private List<String> shipToCodes = new ArrayList<>();
+    private List<String> shipToNames = new ArrayList<>();
+
+    /** Legacy single-value fields retained while existing MongoDB rows are migrated. */
     private String shipToId;
     private String shipToCode;
     private String shipToName;

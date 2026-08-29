@@ -491,6 +491,10 @@ public class CurrencyMasterService {
         }
 
         for (MprDocument document : mprDocumentRepository.findAll()) {
+            // A completed MPR is a frozen business snapshot, including its currency references.
+            if (MprDocument.STATUS_COMPLETED.equalsIgnoreCase(document.getStatus())) {
+                continue;
+            }
             boolean changed = false;
 
             for (MprLine line : safe(document.getLines())) {

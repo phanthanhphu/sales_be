@@ -12,7 +12,9 @@ import org.bsl.sales.exception.OrderBomMprValidationException;
 import org.bsl.sales.model.*;
 import org.bsl.sales.repository.*;
 import org.bsl.sales.support.BuyerKeys;
+import org.bsl.sales.support.BomMprSourceRevision;
 import org.bsl.sales.support.MaterialShipToMappingKeys;
+import org.bsl.sales.support.MasterDataTextNormalizer;
 import org.springframework.beans.BeanUtils;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
@@ -20,6 +22,7 @@ import org.springframework.web.multipart.MultipartFile;
 import java.math.BigDecimal;
 import java.math.MathContext;
 import java.math.RoundingMode;
+import java.text.Normalizer;
 import java.time.LocalDateTime;
 import java.util.*;
 import java.util.stream.Collectors;
@@ -83,23 +86,39 @@ public class MprService {
         SalesOrder order = orderService.get(orderId);
         MprDocument mpr = mprRepository.findByOrderId(orderId)
                 .orElseThrow(() -> new OrderBomMprNotFoundException("MPR has not been created for this order"));
+        normalizeLegacyStatus(mpr);
         String orderBuyer = BuyerKeys.legacyDefault(order.getBuyerKey());
         if (mpr.getBuyerKey() == null || mpr.getBuyerKey().isBlank()) {
             mpr.setBuyerKey(orderBuyer);
         } else if (!orderBuyer.equals(BuyerKeys.legacyDefault(mpr.getBuyerKey()))) {
             throw new OrderBomMprValidationException("MPR belongs to another Buyer");
         }
-        // Backfill BOM-owned fields introduced after older MPR records were saved.
-        // This lets users export POSITION immediately without regenerating the MPR.
-        backfillMissingBomSourceFields(mpr);
+        // COMPLETED is a frozen snapshot. Reads and exports must not silently
+        // recalculate it from newer BOM/master-data values.
+        if (!MprDocument.STATUS_COMPLETED.equalsIgnoreCase(mpr.getStatus())) {
+            // Backfill BOM-owned fields introduced after older MPR records were saved.
+            backfillMissingBomSourceFields(mpr);
 
-        // Always return the final MPR data set: every duplicate group keeps
-        // exactly one survivor, including legacy records saved before duplicate
-        // consolidation was introduced.
-        mpr.setLines(consolidateFinalLines(mpr.getLines()));
-        orderLinesForDisplay(mpr);
-        // Recalculate once with one bulk Currency Master cache for the whole document.
-        recalculateMprCalculations(mpr);
+            // MAT_INFO can be created/updated after the MPR batch was generated.
+            // Fill only missing commercial fields while the MPR is editable.
+            backfillMissingMatInfoFields(mpr, orderBuyer);
+
+            // Always return the final MPR data set: every duplicate group keeps
+            // exactly one survivor, including legacy records saved before duplicate
+            // consolidation was introduced.
+            mpr.setLines(consolidateFinalLines(mpr.getLines()));
+            orderLinesForDisplay(mpr);
+            // Recalculate once with one bulk Currency Master cache for the whole document.
+            recalculateMprCalculations(mpr);
+        }
+
+        // Older MPR batches stored only the readable color name (for example
+        // NATURAL). Recover the exact Product Color id from the generated lines
+        // whenever possible so two four-field Product Colors with the same name
+        // are not shown as both selected.
+        backfillSelectionProductColorIds(mpr);
+
+        decorateBomSourceState(mpr);
         return mpr;
     }
 
@@ -112,6 +131,7 @@ public class MprService {
         Optional<MprDocument> current = mprRepository.findByOrderId(orderId);
         return current.map(existing -> {
             backfillMissingBomSourceFields(existing);
+            backfillMissingMatInfoFields(existing, BuyerKeys.legacyDefault(existing.getBuyerKey()));
             return mergeForPreview(existing, candidate);
         }).orElseGet(() -> {
             orderLinesForDisplay(candidate);
@@ -135,7 +155,8 @@ public class MprService {
         String buyerKey = BuyerKeys.legacyDefault(order.getBuyerKey());
         requireLlBeanImplementation(buyerKey, "MPR generation");
 
-        Map<String, MatInfo> matByKey = buildMatInfoCache(buyerKey);
+        List<MatInfo> activeMatInfos = loadActiveMatInfos(buyerKey);
+        Map<String, MatInfo> matByKey = buildMatInfoCache(activeMatInfos);
         Map<String, ShipTo> shipToById = buildShipToCache(buyerKey);
         Map<String, MaterialShipToMapping> dedicatedShipToByMaterialKey = materialShipToMappingRepository
                 .findByBuyerKeyAndActiveTrue(buyerKey).stream()
@@ -171,6 +192,8 @@ public class MprService {
         lineStore.hydrateAllForMpr(selectedBoms);
 
         Map<String, ValidationIssueAccumulator> issueByKey = new LinkedHashMap<>();
+        List<MprValidationIssue> masterDataWarnings = new ArrayList<>();
+        Set<String> masterDataWarningKeys = new LinkedHashSet<>();
 
         for (MprSelectionRequest selectionRequest : requestedSelections) {
             BomDocument bom = selectedBomById.get(selectionRequest.bomId());
@@ -185,8 +208,8 @@ public class MprService {
                 throw new OrderBomMprValidationException("Only submitted BOM can be used to create MPR: " + bom.getBomNo());
             }
 
-            List<String> colors = normalizeSelectionColors(selectionRequest.colors(), bom);
-            if (colors.isEmpty()) {
+            List<BomProductColor> selectedProductColors = normalizeSelectionProductColors(selectionRequest.colors(), bom);
+            if (selectedProductColors.isEmpty()) {
                 throw new OrderBomMprValidationException("Select at least one Product Color for BOM " + bom.getBomNo());
             }
 
@@ -209,14 +232,17 @@ public class MprService {
                 selectedPackings.add(packing);
             }
 
-            Map<String, String> productColorIdByName = productColorIdsByName(bom);
-
-            for (String colorName : colors) {
-                List<String> selectedShipToIds = shipToIdsForColor(selectionRequest, bom, colorName, shipToById);
+            for (BomProductColor productColor : selectedProductColors) {
+                String productColorId = trim(productColor.getId());
+                String colorName = trim(productColor.getColorName());
+                List<String> selectedShipToIds = shipToIdsForColor(
+                        selectionRequest, bom, productColor, shipToById
+                );
                 // Reuse the same quantity validation as real generation.
-                shipToQuantitiesForColor(selectionRequest, bom, colorName, selectedShipToIds, request.poQuantity());
-                String resolvedProductColorId = productColorIdByName.getOrDefault(normalize(colorName), "");
-                String uiProductColorId = hasText(resolvedProductColorId) ? resolvedProductColorId : colorName;
+                shipToQuantitiesForColor(
+                        selectionRequest, bom, productColor, selectedShipToIds, request.poQuantity()
+                );
+                String uiProductColorId = productColorId;
 
                 List<BomLine> sourceLines = new ArrayList<>(safeList(bom.getCoreLines()));
                 for (BomPacking packing : selectedPackings) sourceLines.addAll(safeList(packing.getLines()));
@@ -225,7 +251,7 @@ public class MprService {
                     if (!isPurchasableMaterialLine(source)) continue;
 
                     String description = bomMaterialDescription(source);
-                    String materialColor = materialColorFor(source, colorName, resolvedProductColorId);
+                    String materialColor = materialColorFor(source, colorName, productColorId);
                     MatInfo mat = findMatInfo(matByKey, source, materialColor);
                     String materialType = trim(source.getMaterialType());
                     String resolvedSapCode = firstNonBlank(source.getSapCode(), mat == null ? null : mat.getFlexId());
@@ -234,6 +260,16 @@ public class MprService {
                             source.getCostingUnit(),
                             mat == null ? null : mat.getMatUnit()
                     );
+
+                    if (mat == null) {
+                        MprValidationIssue warning = buildBomMatInfoWarning(
+                                bom, productColor, source, materialType, description, materialColor, resolvedMatUnit, activeMatInfos
+                        );
+                        String warningKey = matInfoWarningKey(warning);
+                        if (warning != null && masterDataWarningKeys.add(warningKey)) {
+                            masterDataWarnings.add(warning);
+                        }
+                    }
                     String materialMappingKey = MaterialShipToMappingKeys.build(
                             resolvedSapCode,
                             materialType,
@@ -245,20 +281,25 @@ public class MprService {
                     MaterialShipToMapping mapping = dedicatedShipToByMaterialKey.get(materialMappingKey);
                     if (mapping == null) continue;
 
-                    String requiredId = trim(mapping.getShipToId());
-                    if (selectedShipToIds.contains(requiredId)) continue;
-
                     String materialLabel = firstNonBlank(resolvedSapCode, description, materialType);
-                    String issueKey = bom.getId() + "|" + uiProductColorId + "|" + normalize(colorName) + "|" + requiredId;
+                    List<String> allowedIds = dedicatedShipToIds(mapping, shipToById, materialLabel);
+                    boolean hasMatchingShipTo = selectedShipToIds.stream().anyMatch(allowedIds::contains);
+                    if (hasMatchingShipTo) continue;
+
+                    List<String> allowedCodes = shipToValues(allowedIds, shipToById, true);
+                    List<String> allowedNames = shipToValues(allowedIds, shipToById, false);
+                    String productColorDisplay = productColorLabel(productColor);
+                    String issueKey = bom.getId() + "|" + uiProductColorId + "|" + normalize(productColorDisplay)
+                            + "|" + String.join(",", allowedIds);
                     ValidationIssueAccumulator accumulator = issueByKey.computeIfAbsent(issueKey, key -> new ValidationIssueAccumulator(
                             bom.getId(),
                             trim(bom.getBomNo()),
                             trim(bom.getBomName()),
                             uiProductColorId,
-                            colorName,
-                            requiredId,
-                            trim(mapping.getShipToCode()),
-                            trim(mapping.getShipToName())
+                            productColorDisplay,
+                            allowedIds,
+                            allowedCodes,
+                            allowedNames
                     ));
                     if (hasText(materialLabel)) accumulator.materials.add(materialLabel);
                 }
@@ -267,24 +308,69 @@ public class MprService {
 
         List<MprValidationIssue> issues = issueByKey.values().stream()
                 .map(item -> {
-                    String shipToLabel = firstNonBlank(item.requiredShipToCode, item.requiredShipToName, item.requiredShipToId);
+                    String shipToLabel = dedicatedShipToLabel(item.allowedShipToIds, shipToById);
                     return new MprValidationIssue(
-                            "MISSING_DEDICATED_SHIP_TO",
+                            "NO_MATCHING_DEDICATED_SHIP_TO",
                             item.bomId,
                             item.bomNo,
                             item.bomName,
                             item.productColorId,
                             item.productColor,
-                            item.requiredShipToId,
-                            item.requiredShipToCode,
-                            item.requiredShipToName,
+                            firstListValue(item.allowedShipToIds),
+                            firstListValue(item.allowedShipToCodes),
+                            firstListValue(item.allowedShipToNames),
+                            new ArrayList<>(item.allowedShipToIds),
+                            new ArrayList<>(item.allowedShipToCodes),
+                            new ArrayList<>(item.allowedShipToNames),
                             new ArrayList<>(item.materials),
-                            "BOM " + item.bomNo + " · " + item.productColor + " → Missing Ship To " + shipToLabel
+                            "BOM " + item.bomNo + " · " + item.productColor
+                                    + " → Select at least one Dedicated Ship To: " + shipToLabel,
+                            "ERROR",
+                            true,
+                            null, null, null, null,
+                            null, null, null, null,
+                            List.of(),
+                            null
                     );
                 })
                 .collect(Collectors.toCollection(ArrayList::new));
 
-        return new MprValidationResult(issues.isEmpty(), issues);
+        issues.addAll(masterDataWarnings);
+        boolean valid = issues.stream().noneMatch(MprValidationIssue::blocking);
+        return new MprValidationResult(valid, issues);
+    }
+
+    /**
+     * Validates the already-created MPR against current MAT Info before Excel export.
+     * MAT Info gaps are warnings only: export remains allowed after user acknowledgement.
+     */
+    public MprValidationResult validateCurrentMasterData(String orderId) {
+        SalesOrder order = orderService.get(orderId);
+        String buyerKey = BuyerKeys.legacyDefault(order.getBuyerKey());
+        MprDocument mpr = getByOrder(orderId);
+
+        List<MatInfo> activeMatInfos = loadActiveMatInfos(buyerKey);
+        Map<String, MatInfo> matByKey = buildMatInfoCache(activeMatInfos);
+        List<MprValidationIssue> issues = new ArrayList<>();
+        Set<String> warningKeys = new LinkedHashSet<>();
+
+        for (MprLine line : safeList(mpr.getLines())) {
+            if (line == null || blank(line.getMaterialType()) || blank(line.getMatUnit())) continue;
+            boolean missingCommercialData = blank(line.getCurrency())
+                    || blank(line.getShortNameSupplier())
+                    || line.getMatPriceWithoutTax() == null
+                    || line.getMatPriceWithoutTax().signum() == 0;
+            if (!missingCommercialData) continue;
+
+            String description = firstNonBlank(line.getMatFullDescription(), line.getPosition());
+            if (blank(description)) continue;
+            if (findMatInfo(matByKey, line) != null) continue;
+
+            MprValidationIssue warning = buildMprLineMatInfoWarning(line, activeMatInfos);
+            String warningKey = matInfoWarningKey(warning);
+            if (warning != null && warningKeys.add(warningKey)) issues.add(warning);
+        }
+        return new MprValidationResult(true, issues);
     }
 
     /**
@@ -294,6 +380,10 @@ public class MprService {
      * identical inside the same BOM/Product Color.
      */
     public MprDocument generate(String orderId, MprGenerateRequest request) {
+        Optional<MprDocument> current = mprRepository.findByOrderId(orderId);
+        current.ifPresent(this::normalizeLegacyStatus);
+        current.ifPresent(this::requireEditable);
+
         MprDocument candidate = build(orderId, request, false);
         if (safeList(candidate.getLines()).isEmpty()) {
             throw new OrderBomMprValidationException(
@@ -301,12 +391,12 @@ public class MprService {
             );
         }
 
-        Optional<MprDocument> current = mprRepository.findByOrderId(orderId);
         LocalDateTime now = LocalDateTime.now();
 
         if (current.isPresent()) {
             MprDocument entity = current.get();
             backfillMissingBomSourceFields(entity);
+            backfillMissingMatInfoFields(entity, BuyerKeys.legacyDefault(entity.getBuyerKey()));
             LineMergeResult merged = mergeLineSets(entity.getLines(), candidate.getLines());
             if (!merged.changed()) {
                 throw new OrderBomMprValidationException(
@@ -322,7 +412,7 @@ public class MprService {
             allSelections.addAll(newSelections);
 
             entity.setMprNo(firstNonBlank(entity.getMprNo(), candidate.getMprNo()));
-            entity.setStatus("DRAFT");
+            entity.setStatus(MprDocument.STATUS_IN_PROGRESS);
             entity.setPoQuantity(totalPoQuantity(allSelections));
             entity.setSampleQuantity(firstNonNull(entity.getSampleQuantity(), candidate.getSampleQuantity()));
             entity.setSelections(allSelections);
@@ -337,13 +427,14 @@ public class MprService {
             candidate.setUpdatedAt(now);
             candidate.setCreatedBy(RequestActor.current());
             candidate.setUpdatedBy(RequestActor.current());
-            candidate.setStatus("DRAFT");
+            candidate.setStatus(MprDocument.STATUS_IN_PROGRESS);
             orderLinesForDisplay(candidate);
             recalculateMprCalculations(candidate);
             candidate = mprRepository.save(candidate);
         }
 
-        orderService.markMprDraft(orderId);
+        decorateBomSourceState(candidate);
+        orderService.markMprInProgress(orderId);
         return candidate;
     }
 
@@ -353,16 +444,50 @@ public class MprService {
             throw new OrderBomMprValidationException("Cannot confirm an empty MPR");
         }
 
-        if (!"COMPLETED".equalsIgnoreCase(mpr.getStatus())) {
-            mpr.setStatus("COMPLETED");
+        if (!MprDocument.STATUS_COMPLETED.equalsIgnoreCase(mpr.getStatus())) {
+            requireCurrentBomSources(mpr);
+            mpr.setStatus(MprDocument.STATUS_COMPLETED);
             mpr.setUpdatedAt(LocalDateTime.now());
             mpr.setUpdatedBy(RequestActor.current());
             mpr = mprRepository.save(mpr);
         }
 
         // Keep Order and MPR completion status synchronized.
+        decorateBomSourceState(mpr);
         orderService.markMprCompleted(orderId);
         return mpr;
+    }
+
+    public MprDocument reopen(String orderId, String reason) {
+        MprDocument mpr = getByOrder(orderId);
+        if (!MprDocument.STATUS_COMPLETED.equalsIgnoreCase(mpr.getStatus())) {
+            throw new OrderBomMprValidationException("Only a completed MPR can be reopened");
+        }
+
+        String cleanReason = reason == null ? "" : reason.trim().replaceAll("\\s+", " ");
+        if (cleanReason.isBlank()) {
+            throw new OrderBomMprValidationException("Reopen reason is required");
+        }
+
+        LocalDateTime now = LocalDateTime.now();
+        String actor = RequestActor.current();
+        MprReopenHistory history = new MprReopenHistory();
+        history.setFromStatus(MprDocument.STATUS_COMPLETED);
+        history.setToStatus(MprDocument.STATUS_IN_PROGRESS);
+        history.setReason(cleanReason);
+        history.setReopenedBy(actor);
+        history.setReopenedAt(now);
+
+        List<MprReopenHistory> reopenHistory = new ArrayList<>(safeList(mpr.getReopenHistory()));
+        reopenHistory.add(history);
+        mpr.setReopenHistory(reopenHistory);
+        mpr.setStatus(MprDocument.STATUS_IN_PROGRESS);
+        mpr.setUpdatedAt(now);
+        mpr.setUpdatedBy(actor);
+        MprDocument saved = mprRepository.save(mpr);
+        decorateBomSourceState(saved);
+        orderService.markMprInProgress(orderId);
+        return saved;
     }
 
     private MprDocument mergeForPreview(MprDocument existing, MprDocument candidate) {
@@ -488,6 +613,9 @@ public class MprService {
             MprLine survivor = survivorByDuplicateKey.get(duplicateKey);
 
             if (survivor == null) {
+                // Also normalize rows that were already consolidated and saved by
+                // an older build where duplicate trace PO Qty values were summed.
+                refreshMergedQuantityAndShipTo(candidate);
                 refreshDuplicateMetadata(candidate);
                 survivorByDuplicateKey.put(duplicateKey, candidate);
                 continue;
@@ -587,8 +715,8 @@ public class MprService {
             return trace.getSourceBomDedupKey();
         }
         String color = firstNonBlank(
-                fallback == null ? null : fallback.getStyleColor(),
-                fallback == null ? null : fallback.getProductColorId()
+                fallback == null ? null : fallback.getProductColorId(),
+                fallback == null ? null : fallback.getStyleColor()
         );
         String sourceLineId = trace == null
                 ? (fallback == null ? null : fallback.getSourceLineId())
@@ -605,9 +733,30 @@ public class MprService {
                 + "|" + (hasText(sourceLineId) ? "" : mprDuplicateKey(fallback));
     }
 
+    private String sourceAnchorKey(MprSourceTrace trace, MprLine fallback) {
+        String color = firstNonBlank(
+                fallback == null ? null : fallback.getProductColorId(),
+                fallback == null ? null : fallback.getStyleColor()
+        );
+        Integer row = trace == null
+                ? (fallback == null ? null : fallback.getSourceRowNumber())
+                : trace.getSourceRowNumber();
+        String packing = firstNonBlank(
+                trace == null ? null : trace.getPackingName(),
+                fallback == null ? null : fallback.getPackingName(),
+                trace == null ? null : trace.getPackingId(),
+                fallback == null ? null : fallback.getPackingId()
+        );
+        return "ANCHOR|" + normalize(fallback == null ? null : fallback.getBomId())
+                + "|" + normalize(color)
+                + "|" + normalize(trace == null ? (fallback == null ? null : fallback.getSection()) : trace.getSection())
+                + "|" + normalize(packing)
+                + "|ROW:" + (row == null ? "" : row);
+    }
+
     private String mprDuplicateKey(MprLine line) {
-        String color = firstNonBlank(line == null ? null : line.getStyleColor(),
-                line == null ? null : line.getProductColorId());
+        String color = firstNonBlank(line == null ? null : line.getProductColorId(),
+                line == null ? null : line.getStyleColor());
         return normalize(line == null ? null : line.getBomId())
                 + "|" + normalize(color)
                 + "|" + mprMaterialIdentityKey(line)
@@ -651,7 +800,8 @@ public class MprService {
                 .collect(Collectors.joining(", "));
         line.setDuplicateNote(
                 "Merged/Đã gộp " + removed
-                        + " duplicate row(s) because the business material key + CONS. + NET are identical; PO Qty was summed."
+                        + " duplicate row(s) because the business material key + CONS. + NET are identical; "
+                        + "PO Qty was kept once (not summed again)."
                         + (sources.isBlank() ? "" : " Sources/Nguồn: " + sources)
         );
     }
@@ -669,9 +819,14 @@ public class MprService {
         if (line == null || traces == null || traces.isEmpty()) return;
         boolean hasQuantitySnapshot = traces.stream().filter(Objects::nonNull).anyMatch(trace -> trace.getPoQuantity() != null);
         if (!hasQuantitySnapshot) {
-            traces.get(0).setPoQuantity(safe(line.getPoQuantity()));
-            for (int i = 1; i < traces.size(); i++) {
-                if (traces.get(i) != null) traces.get(i).setPoQuantity(BigDecimal.ZERO);
+            // PO Qty on a generated material row is already the total quantity for
+            // the selected BOM + Product Color + Ship To scope. Duplicate BOM
+            // source rows repeat that same quantity; they are not additive
+            // contributions. Keep the same snapshot on every trace so removing
+            // one duplicate source later does not change the visible PO Qty.
+            BigDecimal snapshot = safe(line.getPoQuantity());
+            for (MprSourceTrace trace : traces) {
+                if (trace != null) trace.setPoQuantity(snapshot);
             }
         }
         for (MprSourceTrace trace : traces) {
@@ -686,12 +841,22 @@ public class MprService {
     private void refreshMergedQuantityAndShipTo(MprLine line) {
         if (line == null) return;
         ensureSourceTracesWithoutRefresh(line);
-        BigDecimal total = safeList(line.getSourceTraces()).stream()
+
+        // IMPORTANT BUSINESS RULE:
+        // appendForColor() already calculates PO Qty as the TOTAL selected Ship To
+        // quantity for this BOM + Product Color before one row is created for each
+        // Core/Packing material source. Therefore two duplicate material rows with
+        // PO Qty 400 represent the same 400 pcs order scope, not 400 + 400.
+        // Duplicate consolidation removes repeated material rows; it must never
+        // perform a second PO Qty aggregation.
+        BigDecimal effectivePoQuantity = safeList(line.getSourceTraces()).stream()
                 .filter(Objects::nonNull)
                 .map(MprSourceTrace::getPoQuantity)
+                .filter(Objects::nonNull)
+                .findFirst()
                 .map(this::safe)
-                .reduce(BigDecimal.ZERO, BigDecimal::add);
-        line.setPoQuantity(total);
+                .orElseGet(() -> safe(line.getPoQuantity()));
+        line.setPoQuantity(effectivePoQuantity);
 
         LinkedHashSet<String> ids = new LinkedHashSet<>();
         LinkedHashSet<String> labels = new LinkedHashSet<>();
@@ -706,9 +871,9 @@ public class MprService {
 
     /**
      * Keeps source-trace PO Qty snapshots consistent when Sales manually edits a
-     * merged MPR row or imports an edited workbook. Existing trace proportions are
-     * preserved where possible; the final trace absorbs rounding so the exact sum
-     * always equals the visible line PO Qty.
+     * merged MPR row. A source trace is provenance for a repeated BOM material row,
+     * not a partial PO Qty contribution, so every duplicate trace keeps the same
+     * visible line PO Qty.
      */
     private void redistributeTraceQuantityToLineTotal(MprLine line, BigDecimal requestedTotal) {
         if (line == null) return;
@@ -717,29 +882,8 @@ public class MprService {
                 .filter(Objects::nonNull)
                 .collect(Collectors.toCollection(ArrayList::new));
         BigDecimal newTotal = safe(requestedTotal);
-        if (traces.isEmpty()) {
-            line.setPoQuantity(newTotal);
-            return;
-        }
-
-        BigDecimal oldTotal = traces.stream()
-                .map(MprSourceTrace::getPoQuantity)
-                .map(this::safe)
-                .reduce(BigDecimal.ZERO, BigDecimal::add);
-        BigDecimal assigned = BigDecimal.ZERO;
-        for (int index = 0; index < traces.size(); index++) {
-            MprSourceTrace trace = traces.get(index);
-            BigDecimal nextQuantity;
-            if (index == traces.size() - 1) {
-                nextQuantity = newTotal.subtract(assigned);
-            } else if (oldTotal.signum() > 0) {
-                nextQuantity = newTotal.multiply(safe(trace.getPoQuantity()))
-                        .divide(oldTotal, 12, RoundingMode.HALF_UP);
-            } else {
-                nextQuantity = index == 0 ? newTotal : BigDecimal.ZERO;
-            }
-            trace.setPoQuantity(nextQuantity);
-            assigned = assigned.add(nextQuantity);
+        for (MprSourceTrace trace : traces) {
+            trace.setPoQuantity(newTotal);
         }
         line.setSourceTraces(traces);
         line.setPoQuantity(newTotal);
@@ -779,7 +923,8 @@ public class MprService {
             BomDocument bom,
             BomPacking packing,
             BomLine source,
-            String selectedColor
+            String selectedColor,
+            String productColorId
     ) {
         String sourceId = source == null ? null : source.getId();
         if (!hasText(sourceId)) {
@@ -796,7 +941,7 @@ public class MprService {
                     + "|" + normalize(source == null ? null : source.getConsumptionUnit());
         }
         return normalize(bom == null ? null : bom.getId())
-                + "|" + normalize(selectedColor)
+                + "|" + normalize(firstNonBlank(productColorId, selectedColor))
                 + "|" + (packing == null ? "core" : "packing")
                 + "|" + normalize(packing == null ? null : packing.getId())
                 + "|" + normalize(sourceId);
@@ -841,7 +986,9 @@ public class MprService {
 
     public void delete(String orderId) {
         MprDocument mpr = getByOrder(orderId);
+        requireEditable(mpr);
         mprRepository.delete(mpr);
+        orderService.markBomSubmitted(orderId);
     }
 
     /**
@@ -859,6 +1006,7 @@ public class MprService {
         }
 
         MprDocument mpr = getByOrder(orderId);
+        requireEditable(mpr);
         safeList(mpr.getSelections()).stream()
                 .filter(item -> item != null && batchId.equals(item.getBatchId()))
                 .findFirst()
@@ -907,6 +1055,7 @@ public class MprService {
 
         if (remainingLines.isEmpty()) {
             mprRepository.delete(mpr);
+            orderService.markBomSubmitted(orderId);
             return new MprBatchDeleteResult(true, removedSourceCount, 0, null);
         }
 
@@ -919,6 +1068,7 @@ public class MprService {
         mpr.setUpdatedBy(RequestActor.current());
 
         MprDocument saved = mprRepository.save(mpr);
+        decorateBomSourceState(saved);
         return new MprBatchDeleteResult(
                 false,
                 removedSourceCount,
@@ -933,32 +1083,87 @@ public class MprService {
      * unchanged physical source rows retain their saved MPR edits.
      */
     public MprDocument updateBatch(String orderId, String batchId, MprBatchUpdateRequest request) {
-        if (blank(batchId)) {
-            throw new OrderBomMprValidationException("MPR generation batch id is required");
-        }
         if (request == null) {
             throw new OrderBomMprValidationException("MPR batch data is required");
         }
-
         MprDocument mpr = getByOrder(orderId);
+        requireEditable(mpr);
+        rebuildBatchFromCurrentBom(orderId, mpr, batchId, request, false);
+        return saveRefreshedMpr(mpr);
+    }
+
+    /**
+     * Rebuilds every stale generation batch that uses one changed BOM. The
+     * saved Product Color / Packing / Ship To / PO Qty selection is reused.
+     * BOM-owned fields come from the current BOM; MPR-owned Sales/stock/vendor
+     * inputs are preserved for source rows that can still be matched.
+     */
+    public MprDocument refreshBomSource(String orderId, String bomId) {
+        if (blank(bomId)) {
+            throw new OrderBomMprValidationException("BOM id is required");
+        }
+        return refreshChangedBomSources(orderId, bomId);
+    }
+
+    /** Refreshes every BOM source currently marked stale in this MPR. */
+    public MprDocument refreshAllBomSources(String orderId) {
+        return refreshChangedBomSources(orderId, null);
+    }
+
+    private MprDocument refreshChangedBomSources(String orderId, String onlyBomId) {
+        MprDocument mpr = getByOrder(orderId);
+        requireEditable(mpr);
+        decorateBomSourceState(mpr);
+
+        List<String> staleBatchIds = safeList(mpr.getSelections()).stream()
+                .filter(Objects::nonNull)
+                .filter(MprSelection::isBomSourceChanged)
+                .filter(item -> !item.isBomSourceMissing())
+                .filter(item -> blank(onlyBomId) || Objects.equals(onlyBomId, item.getBomId()))
+                .map(MprSelection::getBatchId)
+                .filter(this::hasText)
+                .distinct()
+                .collect(Collectors.toCollection(ArrayList::new));
+
+        if (staleBatchIds.isEmpty()) {
+            return mpr;
+        }
+
+        for (String batchId : staleBatchIds) {
+            rebuildBatchFromCurrentBom(orderId, mpr, batchId, null, true);
+        }
+        return saveRefreshedMpr(mpr);
+    }
+
+    private void rebuildBatchFromCurrentBom(
+            String orderId,
+            MprDocument mpr,
+            String batchId,
+            MprBatchUpdateRequest request,
+            boolean sourceRefresh
+    ) {
+        if (blank(batchId)) {
+            throw new OrderBomMprValidationException("MPR generation batch id is required");
+        }
+
         MprSelection currentBatch = safeList(mpr.getSelections()).stream()
                 .filter(item -> item != null && batchId.equals(item.getBatchId()))
                 .findFirst()
                 .orElseThrow(() -> new OrderBomMprNotFoundException("MPR generation batch not found"));
 
-        List<String> colors = request.colors() == null
+        List<String> colors = request == null || request.colors() == null
                 ? new ArrayList<>(safeList(currentBatch.getColors()))
                 : new ArrayList<>(safeList(request.colors()));
-        List<String> packingIds = request.packingIds() == null
+        List<String> packingIds = request == null || request.packingIds() == null
                 ? new ArrayList<>(safeList(currentBatch.getPackingIds()))
                 : new ArrayList<>(safeList(request.packingIds()));
-        Map<String, BigDecimal> poQtyByColor = request.poQtyByColor() == null
+        Map<String, BigDecimal> poQtyByColor = request == null || request.poQtyByColor() == null
                 ? new LinkedHashMap<>(currentBatch.getPoQtyByColor() == null ? Map.of() : currentBatch.getPoQtyByColor())
                 : new LinkedHashMap<>(request.poQtyByColor());
-        Map<String, List<String>> shipToIdsByColor = request.shipToIdsByColor() == null
+        Map<String, List<String>> shipToIdsByColor = request == null || request.shipToIdsByColor() == null
                 ? copyStringListMap(currentBatch.getShipToIdsByColor())
                 : copyStringListMap(request.shipToIdsByColor());
-        Map<String, Map<String, BigDecimal>> shipToQtyByColor = request.shipToQtyByColor() == null
+        Map<String, Map<String, BigDecimal>> shipToQtyByColor = request == null || request.shipToQtyByColor() == null
                 ? copyNestedQuantityMap(currentBatch.getShipToQtyByColor())
                 : copyNestedQuantityMap(request.shipToQtyByColor());
 
@@ -993,13 +1198,14 @@ public class MprService {
         replacementBatch.setCreatedBy(currentBatch.getCreatedBy());
         remapGenerationBatch(regenerated.getLines(), temporaryBatchId, batchId);
 
-        // Preserve user-entered values for physical source rows that remain in
-        // the edited Product Color/Packing selection. Newly added source rows
-        // keep the fresh BOM/Master Data snapshot.
         Map<String, MprLine> editableSnapshotBySource = editableSnapshotByBatchSource(
                 mpr.getLines(), batchId
         );
-        preserveExistingLineEdits(regenerated.getLines(), editableSnapshotBySource);
+        if (sourceRefresh) {
+            preserveMprOwnedLineEdits(regenerated.getLines(), editableSnapshotBySource);
+        } else {
+            preserveExistingLineEdits(regenerated.getLines(), editableSnapshotBySource);
+        }
 
         // Remove the old batch traces first, then merge the regenerated batch
         // into the remaining MPR. Other saved batches are never regenerated.
@@ -1007,7 +1213,9 @@ public class MprService {
         LineMergeResult merged = mergeLineSets(remainingLines, regenerated.getLines());
         if (!merged.acceptedBatchIds().contains(batchId)) {
             throw new OrderBomMprValidationException(
-                    "The edited Product Color / Packing selection is already fully represented by another MPR batch"
+                    sourceRefresh
+                            ? "The refreshed BOM sources are already fully represented by another MPR batch"
+                            : "The edited Product Color / Packing selection is already fully represented by another MPR batch"
             );
         }
 
@@ -1028,9 +1236,14 @@ public class MprService {
         mpr.setPoQuantity(totalPoQuantity(selections));
         orderLinesForDisplay(mpr);
         recalculateMprCalculations(mpr);
+    }
+
+    private MprDocument saveRefreshedMpr(MprDocument mpr) {
         mpr.setUpdatedAt(LocalDateTime.now());
         mpr.setUpdatedBy(RequestActor.current());
-        return mprRepository.save(mpr);
+        MprDocument saved = mprRepository.save(mpr);
+        decorateBomSourceState(saved);
+        return saved;
     }
 
     private Map<String, List<String>> copyStringListMap(Map<String, List<String>> source) {
@@ -1079,6 +1292,7 @@ public class MprService {
             for (MprSourceTrace trace : safeList(line.getSourceTraces())) {
                 if (trace != null && batchId.equals(trace.getGenerationBatchId())) {
                     result.putIfAbsent(sourceKey(trace, line), line);
+                    result.putIfAbsent(sourceAnchorKey(trace, line), line);
                 }
             }
         }
@@ -1095,11 +1309,51 @@ public class MprService {
             MprLine saved = null;
             for (MprSourceTrace trace : safeList(target.getSourceTraces())) {
                 saved = editableSnapshotBySource.get(sourceKey(trace, target));
+                if (saved == null) saved = editableSnapshotBySource.get(sourceAnchorKey(trace, target));
                 if (saved != null) break;
             }
             if (saved == null) continue;
             copyEditableMprValues(saved, target);
         }
+    }
+
+    private void preserveMprOwnedLineEdits(
+            List<MprLine> regeneratedLines,
+            Map<String, MprLine> editableSnapshotBySource
+    ) {
+        for (MprLine target : safeList(regeneratedLines)) {
+            if (target == null) continue;
+            ensureSourceTracesWithoutRefresh(target);
+            MprLine saved = null;
+            for (MprSourceTrace trace : safeList(target.getSourceTraces())) {
+                saved = editableSnapshotBySource.get(sourceKey(trace, target));
+                if (saved == null) saved = editableSnapshotBySource.get(sourceAnchorKey(trace, target));
+                if (saved != null) break;
+            }
+            if (saved == null) continue;
+            copyMprOwnedValues(saved, target);
+        }
+    }
+
+    /**
+     * Values owned by Sales/MPR are retained during an Update from BOM.
+     * BOM-owned identity/consumption fields intentionally remain from the newly
+     * regenerated source so users really receive the BOM change.
+     */
+    private void copyMprOwnedValues(MprLine source, MprLine target) {
+        target.setSalesComment(source.getSalesComment());
+        target.setSampleQuantity(defaultZero(source.getSampleQuantity()));
+        target.setMcdStock(defaultZero(source.getMcdStock()));
+        target.setCmcdStock(defaultZero(source.getCmcdStock()));
+        target.setNonSapStockQuantity(defaultZero(source.getNonSapStockQuantity()));
+        target.setCurrency(source.getCurrency());
+        target.setMatPriceWithoutTax(defaultZero(source.getMatPriceWithoutTax()));
+        target.setShortNameSupplier(source.getShortNameSupplier());
+        target.setVendorCode(source.getVendorCode());
+        target.setVendorName(source.getVendorName());
+        target.setMatCharger(source.getMatCharger());
+        target.setMatDueDate(source.getMatDueDate());
+        target.setBomReviews(new ArrayList<>(safeList(source.getBomReviews())));
     }
 
     private void copyEditableMprValues(MprLine source, MprLine target) {
@@ -1160,6 +1414,7 @@ public class MprService {
      */
     public MprDocument importExcel(String orderId, MultipartFile file) {
         MprDocument mpr = getByOrder(orderId);
+        requireEditable(mpr);
         List<MprExcelImportService.ImportedMprRow> importedRows = excelImportService.parse(file);
         List<MprLine> lines = new ArrayList<>(safeList(mpr.getLines()));
 
@@ -1212,7 +1467,9 @@ public class MprService {
         recalculateMprCalculations(mpr);
         mpr.setUpdatedAt(LocalDateTime.now());
         mpr.setUpdatedBy(RequestActor.current());
-        return mprRepository.save(mpr);
+        MprDocument saved = mprRepository.save(mpr);
+        decorateBomSourceState(saved);
+        return saved;
     }
 
     /**
@@ -1260,6 +1517,7 @@ public class MprService {
         }
 
         MprDocument mpr = getByOrder(orderId);
+        requireEditable(mpr);
         MprLine line = safeList(mpr.getLines()).stream()
                 .filter(item -> item != null && lineId.equals(item.getId()))
                 .findFirst()
@@ -1275,7 +1533,9 @@ public class MprService {
         recalculateMprCalculations(mpr);
         mpr.setUpdatedAt(LocalDateTime.now());
         mpr.setUpdatedBy(RequestActor.current());
-        return mprRepository.save(mpr);
+        MprDocument saved = mprRepository.save(mpr);
+        decorateBomSourceState(saved);
+        return saved;
     }
 
     /** Deletes only one MPR item and keeps the other MPR rows unchanged. */
@@ -1285,10 +1545,17 @@ public class MprService {
         }
 
         MprDocument mpr = getByOrder(orderId);
+        requireEditable(mpr);
         List<MprLine> remaining = new ArrayList<>(safeList(mpr.getLines()));
         boolean removed = remaining.removeIf(item -> item != null && lineId.equals(item.getId()));
         if (!removed) {
             throw new OrderBomMprNotFoundException("MPR item not found");
+        }
+
+        if (remaining.isEmpty()) {
+            mprRepository.delete(mpr);
+            orderService.markBomSubmitted(orderId);
+            return null;
         }
 
         mpr.setLines(consolidateFinalLines(remaining));
@@ -1298,7 +1565,9 @@ public class MprService {
         recalculateMprCalculations(mpr);
         mpr.setUpdatedAt(LocalDateTime.now());
         mpr.setUpdatedBy(RequestActor.current());
-        return mprRepository.save(mpr);
+        MprDocument saved = mprRepository.save(mpr);
+        decorateBomSourceState(saved);
+        return saved;
     }
 
     /**
@@ -1482,30 +1751,38 @@ public class MprService {
                 throw new OrderBomMprValidationException("Only submitted BOM can be used to create MPR: " + bom.getBomNo());
             }
 
-            List<String> colors = normalizeSelectionColors(selectionRequest.colors(), bom);
-            if (colors.isEmpty()) {
+            List<BomProductColor> selectedProductColors = normalizeSelectionProductColors(selectionRequest.colors(), bom);
+            if (selectedProductColors.isEmpty()) {
                 throw new OrderBomMprValidationException("Select at least one Product Color for BOM " + bom.getBomNo());
             }
+
+            List<String> productColorIds = selectedProductColors.stream()
+                    .map(BomProductColor::getId)
+                    .map(this::trim)
+                    .filter(this::hasText)
+                    .collect(Collectors.toCollection(ArrayList::new));
 
             Map<String, BigDecimal> poQtyByColor = new LinkedHashMap<>();
             Map<String, List<String>> shipToIdsByColor = new LinkedHashMap<>();
             Map<String, Map<String, BigDecimal>> shipToQtyByColor = new LinkedHashMap<>();
             Map<String, String> shipToByColor = new LinkedHashMap<>();
-            for (String colorName : colors) {
-                List<String> shipToIds = shipToIdsForColor(selectionRequest, bom, colorName, shipToById);
+            for (BomProductColor productColor : selectedProductColors) {
+                String productColorId = trim(productColor.getId());
+                String colorName = trim(productColor.getColorName());
+                List<String> shipToIds = shipToIdsForColor(selectionRequest, bom, productColor, shipToById);
                 Map<String, BigDecimal> shipToQty = shipToQuantitiesForColor(
-                        selectionRequest, bom, colorName, shipToIds, request.poQuantity()
+                        selectionRequest, bom, productColor, shipToIds, request.poQuantity()
                 );
                 BigDecimal poQuantity = shipToQty.isEmpty()
-                        ? poQuantityForColor(selectionRequest, bom, colorName, request.poQuantity())
+                        ? poQuantityForColor(selectionRequest, bom, productColor, request.poQuantity())
                         : shipToQty.values().stream().map(this::safe).reduce(BigDecimal.ZERO, BigDecimal::add);
                 if (poQuantity.signum() < 0) {
-                    throw new OrderBomMprValidationException("PO Qty cannot be negative for Product Color " + colorName);
+                    throw new OrderBomMprValidationException("PO Qty cannot be negative for Product Color " + productColorLabel(productColor));
                 }
-                poQtyByColor.put(colorName, poQuantity);
-                shipToIdsByColor.put(colorName, shipToIds);
-                shipToQtyByColor.put(colorName, shipToQty);
-                shipToByColor.put(colorName, shipToDisplay(shipToIds, shipToById));
+                poQtyByColor.put(productColorId, poQuantity);
+                shipToIdsByColor.put(productColorId, shipToIds);
+                shipToQtyByColor.put(productColorId, shipToQty);
+                shipToByColor.put(productColorId, shipToDisplay(shipToIds, shipToById));
                 totalPoQuantity = totalPoQuantity.add(poQuantity);
             }
 
@@ -1516,7 +1793,9 @@ public class MprService {
             selection.setBomId(bom.getId());
             selection.setBomNo(bom.getBomNo());
             selection.setBomName(bom.getBomName());
-            selection.setColors(colors);
+            selection.setBomSourceRevision(BomMprSourceRevision.current(bom));
+            selection.setBomSourceChangedAt(bom.getMprSourceChangedAt());
+            selection.setColors(productColorIds);
             selection.setPackingIds(selectionRequest.packingIds() == null ? new ArrayList<>() : new ArrayList<>(selectionRequest.packingIds()));
             selection.setPoQtyByColor(poQtyByColor);
             selection.setShipToIdsByColor(shipToIdsByColor);
@@ -1554,11 +1833,11 @@ public class MprService {
                 }
                 selectedPackings.add(packing);
             }
-            Map<String, String> productColorIdByName = productColorIdsByName(bom);
-
-            // Color is the outer loop so every color owns one complete, consecutive block.
-            for (String colorName : colors) {
-                String productColorId = productColorIdByName.getOrDefault(normalize(colorName), "");
+            // Product Color is the outer loop so every exact 4-field Product Color
+            // identity owns one complete, consecutive block.
+            for (BomProductColor productColor : selectedProductColors) {
+                String productColorId = trim(productColor.getId());
+                String colorName = trim(productColor.getColorName());
                 List<MprLine> rowsForColor = new ArrayList<>();
 
                 // 1) Copy every original BOM row without Packing into this color.
@@ -1566,9 +1845,9 @@ public class MprService {
                     appendForColor(
                             rowsForColor,
                             bom, null, coreLine, "CORE", colorName, productColorId,
-                            poQtyByColor.get(colorName), sampleQuantity, selection.getBatchId(),
-                            shipToIdsByColor.get(colorName), shipToByColor.get(colorName),
-                            shipToQtyByColor.get(colorName), dedicatedShipToByMaterialKey, shipToById,
+                            poQtyByColor.get(productColorId), sampleQuantity, selection.getBatchId(),
+                            shipToIdsByColor.get(productColorId), shipToByColor.get(productColorId),
+                            shipToQtyByColor.get(productColorId), dedicatedShipToByMaterialKey, shipToById,
                             matByKey, lossByKey, vendorByKey
                     );
                 }
@@ -1579,9 +1858,9 @@ public class MprService {
                         appendForColor(
                                 rowsForColor,
                                 bom, packing, packingLine, "PACKING", colorName, productColorId,
-                                poQtyByColor.get(colorName), sampleQuantity, selection.getBatchId(),
-                                shipToIdsByColor.get(colorName), shipToByColor.get(colorName),
-                                shipToQtyByColor.get(colorName), dedicatedShipToByMaterialKey, shipToById,
+                                poQtyByColor.get(productColorId), sampleQuantity, selection.getBatchId(),
+                                shipToIdsByColor.get(productColorId), shipToByColor.get(productColorId),
+                                shipToQtyByColor.get(productColorId), dedicatedShipToByMaterialKey, shipToById,
                                 matByKey, lossByKey, vendorByKey
                         );
                     }
@@ -1599,7 +1878,7 @@ public class MprService {
         mpr.setSelections(selections);
         LineMergeResult consolidated = mergeLineSets(List.of(), generated);
         mpr.setLines(consolidated.lines());
-        mpr.setStatus("DRAFT");
+        mpr.setStatus(MprDocument.STATUS_IN_PROGRESS);
         orderLinesForDisplay(mpr);
         if (calculate) recalculateMprCalculations(mpr);
         return mpr;
@@ -1645,24 +1924,31 @@ public class MprService {
         String effectiveShipTo = trim(shipTo);
         BigDecimal linePoQuantity = safe(poQuantity);
         if (dedicatedMapping != null) {
-            String dedicatedId = trim(dedicatedMapping.getShipToId());
-            if (!effectiveShipToIds.contains(dedicatedId)) {
+            String materialLabel = firstNonBlank(resolvedSapCode, description, materialType);
+            List<String> dedicatedIds = dedicatedShipToIds(dedicatedMapping, shipToById, materialLabel);
+            effectiveShipToIds = effectiveShipToIds.stream()
+                    .filter(dedicatedIds::contains)
+                    .collect(Collectors.toCollection(ArrayList::new));
+            if (effectiveShipToIds.isEmpty()) {
                 throw new OrderBomMprValidationException(
-                        "Material " + firstNonBlank(resolvedSapCode, description, materialType)
-                                + " is dedicated to Ship To " + firstNonBlank(dedicatedMapping.getShipToName(), dedicatedMapping.getShipToCode(), dedicatedId)
-                                + ", but that Ship To was not selected for Product Color " + selectedColor
+                        "Material " + materialLabel
+                                + " is dedicated to " + dedicatedShipToLabel(dedicatedIds, shipToById)
+                                + ", but none of those Ship To values was selected for Product Color " + selectedColor
                 );
             }
-            BigDecimal dedicatedQty = shipToQtyById == null ? null : shipToQtyById.get(dedicatedId);
-            if (dedicatedQty == null) {
-                if (effectiveShipToIds.size() == 1) dedicatedQty = safe(poQuantity);
-                else throw new OrderBomMprValidationException(
-                        "Enter separate PO Qty for every selected Ship To before generating dedicated material "
-                                + firstNonBlank(resolvedSapCode, description, materialType)
-                );
+
+            BigDecimal dedicatedTotal = BigDecimal.ZERO;
+            for (String dedicatedId : effectiveShipToIds) {
+                BigDecimal dedicatedQty = shipToQtyById == null ? null : shipToQtyById.get(dedicatedId);
+                if (dedicatedQty == null) {
+                    if (safeList(shipToIds).size() == 1) dedicatedQty = safe(poQuantity);
+                    else throw new OrderBomMprValidationException(
+                            "Enter separate PO Qty for every selected Ship To before generating dedicated material " + materialLabel
+                    );
+                }
+                dedicatedTotal = dedicatedTotal.add(safe(dedicatedQty));
             }
-            linePoQuantity = safe(dedicatedQty);
-            effectiveShipToIds = new ArrayList<>(List.of(dedicatedId));
+            linePoQuantity = dedicatedTotal;
             effectiveShipTo = shipToDisplay(effectiveShipToIds, shipToById);
         }
         BigDecimal yield = source.getConsumptionNet();
@@ -1686,7 +1972,7 @@ public class MprService {
         line.setGenerationBatchId(generationBatchId);
         // Persist source identity only to prevent re-adding the exact same
         // Core/Packing source row in a later Add To MPR action.
-        line.setSourceBomDedupKey(bomSourceSelectionKey(bom, packing, source, selectedColor));
+        line.setSourceBomDedupKey(bomSourceSelectionKey(bom, packing, source, selectedColor, productColorId));
         line.setSourceDetailConsumption(source.getDetailConsumption());
 
         MprSourceTrace trace = new MprSourceTrace();
@@ -1839,6 +2125,99 @@ public class MprService {
         }
     }
 
+
+    /**
+     * MAT_INFO is matched when a batch is generated, but an existing editable
+     * MPR can still have blank commercial fields if MAT_INFO was added later.
+     * Fill only missing values; never overwrite saved Sales/MPR values.
+     */
+    private void backfillMissingMatInfoFields(MprDocument mpr, String buyerKey) {
+        if (mpr == null || safeList(mpr.getLines()).isEmpty()) return;
+
+        String normalizedBuyer = BuyerKeys.legacyDefault(buyerKey);
+        Map<String, MatInfo> matByKey = buildMatInfoCache(normalizedBuyer);
+        if (matByKey.isEmpty()) return;
+
+        Map<String, VendorCode> vendorByKey = vendorCodeRepository.findByBuyerKey(normalizedBuyer).stream()
+                .filter(Objects::nonNull)
+                .filter(item -> hasText(item.getShortNameSupplier()))
+                .collect(Collectors.toMap(
+                        item -> normalize(item.getShortNameSupplier()),
+                        item -> item,
+                        (a, b) -> a,
+                        LinkedHashMap::new
+                ));
+
+        for (MprLine line : safeList(mpr.getLines())) {
+            if (line == null) continue;
+
+            boolean missingCurrency = blank(line.getCurrency());
+            boolean missingSupplier = blank(line.getShortNameSupplier());
+            boolean missingPrice = line.getMatPriceWithoutTax() == null
+                    || line.getMatPriceWithoutTax().signum() == 0;
+
+            if (missingCurrency || missingSupplier || missingPrice) {
+                MatInfo mat = findMatInfo(matByKey, line);
+                if (mat != null) {
+                    if (missingCurrency && hasText(mat.getCurrency())) {
+                        line.setCurrency(normalizeCurrency(mat.getCurrency()));
+                    }
+                    if (missingPrice && mat.getMatPriceWithoutTax() != null) {
+                        line.setMatPriceWithoutTax(mat.getMatPriceWithoutTax());
+                    }
+                    if (missingSupplier && hasText(mat.getShortNameSupplier())) {
+                        line.setShortNameSupplier(trim(mat.getShortNameSupplier()));
+                    }
+                }
+            }
+
+            backfillMissingVendorFields(line, vendorByKey);
+        }
+    }
+
+    /**
+     * MPR-line version of the same MAT_INFO lookup used during generation:
+     * Material Type + Description/Position + Material Color.
+     */
+    private MatInfo findMatInfo(Map<String, MatInfo> cache, MprLine line) {
+        if (cache == null || cache.isEmpty() || line == null) return null;
+
+        String materialType = line.getMaterialType();
+        LinkedHashSet<String> descriptions = new LinkedHashSet<>();
+        descriptions.add(trim(line.getMatFullDescription()));
+        descriptions.add(trim(line.getPosition()));
+
+        for (String description : descriptions) {
+            if (blank(description)) continue;
+            MatInfo exact = cache.get(materialKey(
+                    materialType,
+                    description,
+                    line.getMatColor(),
+                    line.getMatUnit()
+            ));
+            if (exact != null) return exact;
+        }
+        return null;
+    }
+
+    private void backfillMissingVendorFields(MprLine line, Map<String, VendorCode> vendorByKey) {
+        if (line == null || vendorByKey == null || vendorByKey.isEmpty()) return;
+        if (!hasText(line.getShortNameSupplier())) return;
+
+        VendorCode vendor = vendorByKey.get(normalize(line.getShortNameSupplier()));
+        if (vendor == null) return;
+
+        if (blank(line.getVendorCode())) {
+            line.setVendorCode(vendorCodeText(vendor.getVendorCode()));
+        }
+        if (blank(line.getVendorName())) {
+            line.setVendorName(vendor.getVendorName());
+        }
+        if (blank(line.getMatCharger())) {
+            line.setMatCharger(vendor.getMatCharger());
+        }
+    }
+
     private BomLine findMprSourceLine(BomDocument bom, MprLine line) {
         if (bom == null || line == null) return null;
         List<BomLine> candidates = new ArrayList<>();
@@ -1873,24 +2252,205 @@ public class MprService {
         return null;
     }
 
+    private List<MatInfo> loadActiveMatInfos(String buyerKey) {
+        return matInfoRepository.findByBuyerKey(BuyerKeys.legacyDefault(buyerKey)).stream()
+                .filter(Objects::nonNull)
+                .filter(MatInfo::isActive)
+                .collect(Collectors.toCollection(ArrayList::new));
+    }
+
     private Map<String, MatInfo> buildMatInfoCache(String buyerKey) {
+        return buildMatInfoCache(loadActiveMatInfos(buyerKey));
+    }
+
+    private Map<String, MatInfo> buildMatInfoCache(List<MatInfo> matInfos) {
         Map<String, MatInfo> result = new LinkedHashMap<>();
-        for (MatInfo item : matInfoRepository.findByBuyerKey(buyerKey)) {
+        for (MatInfo item : safeList(matInfos)) {
             if (item == null) continue;
-            String fullKey = materialKey(item.getMaterialType(), item.getMatFullDescription(), item.getMatColor());
+            String fullKey = materialKey(
+                    item.getMaterialType(),
+                    item.getMatFullDescription(),
+                    item.getMatColor(),
+                    item.getMatUnit()
+            );
             result.putIfAbsent(fullKey, item);
-            result.putIfAbsent(materialKey(item.getMaterialType(), item.getMatFullDescription(), ""), item);
         }
         return result;
     }
 
+    private MprValidationIssue buildBomMatInfoWarning(
+            BomDocument bom,
+            BomProductColor productColor,
+            BomLine source,
+            String materialType,
+            String description,
+            String materialColor,
+            String materialUnit,
+            List<MatInfo> matInfos
+    ) {
+        if (bom == null || source == null) return null;
+        MatInfo possible = findPossibleMatInfo(matInfos, materialType, description, materialColor, materialUnit);
+        List<String> mismatchFields = matInfoMismatchFields(possible, materialType, description, materialColor, materialUnit);
+        String code = possible == null ? "MAT_INFO_NOT_FOUND" : "MAT_INFO_MISMATCH";
+        String materialLabel = firstNonBlank(source.getSapCode(), description, materialType);
+        String productColorDisplay = productColor == null ? "" : productColorLabel(productColor);
+        String message = possible == null
+                ? "No exact MAT Info match. Check Material Type, MAT Full Description, MAT Color and MAT Unit."
+                : "Possible MAT Info found, but " + String.join(", ", mismatchFields)
+                        + " does not match. Review Master Data before continuing.";
+
+        return new MprValidationIssue(
+                code,
+                bom.getId(),
+                trim(bom.getBomNo()),
+                trim(bom.getBomName()),
+                productColor == null ? "" : trim(productColor.getId()),
+                productColorDisplay,
+                null, null, null,
+                List.of(), List.of(), List.of(),
+                hasText(materialLabel) ? List.of(materialLabel) : List.of(),
+                message,
+                "WARNING",
+                false,
+                trim(materialType),
+                trim(description),
+                trim(materialColor),
+                trim(materialUnit),
+                possible == null ? null : trim(possible.getMaterialType()),
+                possible == null ? null : trim(possible.getMatFullDescription()),
+                possible == null ? null : trim(possible.getMatColor()),
+                possible == null ? null : trim(possible.getMatUnit()),
+                mismatchFields,
+                source.getSourceRowNumber()
+        );
+    }
+
+    private MprValidationIssue buildMprLineMatInfoWarning(MprLine line, List<MatInfo> matInfos) {
+        if (line == null) return null;
+        String description = firstNonBlank(line.getMatFullDescription(), line.getPosition());
+        MatInfo possible = findPossibleMatInfo(
+                matInfos, line.getMaterialType(), description, line.getMatColor(), line.getMatUnit()
+        );
+        List<String> mismatchFields = matInfoMismatchFields(
+                possible, line.getMaterialType(), description, line.getMatColor(), line.getMatUnit()
+        );
+        String code = possible == null ? "MAT_INFO_NOT_FOUND" : "MAT_INFO_MISMATCH";
+        String materialLabel = firstNonBlank(line.getSapCode(), description, line.getMaterialType());
+        String message = possible == null
+                ? "No exact MAT Info match. Export may contain blank Currency, Price or Supplier."
+                : "Possible MAT Info found, but " + String.join(", ", mismatchFields)
+                        + " does not match. Export may contain incorrect or missing commercial data.";
+
+        return new MprValidationIssue(
+                code,
+                line.getBomId(),
+                trim(line.getBomNo()),
+                trim(line.getBomName()),
+                trim(line.getProductColorId()),
+                trim(line.getStyleColor()),
+                null, null, null,
+                List.of(), List.of(), List.of(),
+                hasText(materialLabel) ? List.of(materialLabel) : List.of(),
+                message,
+                "WARNING",
+                false,
+                trim(line.getMaterialType()),
+                trim(description),
+                trim(line.getMatColor()),
+                trim(line.getMatUnit()),
+                possible == null ? null : trim(possible.getMaterialType()),
+                possible == null ? null : trim(possible.getMatFullDescription()),
+                possible == null ? null : trim(possible.getMatColor()),
+                possible == null ? null : trim(possible.getMatUnit()),
+                mismatchFields,
+                line.getSourceRowNumber()
+        );
+    }
+
     /**
-     * First try exact BOM Material Type + Description + Color, then fall back
-     * to the same Material Type + Description without a color. A missing row
-     * never removes the material from the MPR.
+     * Suggest a MAT Info row only when at least three of the four identity fields
+     * match. This is diagnostic only; it is never used to populate MPR values.
+     */
+    private MatInfo findPossibleMatInfo(
+            List<MatInfo> matInfos,
+            String materialType,
+            String description,
+            String materialColor,
+            String materialUnit
+    ) {
+        MatInfo best = null;
+        int bestScore = 0;
+        for (MatInfo item : safeList(matInfos)) {
+            if (item == null) continue;
+            int score = matInfoMatchScore(item, materialType, description, materialColor, materialUnit);
+            if (score > bestScore) {
+                best = item;
+                bestScore = score;
+            }
+        }
+        return bestScore >= 3 ? best : null;
+    }
+
+    private int matInfoMatchScore(
+            MatInfo item,
+            String materialType,
+            String description,
+            String materialColor,
+            String materialUnit
+    ) {
+        if (item == null) return 0;
+        int score = 0;
+        if (materialTypeMatchKey(materialType).equals(materialTypeMatchKey(item.getMaterialType()))) score++;
+        if (materialTextMatchKey(description).equals(materialTextMatchKey(item.getMatFullDescription()))) score++;
+        if (materialTextMatchKey(materialColor).equals(materialTextMatchKey(item.getMatColor()))) score++;
+        if (materialTextMatchKey(materialUnit).equals(materialTextMatchKey(item.getMatUnit()))) score++;
+        return score;
+    }
+
+    private List<String> matInfoMismatchFields(
+            MatInfo possible,
+            String materialType,
+            String description,
+            String materialColor,
+            String materialUnit
+    ) {
+        if (possible == null) return List.of("MAT Info record");
+        List<String> fields = new ArrayList<>();
+        if (!materialTypeMatchKey(materialType).equals(materialTypeMatchKey(possible.getMaterialType()))) {
+            fields.add("Material Type");
+        }
+        if (!materialTextMatchKey(description).equals(materialTextMatchKey(possible.getMatFullDescription()))) {
+            fields.add("MAT Full Description");
+        }
+        if (!materialTextMatchKey(materialColor).equals(materialTextMatchKey(possible.getMatColor()))) {
+            fields.add("MAT Color");
+        }
+        if (!materialTextMatchKey(materialUnit).equals(materialTextMatchKey(possible.getMatUnit()))) {
+            fields.add("MAT Unit");
+        }
+        return fields.isEmpty() ? List.of("MAT Info identity") : fields;
+    }
+
+    private String matInfoWarningKey(MprValidationIssue issue) {
+        if (issue == null) return "";
+        return normalize(issue.bomId())
+                + "|" + normalize(issue.productColorId())
+                + "|" + materialTypeMatchKey(issue.materialType())
+                + "|" + materialTextMatchKey(issue.matFullDescription())
+                + "|" + materialTextMatchKey(issue.matColor())
+                + "|" + materialTextMatchKey(issue.matUnit());
+    }
+
+    /**
+     * MAT_INFO must match the actual material identity exactly:
+     * Material Type + Description + MAT Color + MAT Unit.
+     *
+     * Do not fall back by dropping color: one description can legitimately have
+     * NATURAL, WEATHERED OAK, etc. with different prices/currencies/suppliers.
      */
     private MatInfo findMatInfo(Map<String, MatInfo> cache, BomLine line, String materialColor) {
         String materialType = line == null ? "" : line.getMaterialType();
+        String materialUnit = line == null ? "" : firstNonBlank(line.getConsumptionUnit(), line.getCostingUnit());
         LinkedHashSet<String> descriptions = new LinkedHashSet<>();
         descriptions.add(bomMaterialDescription(line));
         if (line != null) {
@@ -1901,13 +2461,8 @@ public class MprService {
 
         for (String description : descriptions) {
             if (blank(description)) continue;
-            MatInfo exact = cache.get(materialKey(materialType, description, materialColor));
+            MatInfo exact = cache.get(materialKey(materialType, description, materialColor, materialUnit));
             if (exact != null) return exact;
-        }
-        for (String description : descriptions) {
-            if (blank(description)) continue;
-            MatInfo withoutColor = cache.get(materialKey(materialType, description, ""));
-            if (withoutColor != null) return withoutColor;
         }
         return null;
     }
@@ -1923,79 +2478,177 @@ public class MprService {
     }
 
     /**
-     * The MPR API accepts Product Color ids and names. The MPR stores readable
-     * Color Names while keeping Product Color Id internally for traceability.
+     * One BOM Product Color is a business identity made from exactly four fields:
+     * Product/Style Color + Pattern Number + Season + Style Number.
+     *
+     * The API persists the stable Product Color id for that four-field identity.
+     * A readable color name is accepted only for legacy payloads when that name is
+     * unique inside the BOM. If two Product Colors are both NATURAL, a name-only
+     * request is ambiguous and is rejected instead of silently selecting the first.
      */
-    private List<String> normalizeSelectionColors(List<String> requestColors, BomDocument bom) {
-        LinkedHashSet<String> colors = new LinkedHashSet<>();
-        if (requestColors != null) {
-            for (String requestColor : requestColors) {
-                if (blank(requestColor)) continue;
-                String colorName = resolveProductColorName(bom, requestColor);
-                if (blank(colorName)) {
-                    throw new OrderBomMprValidationException("Selected Product Color does not belong to BOM " + bom.getBomNo());
+    private List<BomProductColor> normalizeSelectionProductColors(
+            List<String> requestedProductColors,
+            BomDocument bom
+    ) {
+        LinkedHashMap<String, BomProductColor> selectedByIdentity = new LinkedHashMap<>();
+        for (String requested : safeList(requestedProductColors)) {
+            if (blank(requested)) continue;
+            BomProductColor productColor = resolveProductColorReference(bom, requested);
+            if (productColor == null) {
+                throw new OrderBomMprValidationException(
+                        "Selected Product Color does not belong to BOM " + bom.getBomNo()
+                );
+            }
+            selectedByIdentity.putIfAbsent(productColorBusinessIdentityKey(productColor), productColor);
+        }
+        return new ArrayList<>(selectedByIdentity.values());
+    }
+
+    private BomProductColor resolveProductColorReference(BomDocument bom, String idOrLegacyName) {
+        String reference = trim(idOrLegacyName);
+        if (blank(reference)) return null;
+
+        // Current clients send the stable Product Color id. That id belongs to one
+        // exact four-field Product Color identity in the BOM.
+        for (BomProductColor item : safeList(bom == null ? null : bom.getProductColors())) {
+            if (item == null) continue;
+            if (reference.equals(trim(item.getId()))) return item;
+            if (normalize(reference).equals(productColorBusinessIdentityKey(item))) return item;
+        }
+
+        // Backward compatibility for old saved batches / clients that stored only
+        // the readable color name. It is safe only when the name is unique.
+        List<BomProductColor> sameName = safeList(bom == null ? null : bom.getProductColors()).stream()
+                .filter(Objects::nonNull)
+                .filter(item -> normalize(reference).equals(normalize(item.getColorName())))
+                .collect(Collectors.toCollection(ArrayList::new));
+        if (sameName.size() == 1) return sameName.get(0);
+        if (sameName.size() > 1) {
+            throw new OrderBomMprValidationException(
+                    "Product Color " + reference
+                            + " is ambiguous in BOM " + bom.getBomNo()
+                            + ". Select the exact Product Color (Color + Pattern Number + Season + Style Number)."
+            );
+        }
+        return null;
+    }
+
+    private String productColorBusinessIdentityKey(BomProductColor item) {
+        if (item == null) return "";
+        return normalize(item.getColorName())
+                + "|" + normalize(item.getPatternNumber())
+                + "|" + normalize(item.getSeason())
+                + "|" + normalize(item.getStyleNumber());
+    }
+
+    private String productColorLabel(BomProductColor item) {
+        if (item == null) return "";
+        return joinNonBlank(
+                item.getColorName(),
+                item.getPatternNumber(),
+                item.getSeason(),
+                item.getStyleNumber()
+        );
+    }
+
+    private boolean productColorNameIsUnique(BomDocument bom, BomProductColor productColor) {
+        if (bom == null || productColor == null || blank(productColor.getColorName())) return false;
+        String wanted = normalize(productColor.getColorName());
+        long count = safeList(bom.getProductColors()).stream()
+                .filter(Objects::nonNull)
+                .filter(item -> wanted.equals(normalize(item.getColorName())))
+                .count();
+        return count == 1;
+    }
+
+    private <T> T mapValueForProductColor(
+            Map<String, T> values,
+            BomDocument bom,
+            BomProductColor productColor
+    ) {
+        if (values == null || values.isEmpty() || productColor == null) return null;
+
+        String productColorId = trim(productColor.getId());
+        if (hasText(productColorId) && values.containsKey(productColorId)) {
+            return values.get(productColorId);
+        }
+        String businessKey = productColorBusinessIdentityKey(productColor);
+        if (hasText(businessKey) && values.containsKey(businessKey)) {
+            return values.get(businessKey);
+        }
+
+        // Legacy name-keyed maps are accepted only when the visible color name is
+        // unique in this BOM. Never let NATURAL resolve to two different columns.
+        if (productColorNameIsUnique(bom, productColor)) {
+            for (Map.Entry<String, T> entry : values.entrySet()) {
+                if (normalize(entry.getKey()).equals(normalize(productColor.getColorName()))) {
+                    return entry.getValue();
                 }
-                colors.add(colorName);
             }
         }
-        return new ArrayList<>(colors);
+        return null;
     }
 
     private BigDecimal poQuantityForColor(
             MprSelectionRequest selectionRequest,
             BomDocument bom,
-            String colorName,
+            BomProductColor productColor,
             BigDecimal fallbackQuantity
     ) {
-        Map<String, BigDecimal> supplied = selectionRequest.poQtyByColor();
-        if (supplied != null && !supplied.isEmpty()) {
-            String productColorId = productColorIdFor(bom, colorName);
-            for (Map.Entry<String, BigDecimal> entry : supplied.entrySet()) {
-                if (entry.getValue() == null) continue;
-                String key = entry.getKey();
-                if ((hasText(productColorId) && productColorId.equals(key)) || normalize(key).equals(normalize(colorName))) {
-                    return entry.getValue();
-                }
-            }
-        }
-        return safe(fallbackQuantity);
+        BigDecimal supplied = mapValueForProductColor(
+                selectionRequest == null ? null : selectionRequest.poQtyByColor(),
+                bom,
+                productColor
+        );
+        return supplied == null ? safe(fallbackQuantity) : supplied;
     }
 
     private Map<String, BigDecimal> shipToQuantitiesForColor(
             MprSelectionRequest request,
             BomDocument bom,
-            String colorName,
+            BomProductColor productColor,
             List<String> selectedShipToIds,
             BigDecimal fallbackQuantity
     ) {
-        Map<String, BigDecimal> supplied = mapValueForColor(
+        Map<String, BigDecimal> supplied = mapValueForProductColor(
                 request == null ? null : request.shipToQtyByColor(),
-                colorName,
-                productColorIdFor(bom, colorName)
+                bom,
+                productColor
         );
         LinkedHashMap<String, BigDecimal> result = new LinkedHashMap<>();
         if (supplied != null && !supplied.isEmpty()) {
             for (String id : safeList(selectedShipToIds)) {
                 BigDecimal quantity = supplied.get(id);
                 if (quantity == null) {
-                    throw new OrderBomMprValidationException("Enter PO Qty for every selected Ship To in Product Color " + colorName);
+                    throw new OrderBomMprValidationException(
+                            "Enter PO Qty for every selected Ship To in Product Color " + productColorLabel(productColor)
+                    );
                 }
                 if (quantity.signum() < 0) {
-                    throw new OrderBomMprValidationException("Ship To PO Qty cannot be negative for Product Color " + colorName);
+                    throw new OrderBomMprValidationException(
+                            "Ship To PO Qty cannot be negative for Product Color " + productColorLabel(productColor)
+                    );
                 }
                 result.put(id, quantity);
             }
             for (String suppliedId : supplied.keySet()) {
                 if (!safeList(selectedShipToIds).contains(suppliedId)) {
-                    throw new OrderBomMprValidationException("Ship To quantity was provided for an unselected Ship To in Product Color " + colorName);
+                    throw new OrderBomMprValidationException(
+                            "Ship To quantity was provided for an unselected Ship To in Product Color "
+                                    + productColorLabel(productColor)
+                    );
                 }
             }
             return result;
         }
 
-        // Backward compatibility: one selected Ship To can safely inherit the old Product Color PO Qty.
+        // Backward compatibility: one selected Ship To can inherit the old
+        // Product Color total PO Qty.
         if (safeList(selectedShipToIds).size() == 1) {
-            result.put(selectedShipToIds.get(0), poQuantityForColor(request, bom, colorName, fallbackQuantity));
+            result.put(
+                    selectedShipToIds.get(0),
+                    poQuantityForColor(request, bom, productColor, fallbackQuantity)
+            );
         }
         return result;
     }
@@ -2009,21 +2662,23 @@ public class MprService {
         return result;
     }
 
-    /** Ship To is required for every selected Product Color at MPR creation. */
+    /** Ship To is required for every selected four-field Product Color identity. */
     private List<String> shipToIdsForColor(
             MprSelectionRequest request,
             BomDocument bom,
-            String colorName,
+            BomProductColor productColor,
             Map<String, ShipTo> shipToById
     ) {
-        List<String> supplied = mapValueForColor(
+        List<String> supplied = mapValueForProductColor(
                 request == null ? null : request.shipToIdsByColor(),
-                colorName,
-                productColorIdFor(bom, colorName)
+                bom,
+                productColor
         );
         List<String> ids = normalizeShipToIds(supplied, shipToById);
         if (ids.isEmpty()) {
-            throw new OrderBomMprValidationException("Select at least one Ship To for Product Color " + colorName);
+            throw new OrderBomMprValidationException(
+                    "Select at least one Ship To for Product Color " + productColorLabel(productColor)
+            );
         }
         return ids;
     }
@@ -2051,24 +2706,61 @@ public class MprService {
                 .collect(Collectors.joining(" + "));
     }
 
-    /** Supports Product Color id and readable Product Color name in payload maps. */
-    private <T> T mapValueForColor(Map<String, T> values, String colorName, String productColorId) {
-        if (values == null || values.isEmpty()) return null;
-        for (Map.Entry<String, T> entry : values.entrySet()) {
-            String key = entry.getKey();
-            if ((hasText(productColorId) && productColorId.equals(key)) || normalize(key).equals(normalize(colorName))) {
-                return entry.getValue();
-            }
+    private List<String> dedicatedShipToIds(
+            MaterialShipToMapping mapping,
+            Map<String, ShipTo> activeShipToById,
+            String materialLabel
+    ) {
+        List<String> storedIds = mapping == null ? List.of() : safeList(mapping.getShipToIds());
+        if (storedIds.isEmpty() && mapping != null && hasText(mapping.getShipToId())) {
+            storedIds = List.of(mapping.getShipToId());
         }
-        return null;
+
+        LinkedHashSet<String> result = new LinkedHashSet<>();
+        for (String id : storedIds) {
+            String clean = trim(id);
+            if (clean.isEmpty()) continue;
+            if (!activeShipToById.containsKey(clean)) {
+                throw new OrderBomMprValidationException(
+                        "Dedicated Ship To configuration for material " + firstNonBlank(materialLabel, "(unknown material)")
+                                + " contains an inactive or missing Ship To. Update Material Ship To Master before creating MPR."
+                );
+            }
+            result.add(clean);
+        }
+        if (result.isEmpty()) {
+            throw new OrderBomMprValidationException(
+                    "Dedicated Ship To configuration for material " + firstNonBlank(materialLabel, "(unknown material)")
+                            + " is empty. Update Material Ship To Master before creating MPR."
+            );
+        }
+        return new ArrayList<>(result);
     }
 
-    private String resolveBatchColor(MprSelection batch, String productColorId) {
-        if (batch == null || blank(productColorId)) return "";
-        for (String color : safeList(batch.getColors())) {
-            if (normalize(color).equals(normalize(productColorId))) return color;
-        }
-        return "";
+    private List<String> shipToValues(List<String> ids, Map<String, ShipTo> shipToById, boolean code) {
+        return safeList(ids).stream()
+                .map(shipToById::get)
+                .filter(Objects::nonNull)
+                .map(item -> code
+                        ? firstNonBlank(item.getShipToCode(), item.getShipToName(), item.getId())
+                        : firstNonBlank(item.getShipToName(), item.getShipToCode(), item.getId()))
+                .filter(this::hasText)
+                .map(String::trim)
+                .collect(Collectors.toCollection(ArrayList::new));
+    }
+
+    private String dedicatedShipToLabel(List<String> ids, Map<String, ShipTo> shipToById) {
+        return safeList(ids).stream()
+                .map(id -> {
+                    ShipTo shipTo = shipToById.get(id);
+                    return shipTo == null ? id : firstNonBlank(shipTo.getShipToCode(), shipTo.getShipToName(), id);
+                })
+                .filter(this::hasText)
+                .collect(Collectors.joining(" / "));
+    }
+
+    private String firstListValue(List<String> values) {
+        return safeList(values).stream().filter(this::hasText).findFirst().orElse("");
     }
 
     /** STYLE_COLOR is the readable concatenation of STYLE DESCRIPTION and STYLE COLOR. */
@@ -2092,38 +2784,6 @@ public class MprService {
                     return entry.getValue().trim();
                 }
             }
-        }
-        return "";
-    }
-
-    private Map<String, String> productColorIdsByName(BomDocument bom) {
-        Map<String, String> result = new LinkedHashMap<>();
-        for (BomProductColor item : safeList(bom == null ? null : bom.getProductColors())) {
-            if (item == null || blank(item.getColorName())) continue;
-            result.putIfAbsent(normalize(item.getColorName()), trim(item.getId()));
-        }
-        return result;
-    }
-
-    private String productColorIdFor(BomDocument bom, String colorName) {
-        for (BomProductColor item : safeList(bom.getProductColors())) {
-            if (item != null && normalize(item.getColorName()).equals(normalize(colorName))) {
-                return trim(item.getId());
-            }
-        }
-        return "";
-    }
-
-    private String resolveProductColorName(BomDocument bom, String idOrName) {
-        if (blank(idOrName)) return "";
-        for (BomProductColor item : safeList(bom.getProductColors())) {
-            if (item == null) continue;
-            if (idOrName.trim().equals(item.getId()) || normalize(idOrName).equals(normalize(item.getColorName()))) {
-                return trim(item.getColorName());
-            }
-        }
-        for (String color : safeList(bom.getColors())) {
-            if (normalize(idOrName).equals(normalize(color))) return trim(color);
         }
         return "";
     }
@@ -2266,8 +2926,221 @@ public class MprService {
         return defaultZero(left).multiply(defaultZero(right));
     }
 
-    private String materialKey(String materialType, String description, String color) {
-        return normalize(materialType) + "|" + normalize(description) + "|" + normalize(color);
+    private String materialKey(String materialType, String description, String color, String unit) {
+        return materialTypeMatchKey(materialType)
+                + "|" + materialTextMatchKey(description)
+                + "|" + materialTextMatchKey(color)
+                + "|" + materialTextMatchKey(unit);
+    }
+
+    /**
+     * Use the same text cleanup rules as Master Data. BOM values originate from
+     * Excel and can contain NBSP/Unicode spacing that looks identical in the UI
+     * but previously produced a different MPR lookup key.
+     */
+    private String materialTextMatchKey(String value) {
+        if (value == null) return "";
+        String unicode = Normalizer.normalize(value, Normalizer.Form.NFKC)
+                .replace('\u00A0', ' ')   // no-break space
+                .replace('\u202F', ' ')   // narrow no-break space
+                .replace('\u2007', ' ');  // figure space
+        String key = MasterDataTextNormalizer.key(unicode);
+        return key == null ? "" : key;
+    }
+
+    private String materialTypeMatchKey(String value) {
+        String unicode = value == null ? null : Normalizer.normalize(value, Normalizer.Form.NFKC);
+        String key = MasterDataTextNormalizer.materialGroupKey(unicode);
+        return key == null ? "" : key;
+    }
+
+
+    /**
+     * Migrates legacy saved selection keys from a readable color name to the
+     * exact BOM Product Color id in-memory. The generated MPR lines are the
+     * strongest evidence because they already carry productColorId.
+     */
+    private void backfillSelectionProductColorIds(MprDocument mpr) {
+        if (mpr == null || safeList(mpr.getSelections()).isEmpty()) return;
+
+        LinkedHashSet<String> bomIds = safeList(mpr.getSelections()).stream()
+                .filter(Objects::nonNull)
+                .map(MprSelection::getBomId)
+                .filter(this::hasText)
+                .collect(Collectors.toCollection(LinkedHashSet::new));
+
+        Map<String, BomDocument> bomById = new LinkedHashMap<>();
+        for (BomDocument bom : bomRepository.findAllById(bomIds)) {
+            if (bom != null && hasText(bom.getId())) bomById.put(bom.getId(), bom);
+        }
+
+        for (MprSelection selection : safeList(mpr.getSelections())) {
+            if (selection == null) continue;
+            BomDocument bom = bomById.get(selection.getBomId());
+            if (bom == null) continue;
+
+            LinkedHashMap<String, String> oldToExactId = new LinkedHashMap<>();
+            List<String> exactIds = new ArrayList<>();
+
+            for (String saved : safeList(selection.getColors())) {
+                if (blank(saved)) continue;
+                BomProductColor resolved = resolveLegacySavedProductColor(mpr, selection, bom, saved);
+                String exact = resolved == null || blank(resolved.getId()) ? trim(saved) : trim(resolved.getId());
+                oldToExactId.put(saved, exact);
+                if (hasText(exact) && !exactIds.contains(exact)) exactIds.add(exact);
+            }
+
+            if (oldToExactId.isEmpty()) continue;
+
+            selection.setColors(exactIds);
+            selection.setPoQtyByColor(remapSelectionMap(selection.getPoQtyByColor(), oldToExactId));
+            selection.setShipToIdsByColor(remapSelectionMap(selection.getShipToIdsByColor(), oldToExactId));
+            selection.setShipToQtyByColor(remapSelectionMap(selection.getShipToQtyByColor(), oldToExactId));
+            selection.setShipToByColor(remapSelectionMap(selection.getShipToByColor(), oldToExactId));
+        }
+    }
+
+    private BomProductColor resolveLegacySavedProductColor(
+            MprDocument mpr,
+            MprSelection selection,
+            BomDocument bom,
+            String saved
+    ) {
+        String reference = trim(saved);
+        if (blank(reference)) return null;
+
+        List<BomProductColor> productColors = safeList(bom.getProductColors());
+        for (BomProductColor item : productColors) {
+            if (item != null && reference.equals(trim(item.getId()))) return item;
+        }
+
+        List<BomProductColor> sameName = productColors.stream()
+                .filter(Objects::nonNull)
+                .filter(item -> normalize(reference).equals(normalize(item.getColorName())))
+                .collect(Collectors.toCollection(ArrayList::new));
+        if (sameName.size() == 1) return sameName.get(0);
+        if (sameName.isEmpty()) return null;
+
+        Set<String> candidateIds = sameName.stream()
+                .map(BomProductColor::getId)
+                .filter(this::hasText)
+                .collect(Collectors.toCollection(LinkedHashSet::new));
+
+        LinkedHashSet<String> generatedIds = safeList(mpr.getLines()).stream()
+                .filter(Objects::nonNull)
+                .filter(line -> Objects.equals(selection.getBomId(), line.getBomId()))
+                .filter(line -> lineHasBatch(line, selection.getBatchId()))
+                .filter(line -> candidateIds.contains(trim(line.getProductColorId())))
+                .map(MprLine::getProductColorId)
+                .map(this::trim)
+                .filter(this::hasText)
+                .collect(Collectors.toCollection(LinkedHashSet::new));
+
+        if (generatedIds.size() == 1) {
+            String id = generatedIds.iterator().next();
+            return sameName.stream()
+                    .filter(item -> Objects.equals(id, trim(item.getId())))
+                    .findFirst()
+                    .orElse(null);
+        }
+        return null;
+    }
+
+    private <T> Map<String, T> remapSelectionMap(
+            Map<String, T> source,
+            Map<String, String> oldToExactId
+    ) {
+        LinkedHashMap<String, T> result = new LinkedHashMap<>();
+        if (source == null || source.isEmpty()) return result;
+
+        for (Map.Entry<String, String> mapping : oldToExactId.entrySet()) {
+            String oldKey = mapping.getKey();
+            String exactKey = mapping.getValue();
+            T value = source.containsKey(oldKey) ? source.get(oldKey) : source.get(exactKey);
+            if (value != null || source.containsKey(oldKey) || source.containsKey(exactKey)) {
+                result.put(exactKey, value);
+            }
+        }
+
+        // Keep unrelated legacy entries untouched rather than dropping data.
+        for (Map.Entry<String, T> entry : source.entrySet()) {
+            boolean remapped = oldToExactId.keySet().stream()
+                    .anyMatch(key -> normalize(key).equals(normalize(entry.getKey())));
+            if (!remapped) result.putIfAbsent(entry.getKey(), entry.getValue());
+        }
+        return result;
+    }
+
+    private void decorateBomSourceState(MprDocument mpr) {
+        if (mpr == null || safeList(mpr.getSelections()).isEmpty()) return;
+        LinkedHashSet<String> bomIds = safeList(mpr.getSelections()).stream()
+                .filter(Objects::nonNull)
+                .map(MprSelection::getBomId)
+                .filter(this::hasText)
+                .collect(Collectors.toCollection(LinkedHashSet::new));
+        Map<String, BomDocument> currentBomById = new LinkedHashMap<>();
+        for (BomDocument bom : bomRepository.findAllById(bomIds)) {
+            if (bom != null && hasText(bom.getId())) currentBomById.put(bom.getId(), bom);
+        }
+
+        for (MprSelection selection : safeList(mpr.getSelections())) {
+            if (selection == null) continue;
+            BomDocument bom = currentBomById.get(selection.getBomId());
+            long snapshotRevision = BomMprSourceRevision.snapshot(selection.getBomSourceRevision());
+            if (bom == null) {
+                selection.setCurrentBomSourceRevision(snapshotRevision);
+                selection.setCurrentBomSourceChangedAt(null);
+                selection.setCurrentBomSourceChangedBy("");
+                selection.setCurrentBomSourceChangeSummary("Source BOM is no longer available");
+                selection.setBomSourceMissing(true);
+                selection.setBomSourceChanged(true);
+                continue;
+            }
+
+            long currentRevision = BomMprSourceRevision.current(bom);
+            selection.setCurrentBomSourceRevision(currentRevision);
+            selection.setCurrentBomSourceChangedAt(bom.getMprSourceChangedAt());
+            selection.setCurrentBomSourceChangedBy(trim(bom.getMprSourceChangedBy()));
+            selection.setCurrentBomSourceChangeSummary(trim(bom.getMprSourceChangeSummary()));
+            selection.setBomSourceMissing(false);
+            boolean changedAfterSnapshot = bom.getMprSourceChangedAt() != null
+                    && (selection.getBomSourceChangedAt() == null
+                    || bom.getMprSourceChangedAt().isAfter(selection.getBomSourceChangedAt()));
+            selection.setBomSourceChanged(currentRevision != snapshotRevision || changedAfterSnapshot);
+        }
+    }
+
+    private void requireCurrentBomSources(MprDocument mpr) {
+        decorateBomSourceState(mpr);
+        List<String> changedBoms = safeList(mpr.getSelections()).stream()
+                .filter(Objects::nonNull)
+                .filter(MprSelection::isBomSourceChanged)
+                .map(item -> firstNonBlank(item.getBomNo(), item.getBomName(), item.getBomId()))
+                .filter(this::hasText)
+                .distinct()
+                .toList();
+        if (!changedBoms.isEmpty()) {
+            throw new OrderBomMprValidationException(
+                    "Source BOM changed after this MPR was generated: " + String.join(", ", changedBoms)
+                            + ". Update the changed BOM source before confirming MPR."
+            );
+        }
+    }
+
+    private void normalizeLegacyStatus(MprDocument mpr) {
+        if (mpr == null) return;
+        String status = normalize(mpr.getStatus());
+        if (status.isBlank() || "DRAFT".equals(status)) {
+            mpr.setStatus(MprDocument.STATUS_IN_PROGRESS);
+        }
+    }
+
+    private void requireEditable(MprDocument mpr) {
+        if (mpr != null && MprDocument.STATUS_COMPLETED.equalsIgnoreCase(mpr.getStatus())) {
+            throw new OrderBomMprValidationException(
+                    "MPR is completed and locked. Reopen it before changing any MPR data."
+            );
+        }
     }
 
     private String normalize(String value) {
@@ -2315,9 +3188,9 @@ public class MprService {
         private final String bomName;
         private final String productColorId;
         private final String productColor;
-        private final String requiredShipToId;
-        private final String requiredShipToCode;
-        private final String requiredShipToName;
+        private final List<String> allowedShipToIds;
+        private final List<String> allowedShipToCodes;
+        private final List<String> allowedShipToNames;
         private final LinkedHashSet<String> materials = new LinkedHashSet<>();
 
         private ValidationIssueAccumulator(
@@ -2326,18 +3199,18 @@ public class MprService {
                 String bomName,
                 String productColorId,
                 String productColor,
-                String requiredShipToId,
-                String requiredShipToCode,
-                String requiredShipToName
+                List<String> allowedShipToIds,
+                List<String> allowedShipToCodes,
+                List<String> allowedShipToNames
         ) {
             this.bomId = bomId;
             this.bomNo = bomNo;
             this.bomName = bomName;
             this.productColorId = productColorId;
             this.productColor = productColor;
-            this.requiredShipToId = requiredShipToId;
-            this.requiredShipToCode = requiredShipToCode;
-            this.requiredShipToName = requiredShipToName;
+            this.allowedShipToIds = new ArrayList<>(allowedShipToIds);
+            this.allowedShipToCodes = new ArrayList<>(allowedShipToCodes);
+            this.allowedShipToNames = new ArrayList<>(allowedShipToNames);
         }
     }
 

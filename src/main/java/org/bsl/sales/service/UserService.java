@@ -128,7 +128,7 @@ public class UserService {
         if (!StringUtils.hasText(value) || "ALL".equalsIgnoreCase(value.trim())) return "";
         String normalized = value.trim().toUpperCase();
         return switch (normalized) {
-            case User.ACCESS_BOM, User.ACCESS_SALES, User.ACCESS_VIEW_SYSTEM -> normalized;
+            case User.ACCESS_BOM, User.ACCESS_SALES, User.ACCESS_REOPEN_COMPLETED_MPR, User.ACCESS_VIEW_SYSTEM -> normalized;
             default -> "";
         };
     }
@@ -154,6 +154,7 @@ public class UserService {
         dto.setBuyerKeys(user.getBuyerKeys());
         dto.setCanManageBom(user.canManageBom());
         dto.setCanManageSales(user.canManageSales());
+        dto.setCanReopenCompletedMpr(user.canReopenCompletedMpr());
         dto.setViewOnly(user.isViewOnly());
         return dto;
     }

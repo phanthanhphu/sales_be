@@ -19,7 +19,6 @@ import org.springframework.web.multipart.MultipartFile;
 
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
-import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
@@ -30,7 +29,6 @@ import java.util.List;
 public class BomController {
     private static final ZoneId DOWNLOAD_TIME_ZONE = ZoneId.of("Asia/Ho_Chi_Minh");
     private static final DateTimeFormatter DOWNLOAD_TIME_FORMAT = DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss");
-    private static final DateTimeFormatter DOWNLOAD_DATE_FORMAT = DateTimeFormatter.ofPattern("yyyyMMdd");
 
     private final BomService bomService;
     private final OrderBomMprExcelExporter exporter;
@@ -83,6 +81,9 @@ public class BomController {
 
     @PostMapping("/boms/{id}/submit")
     public BomDocument submit(@PathVariable String id) { return bomService.submit(id); }
+
+    @PostMapping("/boms/{id}/resubmit")
+    public BomDocument resubmit(@PathVariable String id) { return bomService.resubmit(id); }
 
     @PostMapping("/boms/{id}/product-colors")
     public BomDocument addProductColor(@PathVariable String id, @Valid @RequestBody BomProductColorRequest request) {
@@ -194,11 +195,11 @@ public class BomController {
     private String downloadFileName(BomDocument bom, boolean template) {
         String buyer = safeBuyerPart(bom == null ? null : bom.getBuyerKey());
         String bomNo = safeFilePart(bom == null ? null : bom.getBomNo(), "BOM");
-        String date = LocalDate.now(DOWNLOAD_TIME_ZONE).format(DOWNLOAD_DATE_FORMAT);
+        String downloadTimestamp = timestamp();
         if (template) {
-            return "BOM_" + buyer + "_" + bomNo + "_Template_" + date + ".xlsx";
+            return "BOM_" + buyer + "_" + bomNo + "_Template_" + downloadTimestamp + ".xlsx";
         }
-        return "BOM_" + buyer + "_" + bomNo + "_" + date + ".xlsx";
+        return "BOM_" + buyer + "_" + bomNo + "_" + downloadTimestamp + ".xlsx";
     }
 
     private String safeBuyerPart(String value) {

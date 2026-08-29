@@ -15,6 +15,8 @@ import org.springframework.web.multipart.MultipartFile;
 
 import java.util.List;
 
+import static org.bsl.sales.support.DownloadFileNames.managerExcel;
+
 @RestController
 @RequestMapping("/api/master-data/ship-tos")
 public class ShipToController {
@@ -75,7 +77,7 @@ public class ShipToController {
     @GetMapping("/export-edit")
     public ResponseEntity<byte[]> exportForEdit(@RequestParam(defaultValue = "LLBEAN") String buyerKey) {
         return ResponseEntity.ok()
-                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"ship-to-" + buyerKey + "-edit.xlsx\"")
+                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + managerExcel(buyerKey, "SHIPTO") + "\"")
                 .contentType(MediaType.parseMediaType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"))
                 .body(service.exportForEdit(buyerKey));
     }

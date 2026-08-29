@@ -5,8 +5,7 @@ import lombok.NoArgsConstructor;
 import org.springframework.data.annotation.Transient;
 
 /**
- * One reusable Child Color under a Product / Style Color.
- * Product Color Master intentionally stores only these color values;
+ * One Child Color owned by one BOM Product / Style Color.
  * BOM material rows keep the relationship through childColorId.
  */
 @Data
@@ -17,7 +16,7 @@ public class ProductColorAttribute {
     /** Example: MINERAL GREY (17-5102) or MINERAL GREY YKK#181. */
     private String childColor;
 
-    /** Runtime-only usage state. Used Child Colors cannot be removed. */
+    /** Runtime-only compatibility field. Backend validation still prevents removal while in use. */
     @Transient
     private boolean deleteLocked;
 

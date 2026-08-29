@@ -70,13 +70,13 @@ public class SecurityConfig {
                          * /api/orders/{orderId}/boms and must never be accidentally treated as Sales.
                          */
                         .requestMatchers(HttpMethod.POST, "/api/boms/**", "/api/orders/*/boms", "/api/orders/*/boms/**")
-                            .hasAnyAuthority("ROLE_ADMIN", "PERM_BOM")
+                            .hasAnyAuthority("ROLE_ADMIN", "PERM_BOM", "PERM_SALES")
                         .requestMatchers(HttpMethod.PUT, "/api/boms/**", "/api/orders/*/boms", "/api/orders/*/boms/**")
-                            .hasAnyAuthority("ROLE_ADMIN", "PERM_BOM")
+                            .hasAnyAuthority("ROLE_ADMIN", "PERM_BOM", "PERM_SALES")
                         .requestMatchers(HttpMethod.PATCH, "/api/boms/**", "/api/orders/*/boms", "/api/orders/*/boms/**")
-                            .hasAnyAuthority("ROLE_ADMIN", "PERM_BOM")
+                            .hasAnyAuthority("ROLE_ADMIN", "PERM_BOM", "PERM_SALES")
                         .requestMatchers(HttpMethod.DELETE, "/api/boms/**", "/api/orders/*/boms", "/api/orders/*/boms/**")
-                            .hasAnyAuthority("ROLE_ADMIN", "PERM_BOM")
+                            .hasAnyAuthority("ROLE_ADMIN", "PERM_BOM", "PERM_SALES")
 
                         /*
                          * Sales workspace mutations: orders, MPR, and all Sales master data.
@@ -106,11 +106,11 @@ public class SecurityConfig {
         CorsConfiguration configuration = new CorsConfiguration();
         configuration.setAllowedOrigins(List.of(
                 "http://localhost:3001", "http://127.0.0.1:3001", "http://127.0.0.1:8081",
-                "http://10.232.132.59:3001", "https://10.232.132.59:8081"
+                "http://10.232.132.16:3001", "https://10.232.132.16:8081"
         ));
         configuration.setAllowedMethods(List.of("GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"));
         configuration.setAllowedHeaders(List.of("*"));
-        configuration.setExposedHeaders(List.of("Authorization", "X-Total-Count"));
+        configuration.setExposedHeaders(List.of("Authorization", "X-Total-Count", "Content-Disposition"));
         configuration.setAllowCredentials(true);
         configuration.setMaxAge(3600L);
         UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();

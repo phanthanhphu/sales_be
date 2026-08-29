@@ -4,6 +4,7 @@ import com.fasterxml.jackson.annotation.JsonFormat;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 import org.springframework.data.annotation.Id;
+import org.springframework.data.annotation.Transient;
 import org.springframework.data.annotation.Version;
 import org.springframework.data.mongodb.core.index.Indexed;
 import org.springframework.data.mongodb.core.index.CompoundIndex;
@@ -60,6 +61,19 @@ public class BomDocument {
     /** Source Excel rows deleted in UI. Export clears these rows while preserving their workbook formatting. */
     private List<Integer> deletedSourceRows = new ArrayList<>();
 
+    /**
+     * Business revision used only for MPR source tracking.
+     * It starts at 0 and is incremented only when BOM data that can affect
+     * MPR generation changes (header/product color/packing/material rows).
+     * Image/attachment-only changes do not increment this revision.
+     */
+    private Long mprSourceRevision = 0L;
+
+    @JsonFormat(pattern = "yyyy-MM-dd'T'HH:mm:ss")
+    private LocalDateTime mprSourceChangedAt;
+    private String mprSourceChangedBy;
+    private String mprSourceChangeSummary;
+
     /** DRAFT | SUBMITTED */
     private String status;
 
@@ -78,4 +92,19 @@ public class BomDocument {
 
     @JsonFormat(pattern = "yyyy-MM-dd'T'HH:mm:ss")
     private LocalDateTime updatedAt;
+
+    /**
+     * Decorated at read time only (never persisted). True when this BOM's order
+     * has a COMPLETED MPR, which locks every BOM mutation until the MPR is reopened.
+     */
+    @Transient
+    private boolean orderMprCompleted;
+
+    /**
+     * Decorated at read time only (never persisted). True when at least one saved
+     * MPR generation batch/selection uses this BOM. A SUBMITTED BOM can be returned
+     * to DRAFT for resubmission only while this is false.
+     */
+    @Transient
+    private boolean usedInMpr;
 }

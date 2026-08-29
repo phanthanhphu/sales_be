@@ -11,7 +11,6 @@ import org.bsl.sales.model.MatInfo;
 import org.bsl.sales.model.Loss;
 import org.bsl.sales.model.MaterialShipToMapping;
 import org.bsl.sales.model.MprDocument;
-import org.bsl.sales.model.ProductColorMaster;
 import org.bsl.sales.model.SalesOrder;
 import org.bsl.sales.model.User;
 import org.bsl.sales.repository.BuyerRepository;
@@ -73,7 +72,6 @@ public class BuyerService {
                 || mongoTemplate.exists(any, BomDocument.class)
                 || mongoTemplate.exists(any, MprDocument.class)
                 || mongoTemplate.exists(any, MatInfo.class)
-                || mongoTemplate.exists(any, ProductColorMaster.class)
                 || mongoTemplate.exists(any, Loss.class)
                 || mongoTemplate.exists(any, MaterialShipToMapping.class);
     }
@@ -156,6 +154,9 @@ public class BuyerService {
         Buyer buyer = new Buyer();
         buyer.setBuyerKey(key);
         apply(buyer, request);
+        if (request.sequence() == null) {
+            buyer.setSequence(nextSequence());
+        }
         buyer.setCreatedAt(LocalDateTime.now());
         buyer.setUpdatedAt(LocalDateTime.now());
         return repository.save(buyer);
@@ -190,7 +191,6 @@ public class BuyerService {
         if (mongoTemplate.exists(entityQuery, BomDocument.class)) return true;
         if (mongoTemplate.exists(entityQuery, MprDocument.class)) return true;
         if (mongoTemplate.exists(entityQuery, MatInfo.class)) return true;
-        if (mongoTemplate.exists(entityQuery, ProductColorMaster.class)) return true;
         if (mongoTemplate.exists(entityQuery, Loss.class)) return true;
         if (mongoTemplate.exists(entityQuery, MaterialShipToMapping.class)) return true;
         Query userAssignment = Query.query(new Criteria().andOperator(
@@ -203,8 +203,17 @@ public class BuyerService {
     private void apply(Buyer buyer, BuyerRequest request) {
         buyer.setBuyerName(required(request.buyerName(), "Buyer Name is required"));
         buyer.setActive(request.active() == null || request.active());
-        buyer.setSequence(request.sequence() == null ? 0 : Math.max(0, request.sequence()));
+        if (request.sequence() != null) {
+            buyer.setSequence(Math.max(0, request.sequence()));
+        }
         buyer.setDescription(request.description() == null ? "" : request.description().trim());
+    }
+
+    private int nextSequence() {
+        return repository.findAll().stream()
+                .mapToInt(Buyer::getSequence)
+                .max()
+                .orElse(0) + 1;
     }
 
     private String required(String value, String message) {

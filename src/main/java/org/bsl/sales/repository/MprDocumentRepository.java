@@ -11,6 +11,7 @@ public interface MprDocumentRepository extends MongoRepository<MprDocument, Stri
     List<MprDocument> findByOrderIdIn(List<String> orderIds);
     boolean existsByOrderId(String orderId);
     boolean existsByBuyerKey(String buyerKey);
+    /** True when at least one persisted MPR generation batch/selection uses this BOM. */
     boolean existsBySelectionsBomId(String bomId);
     boolean existsByLinesShortNameSupplierIgnoreCase(String shortNameSupplier);
     boolean existsByBuyerKeyAndLinesShortNameSupplierIgnoreCase(String buyerKey, String shortNameSupplier);

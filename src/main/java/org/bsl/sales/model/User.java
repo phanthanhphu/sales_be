@@ -20,6 +20,7 @@ public class User {
 
     public static final String ACCESS_BOM = "BOM";
     public static final String ACCESS_SALES = "SALES";
+    public static final String ACCESS_REOPEN_COMPLETED_MPR = "REOPEN_COMPLETED_MPR";
     public static final String ACCESS_VIEW_SYSTEM = "VIEW_SYSTEM";
 
     @Id
@@ -37,7 +38,7 @@ public class User {
     private String departmentId;
 
     /**
-     * User module access. ADMIN is always treated as full BOM + SALES access.
+     * User module access. ADMIN is always treated as full access.
      * VIEW_SYSTEM is read-only and intentionally exclusive.
      */
     private List<String> accessPermissions = new ArrayList<>();
@@ -61,7 +62,7 @@ public class User {
 
     public static List<String> normalizeAccessPermissions(Collection<String> values, boolean admin) {
         if (admin) {
-            return List.of(ACCESS_BOM, ACCESS_SALES);
+            return List.of(ACCESS_BOM, ACCESS_SALES, ACCESS_REOPEN_COMPLETED_MPR);
         }
 
         Set<String> normalized = new LinkedHashSet<>();
@@ -69,7 +70,10 @@ public class User {
             for (String value : values) {
                 if (value == null) continue;
                 String permission = value.trim().toUpperCase(Locale.ROOT);
-                if (ACCESS_BOM.equals(permission) || ACCESS_SALES.equals(permission) || ACCESS_VIEW_SYSTEM.equals(permission)) {
+                if (ACCESS_BOM.equals(permission)
+                        || ACCESS_SALES.equals(permission)
+                        || ACCESS_REOPEN_COMPLETED_MPR.equals(permission)
+                        || ACCESS_VIEW_SYSTEM.equals(permission)) {
                     normalized.add(permission);
                 }
             }
@@ -81,6 +85,15 @@ public class User {
         }
 
         // Existing users without an access list safely become view-only.
+        if (normalized.isEmpty()) {
+            return List.of(ACCESS_VIEW_SYSTEM);
+        }
+
+        // Reopening is an additional MPR capability and cannot exist without SALES access.
+        if (!normalized.contains(ACCESS_SALES)) {
+            normalized.remove(ACCESS_REOPEN_COMPLETED_MPR);
+        }
+
         if (normalized.isEmpty()) {
             return List.of(ACCESS_VIEW_SYSTEM);
         }
@@ -106,11 +119,17 @@ public class User {
     }
 
     public boolean canManageBom() {
-        return isAdminRole() || getAccessPermissions().contains(ACCESS_BOM);
+        return isAdminRole()
+                || getAccessPermissions().contains(ACCESS_BOM)
+                || getAccessPermissions().contains(ACCESS_SALES);
     }
 
     public boolean canManageSales() {
         return isAdminRole() || getAccessPermissions().contains(ACCESS_SALES);
+    }
+
+    public boolean canReopenCompletedMpr() {
+        return isAdminRole() || (canManageSales() && getAccessPermissions().contains(ACCESS_REOPEN_COMPLETED_MPR));
     }
 
     public boolean isViewOnly() {

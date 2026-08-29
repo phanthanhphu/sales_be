@@ -53,7 +53,7 @@ public class BomFileStorageService {
     }
 
 
-    /** Copies an already stored BOM attachment into a new independent Product Color Master image file. */
+    /** Copies an already stored attachment into a new independent BOM-local image file. */
     public StoredFile copyStoredFile(String storedFileName, String originalFileName, String contentType, long size) {
         try {
             Path root = Path.of(uploadDirectory).toAbsolutePath().normalize();

@@ -17,7 +17,7 @@ public class UserRequest {
     private Boolean isEnabled;
     private String departmentId;
 
-    /** Multipart-friendly value: BOM,SALES or VIEW_SYSTEM. */
+    /** Multipart-friendly value: BOM, SALES, REOPEN_COMPLETED_MPR or VIEW_SYSTEM. */
     private String accessPermissions;
     /** Multipart-friendly Buyer keys, for example LLBEAN,TNF. */
     private String buyerKeys;

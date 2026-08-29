@@ -22,6 +22,8 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.multipart.MultipartFile;
 
+import static org.bsl.sales.support.DownloadFileNames.managerExcel;
+
 @RestController
 @Validated
 @RequestMapping("/api/master-data/mat-infos")
@@ -115,7 +117,7 @@ public class MatInfoController {
 
     @GetMapping("/export-edit")
     public ResponseEntity<byte[]> exportForEdit(@RequestParam(defaultValue = "LLBEAN") String buyerKey) {
-        return excelResponse("mat-info-" + buyerKey + "-edit.xlsx", matInfoService.exportForEdit(buyerKey));
+        return excelResponse(managerExcel(buyerKey, "MATINFO"), matInfoService.exportForEdit(buyerKey));
     }
 
     @PostMapping(value = "/upload-edited", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)

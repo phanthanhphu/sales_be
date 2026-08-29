@@ -4,10 +4,10 @@ import lombok.Data;
 import lombok.NoArgsConstructor;
 
 /**
- * A child material color assigned to one BOM Product / Style Color.
- * productColorId links to BomDocument.productColors[].id; childColorId links
- * to ProductColorMaster.childColors[].id. value is retained for API/export
- * compatibility and always mirrors the canonical Child Color text.
+ * A material Child Color assigned to one BOM Product / Style Color.
+ * productColorId links to BomDocument.productColors[].id and childColorId links
+ * to that same BOM Product Color's childColors[].id. value is retained for API
+ * and Excel compatibility and mirrors the BOM-local Child Color text.
  */
 @Data
 @NoArgsConstructor

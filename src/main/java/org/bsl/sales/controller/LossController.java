@@ -25,6 +25,8 @@ import org.springframework.web.multipart.MultipartFile;
 
 import java.math.BigDecimal;
 
+import static org.bsl.sales.support.DownloadFileNames.managerExcel;
+
 @RestController
 @Validated
 @RequestMapping("/api/master-data/loss")
@@ -120,7 +122,7 @@ public class LossController {
 
     @GetMapping("/export-edit")
     public ResponseEntity<byte[]> exportForEdit(@RequestParam(defaultValue = "LLBEAN") String buyerKey) {
-        return excelResponse("loss-master-" + buyerKey + "-edit.xlsx", lossService.exportForEdit(buyerKey));
+        return excelResponse(managerExcel(buyerKey, "LOSS"), lossService.exportForEdit(buyerKey));
     }
 
     @PostMapping(value = "/upload-edited", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)

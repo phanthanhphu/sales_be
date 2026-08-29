@@ -6,12 +6,14 @@ import org.bsl.sales.dto.MprLineUpdateRequest;
 import org.bsl.sales.dto.MprValidationResult;
 import org.bsl.sales.dto.MprBatchDeleteResult;
 import org.bsl.sales.dto.MprBatchUpdateRequest;
+import org.bsl.sales.dto.MprReopenRequest;
 import org.bsl.sales.model.MprDocument;
 import org.bsl.sales.service.MprService;
 import org.bsl.sales.service.OrderBomMprExcelExporter;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
@@ -40,6 +42,11 @@ public class MprController {
         return mprService.validateGeneration(orderId, request);
     }
 
+    @GetMapping("/validate-master-data")
+    public MprValidationResult validateMasterData(@PathVariable String orderId) {
+        return mprService.validateCurrentMasterData(orderId);
+    }
+
     @PostMapping("/preview")
     public MprDocument preview(@PathVariable String orderId, @Valid @RequestBody MprGenerateRequest request) { return mprService.preview(orderId, request); }
 
@@ -48,6 +55,15 @@ public class MprController {
 
     @PostMapping("/confirm")
     public MprDocument confirm(@PathVariable String orderId) { return mprService.confirmCompletion(orderId); }
+
+    @PostMapping("/reopen")
+    @PreAuthorize("@accessControl.canReopenCompletedMpr()")
+    public MprDocument reopen(
+            @PathVariable String orderId,
+            @Valid @RequestBody MprReopenRequest request
+    ) {
+        return mprService.reopen(orderId, request.reason());
+    }
 
     @DeleteMapping
     public ResponseEntity<Void> delete(@PathVariable String orderId) { mprService.delete(orderId); return ResponseEntity.noContent().build(); }
@@ -73,6 +89,19 @@ public class MprController {
             @RequestBody MprBatchUpdateRequest request
     ) {
         return mprService.updateBatch(orderId, batchId, request);
+    }
+
+    @PostMapping("/refresh-bom/{bomId}")
+    public MprDocument refreshBomSource(
+            @PathVariable String orderId,
+            @PathVariable String bomId
+    ) {
+        return mprService.refreshBomSource(orderId, bomId);
+    }
+
+    @PostMapping("/refresh-sources")
+    public MprDocument refreshAllBomSources(@PathVariable String orderId) {
+        return mprService.refreshAllBomSources(orderId);
     }
 
     @DeleteMapping("/batches/{batchId}")

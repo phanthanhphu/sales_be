@@ -28,6 +28,10 @@ public class AccessControl {
         return currentUser().map(user -> user.isEnabled() && user.canManageSales()).orElse(false);
     }
 
+    public boolean canReopenCompletedMpr() {
+        return currentUser().map(user -> user.isEnabled() && user.canReopenCompletedMpr()).orElse(false);
+    }
+
     public boolean canAccessUser(String userId) {
         return currentUser().map(user -> user.isEnabled() && (user.isAdminRole() || user.getId().equals(userId))).orElse(false);
     }

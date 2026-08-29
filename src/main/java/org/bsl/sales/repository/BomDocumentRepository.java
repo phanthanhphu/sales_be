@@ -9,9 +9,7 @@ public interface BomDocumentRepository extends MongoRepository<BomDocument, Stri
     List<BomDocument> findByOrderIdOrderByCreatedAtDescUpdatedAtDesc(String orderId);
     List<BomDocument> findByOrderIdIn(List<String> orderIds);
     long countByOrderId(String orderId);
-    boolean existsByProductColorsProductColorMasterId(String productColorMasterId);
-    long countByProductColorsProductColorMasterId(String productColorMasterId);
-    List<BomDocument> findByProductColorsProductColorMasterId(String productColorMasterId);
+    boolean existsByOrderIdAndStatusIgnoreCase(String orderId, String status);
     boolean existsByOrderIdAndBomNoKey(String orderId, String bomNoKey);
     boolean existsByOrderIdAndBomNoKeyAndIdNot(String orderId, String bomNoKey, String id);
 }

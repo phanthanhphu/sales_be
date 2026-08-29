@@ -12,8 +12,9 @@ import java.util.List;
  *
  * Several Core/Packing rows may be collapsed into one MPR row when their
  * business material identity + consumption values are identical. Keeping each
- * source trace preserves duplicate prevention, batch deletion, and the PO Qty
- * contribution of every removed duplicate row.
+ * source trace preserves duplicate prevention and batch deletion. PO Qty is a
+ * selection-level snapshot repeated on duplicate source rows; it is not an
+ * additive contribution during duplicate consolidation.
  */
 @Data
 @NoArgsConstructor
@@ -29,9 +30,9 @@ public class MprSourceTrace {
     private String section;
     private String sourceLabel;
 
-    /** PO Qty contributed by this physical source row before duplicate consolidation. */
+    /** PO Qty snapshot already calculated for the selected BOM/Product Color/Ship To scope. */
     private BigDecimal poQuantity;
-    /** Ship To snapshot contributed by this source row. */
+    /** Ship To snapshot represented by this physical source row. */
     private List<String> shipToIds = new ArrayList<>();
     private String shipTo;
 }

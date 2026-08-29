@@ -35,6 +35,14 @@ public final class MasterDataEditWorkbookExporter {
     private static final int MATERIAL_SHIP_TO_MIN_INPUT_ROWS = 5000;
     private static final String SHIP_TO_REFERENCE_SHEET = "SHIP TO REFERENCE";
     private static final String SHIP_TO_NAME_RANGE = "SHIP_TO_NAMES";
+    private static final String SYSTEM_GENERATED_KEY_NOTICE = "SYSTEM GENERATED — DO NOT EDIT\n"
+            + "Keep the Key unchanged for UPDATE or DELETE.\n"
+            + "For a new row, leave the Key blank and select CREATE.\n"
+            + "To delete a record, keep the Key and select DELETE in the Action column.";
+    private static final String SYSTEM_GENERATED_LOSS_KEY_NOTICE = "SYSTEM GENERATED — DO NOT EDIT\n"
+            + "Keep the existing Key unchanged when editing a row.\n"
+            + "For a new row, leave the Key blank.\n"
+            + "Do not manually add, edit, clear, copy or delete Key values.";
 
     private MasterDataEditWorkbookExporter() {
     }
@@ -65,8 +73,11 @@ public final class MasterDataEditWorkbookExporter {
             }
 
             setWidths(sheet, 16, 12, 28, 18, 30, 18, 34);
-            addActionValidation(sheet, 1, Math.max(5000, rowIndex + 100));
-            protectIdentityColumns(sheet, 0);
+            int lastInputRow = Math.max(5000, rowIndex + 100);
+            addActionValidation(sheet, 1, lastInputRow);
+            markSystemGeneratedColumns(
+                    workbook, sheet, styles.lockedText, SYSTEM_GENERATED_KEY_NOTICE, lastInputRow, 0
+            );
             return toBytes(workbook);
         } catch (IOException ex) {
             throw new IllegalStateException("Cannot export Vendor Code edit workbook", ex);
@@ -109,8 +120,11 @@ public final class MasterDataEditWorkbookExporter {
             }
 
             setWidths(sheet, 16, 12, 13, 18, 46, 28, 12, 10, 18, 24, 34, 16, 16, 30);
-            addActionValidation(sheet, 1, Math.max(10000, rowIndex + 100));
-            protectIdentityColumns(sheet, 0);
+            int lastInputRow = Math.max(10000, rowIndex + 100);
+            addActionValidation(sheet, 1, lastInputRow);
+            markSystemGeneratedColumns(
+                    workbook, sheet, styles.lockedText, SYSTEM_GENERATED_KEY_NOTICE, lastInputRow, 0
+            );
             return toBytes(workbook);
         } catch (IOException ex) {
             throw new IllegalStateException("Cannot export MAT_INFO edit workbook", ex);
@@ -140,8 +154,12 @@ public final class MasterDataEditWorkbookExporter {
                 write(row, 5, item.getRemark(), styles.textWrap);
             }
             setWidths(sheet, 16, 12, 20, 36, 12, 40);
-            addActionValidation(sheet, 1, Math.max(5000, rowIndex + 100));
-            protectIdentityColumns(sheet, 0);
+            int lastInputRow = Math.max(5000, rowIndex + 100);
+            addActionValidation(sheet, 1, lastInputRow);
+            addActiveValidation(sheet, 4, lastInputRow);
+            markSystemGeneratedColumns(
+                    workbook, sheet, styles.lockedText, SYSTEM_GENERATED_KEY_NOTICE, lastInputRow, 0
+            );
             return toBytes(workbook);
         } catch (IOException ex) {
             throw new IllegalStateException("Cannot export Ship To edit workbook", ex);
@@ -154,7 +172,7 @@ public final class MasterDataEditWorkbookExporter {
             Styles styles = new Styles(workbook);
             writeHeader(sheet, styles.header, 0,
                     "Key", "Action", "SAP Code", "Material Type", "MAT FULL DESCRIPTION", "MAT COLOR", "MAT UNIT",
-                    "Ship To Name", "Active", "Remark");
+                    "Dedicated Ship To", "Active", "Remark");
             sheet.createFreezePane(0, 1);
 
             List<MaterialShipToMapping> sorted = rows == null ? Collections.emptyList() : rows.stream()
@@ -171,7 +189,7 @@ public final class MasterDataEditWorkbookExporter {
                 write(row, 4, item.getMatFullDescription(), styles.textWrap);
                 write(row, 5, item.getMatColor(), styles.textWrap);
                 write(row, 6, item.getMatUnit(), styles.text);
-                write(row, 7, item.getShipToName(), styles.text);
+                write(row, 7, materialShipToNames(item), styles.textWrap);
                 write(row, 8, item.isActive() ? "TRUE" : "FALSE", styles.text);
                 write(row, 9, item.getRemark(), styles.textWrap);
             }
@@ -179,7 +197,9 @@ public final class MasterDataEditWorkbookExporter {
             int lastInputRow = Math.max(MATERIAL_SHIP_TO_MIN_INPUT_ROWS, rowIndex + 100);
             addActionValidation(sheet, 1, lastInputRow);
             addMaterialShipToControls(workbook, sheet, styles, shipTos, 7, 8, lastInputRow);
-            protectIdentityColumns(sheet, 0);
+            markSystemGeneratedColumns(
+                    workbook, sheet, styles.lockedText, SYSTEM_GENERATED_KEY_NOTICE, lastInputRow, 0
+            );
             return toBytes(workbook);
         } catch (IOException ex) {
             throw new IllegalStateException("Cannot export Material Ship To edit workbook", ex);
@@ -192,7 +212,7 @@ public final class MasterDataEditWorkbookExporter {
             Sheet sheet = workbook.createSheet("MATERIAL SHIP TO");
             writeHeader(sheet, styles.header, 0,
                     "SAP Code", "Material Type", "MAT FULL DESCRIPTION", "MAT COLOR", "MAT UNIT",
-                    "Ship To Name", "Active", "Remark");
+                    "Dedicated Ship To", "Active", "Remark");
             sheet.createFreezePane(0, 1);
             setWidths(sheet, 18, 20, 48, 28, 12, 34, 12, 40);
             addMaterialShipToControls(
@@ -226,7 +246,7 @@ public final class MasterDataEditWorkbookExporter {
             int rowIndex = 1;
             for (Loss item : sorted) {
                 Row row = sheet.createRow(rowIndex++);
-                write(row, 0, item.getMasterKey(), styles.text);
+                write(row, 0, item.getMasterKey(), styles.lockedText);
                 write(row, 1, item.getMaterialGroup(), styles.text);
                 write(row, 2, item.getLossLt501(), styles.percentage);
                 write(row, 3, item.getLossLt1501(), styles.percentage);
@@ -240,6 +260,10 @@ public final class MasterDataEditWorkbookExporter {
             }
 
             setWidths(sheet, 16, 18, 12, 12, 12, 12, 4, 18, 12, 12, 12, 12);
+            int lastInputRow = Math.max(5000, rowIndex + 100);
+            markSystemGeneratedColumns(
+                    workbook, sheet, styles.lockedText, SYSTEM_GENERATED_LOSS_KEY_NOTICE, lastInputRow, 0
+            );
             return toBytes(workbook);
         } catch (IOException ex) {
             throw new IllegalStateException("Cannot export Loss edit workbook", ex);
@@ -298,18 +322,35 @@ public final class MasterDataEditWorkbookExporter {
         var shipToConstraint = helper.createFormulaListConstraint(SHIP_TO_NAME_RANGE);
         var shipToRange = new CellRangeAddressList(1, lastRow, shipToNameColumn, shipToNameColumn);
         var shipToValidation = helper.createValidation(shipToConstraint, shipToRange);
-        shipToValidation.setShowErrorBox(true);
+        // Excel's standard .xlsx validation cannot multi-select. Keep the drop-down
+        // for a single value, but allow users to type several names separated by ';'.
+        // The backend validates every entered value against the active Ship To Master.
+        shipToValidation.setShowErrorBox(false);
         shipToValidation.setShowPromptBox(true);
         shipToValidation.createPromptBox(
-                "Select Ship To",
-                "Choose an active Ship To for this Buyer. Add new values in Ship To Master first."
-        );
-        shipToValidation.createErrorBox(
-                "Invalid Ship To",
-                "Select a Ship To from the list. Add new values in Ship To Master first."
+                "Dedicated Ship To",
+                "Select one value, or type multiple active Ship To names separated by ; (example: US; JAPAN)."
         );
         sheet.addValidationData(shipToValidation);
 
+        addActiveValidation(sheet, activeColumn, lastRow);
+        workbook.setSheetHidden(workbook.getSheetIndex(reference), true);
+    }
+
+    private static String materialShipToNames(MaterialShipToMapping item) {
+        if (item == null) return null;
+        List<String> names = item.getShipToNames();
+        if (names != null && !names.isEmpty()) {
+            return names.stream()
+                    .filter(value -> value != null && !value.trim().isEmpty())
+                    .map(String::trim)
+                    .distinct()
+                    .collect(Collectors.joining("; "));
+        }
+        return item.getShipToName();
+    }
+
+    private static void addActiveValidation(Sheet sheet, int activeColumn, int lastRow) {
         addExplicitListValidation(
                 sheet,
                 activeColumn,
@@ -320,7 +361,6 @@ public final class MasterDataEditWorkbookExporter {
                 "Invalid Active value",
                 "Use TRUE or FALSE."
         );
-        workbook.setSheetHidden(workbook.getSheetIndex(reference), true);
     }
 
     private static void addExplicitListValidation(
@@ -344,11 +384,42 @@ public final class MasterDataEditWorkbookExporter {
         sheet.addValidationData(validation);
     }
 
-    private static void protectIdentityColumns(Sheet sheet, int... columns) {
-        // The workbook intentionally remains editable without a password. Identity cells are visually locked
-        // and protected when users choose Review > Protect Sheet.
+    private static void markSystemGeneratedColumns(
+            Workbook workbook,
+            Sheet sheet,
+            CellStyle identityStyle,
+            String notice,
+            int lastInputRow,
+            int... columns
+    ) {
+        var helper = workbook.getCreationHelper();
+        var drawing = sheet.createDrawingPatriarch();
         for (int column : columns) {
             sheet.setColumnHidden(column, false);
+            sheet.setDefaultColumnStyle(column, identityStyle);
+
+            Cell header = sheet.getRow(0) == null ? null : sheet.getRow(0).getCell(column);
+            if (header == null) continue;
+
+            var anchor = helper.createClientAnchor();
+            anchor.setCol1(column);
+            anchor.setCol2(column + 4);
+            anchor.setRow1(0);
+            anchor.setRow2(6);
+            var comment = drawing.createCellComment(anchor);
+            comment.setAuthor("System");
+            comment.setString(helper.createRichTextString(notice));
+            comment.setVisible(false);
+            header.setCellComment(comment);
+
+            var validationHelper = sheet.getDataValidationHelper();
+            var constraint = validationHelper.createCustomConstraint("TRUE");
+            var range = new CellRangeAddressList(1, lastInputRow, column, column);
+            var validation = validationHelper.createValidation(constraint, range);
+            validation.setShowPromptBox(true);
+            validation.setShowErrorBox(false);
+            validation.createPromptBox("System-generated Key", notice);
+            sheet.addValidationData(validation);
         }
     }
 

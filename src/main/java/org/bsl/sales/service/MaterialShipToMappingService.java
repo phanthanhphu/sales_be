@@ -1,5 +1,6 @@
 package org.bsl.sales.service;
 
+import jakarta.annotation.PostConstruct;
 import org.apache.poi.ss.usermodel.FormulaEvaluator;
 import org.apache.poi.ss.usermodel.Row;
 import org.apache.poi.ss.usermodel.Sheet;
@@ -41,6 +42,7 @@ import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -86,16 +88,33 @@ public class MaterialShipToMappingService {
         return buyerAccess.requireBuyer(buyerKey);
     }
 
+    @PostConstruct
+    public void migrateLegacyShipToLists() {
+        Query query = new Query(new Criteria().andOperator(
+                Criteria.where("shipToId").nin(null, ""),
+                new Criteria().orOperator(
+                        Criteria.where("shipToIds").exists(false),
+                        Criteria.where("shipToIds").is(null),
+                        Criteria.where("shipToIds").size(0)
+                )
+        ));
+        List<MaterialShipToMapping> legacyRows = mongoTemplate.find(query, MaterialShipToMapping.class);
+        List<MaterialShipToMapping> changed = legacyRows.stream()
+                .filter(this::normalizeLegacyShipTos)
+                .collect(Collectors.toCollection(ArrayList::new));
+        if (!changed.isEmpty()) repository.saveAll(changed);
+    }
+
     public MaterialShipToMapping create(String buyerKey, MaterialShipToMappingRequest request) {
         String buyer = buyerKey(buyerKey);
         String materialKey = materialKey(request);
         if (repository.findByBuyerKeyAndMaterialKey(buyer, materialKey).isPresent()) {
-            throw new MasterDataConflictException("This material already has a dedicated Ship To for Buyer " + buyer);
+            throw new MasterDataConflictException("This material already has a Dedicated Ship To list for Buyer " + buyer);
         }
-        ShipTo shipTo = requireActiveShipTo(buyer, request.shipToId());
+        List<ShipTo> shipTos = requireActiveShipTos(buyer, request);
         MaterialShipToMapping entity = new MaterialShipToMapping();
         entity.setMasterKey(nextMasterKey());
-        apply(entity, buyer, request, shipTo);
+        apply(entity, buyer, request, shipTos);
         LocalDateTime now = LocalDateTime.now();
         entity.setCreatedAt(now);
         entity.setUpdatedAt(now);
@@ -127,6 +146,8 @@ public class MaterialShipToMappingService {
         if (shipToSearch != null) {
             Pattern pattern = Pattern.compile(Pattern.quote(shipToSearch), Pattern.CASE_INSENSITIVE);
             query.addCriteria(new Criteria().orOperator(
+                    Criteria.where("shipToCodes").regex(pattern),
+                    Criteria.where("shipToNames").regex(pattern),
                     Criteria.where("shipToCode").regex(pattern),
                     Criteria.where("shipToName").regex(pattern)
             ));
@@ -135,7 +156,9 @@ public class MaterialShipToMappingService {
         long total = mongoTemplate.count(query, MaterialShipToMapping.class);
         query.with(NewestFirstSort.mongo());
         query.skip(pageable.getOffset()).limit(pageable.getPageSize());
-        return new PageImpl<>(mongoTemplate.find(query, MaterialShipToMapping.class), pageable, total);
+        List<MaterialShipToMapping> items = mongoTemplate.find(query, MaterialShipToMapping.class);
+        items.forEach(this::normalizeLegacyShipTos);
+        return new PageImpl<>(items, pageable, total);
     }
 
     public MaterialShipToMapping getForBuyer(String buyerKey, String id) {
@@ -145,7 +168,9 @@ public class MaterialShipToMappingService {
         if (!buyer.equals(BuyerKeys.legacyDefault(entity.getBuyerKey()))) {
             throw new MasterDataNotFoundException("Material Ship To mapping not found for Buyer " + buyer);
         }
-        return ensureMasterKeyPersisted(entity);
+        entity = ensureMasterKeyPersisted(entity);
+        normalizeLegacyShipTos(entity);
+        return entity;
     }
 
     public MaterialShipToMapping update(String buyerKey, String id, MaterialShipToMappingRequest request) {
@@ -154,10 +179,10 @@ public class MaterialShipToMappingService {
         String nextMaterialKey = materialKey(request);
         Optional<MaterialShipToMapping> duplicate = repository.findByBuyerKeyAndMaterialKey(buyer, nextMaterialKey);
         if (duplicate.isPresent() && !duplicate.get().getId().equals(id)) {
-            throw new MasterDataConflictException("This material already has a dedicated Ship To for Buyer " + buyer);
+            throw new MasterDataConflictException("This material already has a Dedicated Ship To list for Buyer " + buyer);
         }
-        ShipTo shipTo = requireActiveShipTo(buyer, request.shipToId());
-        apply(entity, buyer, request, shipTo);
+        List<ShipTo> shipTos = requireActiveShipTos(buyer, request);
+        apply(entity, buyer, request, shipTos);
         entity.setUpdatedAt(LocalDateTime.now());
         return repository.save(entity);
     }
@@ -167,7 +192,9 @@ public class MaterialShipToMappingService {
     }
 
     public List<MaterialShipToMapping> activeForBuyer(String buyerKey) {
-        return repository.findByBuyerKeyAndActiveTrue(buyerKey(buyerKey));
+        List<MaterialShipToMapping> items = repository.findByBuyerKeyAndActiveTrue(buyerKey(buyerKey));
+        items.forEach(this::normalizeLegacyShipTos);
+        return items;
     }
 
     public byte[] template(String buyerKey) {
@@ -179,10 +206,9 @@ public class MaterialShipToMappingService {
     public byte[] exportForEdit(String buyerKey) {
         backfillMissingMasterKeys();
         String buyer = buyerKey(buyerKey);
-        return MasterDataEditWorkbookExporter.materialShipToMappings(
-                repository.findByBuyerKeyOrderByUpdatedAtDesc(buyer),
-                activeShipTosForWorkbook(buyer)
-        );
+        List<MaterialShipToMapping> mappings = repository.findByBuyerKeyOrderByUpdatedAtDesc(buyer);
+        mappings.forEach(this::normalizeLegacyShipTos);
+        return MasterDataEditWorkbookExporter.materialShipToMappings(mappings, activeShipTosForWorkbook(buyer));
     }
 
     private List<ShipTo> activeShipTosForWorkbook(String buyer) {
@@ -199,21 +225,14 @@ public class MaterialShipToMappingService {
         String buyer = buyerKey(buyerKey);
         ImportMode effectiveMode = mode == null ? ImportMode.CREATE_ONLY : mode;
         List<ImportRowError> errors = new ArrayList<>();
-        List<ImportCandidate<MaterialShipToMappingRequest>> rows = parseStandardWorkbook(buyer, file, errors);
-        int totalRows = rows.size();
+        List<ImportCandidate<MaterialShipToMappingRequest>> parsedRows = parseStandardWorkbook(buyer, file, errors);
+        int totalRows = parsedRows.size();
+        List<ImportCandidate<MaterialShipToMappingRequest>> rows = mergeIncomingMaterialRows(parsedRows);
 
-        validateIncomingDuplicates(rows, errors);
         Set<String> materialKeys = rows.stream().map(row -> safeMaterialKey(row.getValue())).filter(v -> v != null).collect(Collectors.toSet());
         Map<String, MaterialShipToMapping> existing = repository.findAllByBuyerKeyAndMaterialKeyIn(buyer, materialKeys).stream()
                 .collect(Collectors.toMap(MaterialShipToMapping::getMaterialKey, item -> item, (a, b) -> a, LinkedHashMap::new));
 
-        for (ImportCandidate<MaterialShipToMappingRequest> row : rows) {
-            String key = safeMaterialKey(row.getValue());
-            if (key == null) continue;
-            if (effectiveMode == ImportMode.CREATE_ONLY && existing.containsKey(key)) {
-                errors.add(new ImportRowError(row.getRowNumber(), "material", "Material mapping already exists; CREATE_ONLY does not allow updates"));
-            }
-        }
         if (!errors.isEmpty()) return MasterDataImportResult.rejected(MASTER_DATA_NAME, effectiveMode, totalRows, errors);
 
         MasterDataImportResult result = baseResult(effectiveMode, totalRows);
@@ -228,7 +247,7 @@ public class MaterialShipToMappingService {
                 MaterialShipToMapping entity = new MaterialShipToMapping();
                 entity.setMasterKey(keys.get(i));
                 entity.setCreatedAt(now);
-                apply(entity, buyer, request, requireActiveShipTo(buyer, request.shipToId()));
+                apply(entity, buyer, request, requireActiveShipTos(buyer, request));
                 entity.setUpdatedAt(now);
                 toSave.add(entity);
             }
@@ -245,6 +264,7 @@ public class MaterialShipToMappingService {
             MaterialShipToMappingRequest request = row.getValue();
             String materialKey = materialKey(request);
             MaterialShipToMapping entity = existing.get(materialKey);
+            if (entity != null) request = mergeExistingShipTos(entity, request);
             if (entity == null) {
                 entity = new MaterialShipToMapping();
                 entity.setMasterKey(newKeys.get(keyIndex++));
@@ -253,7 +273,7 @@ public class MaterialShipToMappingService {
             } else {
                 result.setUpdated(result.getUpdated() + 1);
             }
-            apply(entity, buyer, request, requireActiveShipTo(buyer, request.shipToId()));
+            apply(entity, buyer, request, requireActiveShipTos(buyer, request));
             entity.setUpdatedAt(now);
             toSave.add(entity);
         }
@@ -297,7 +317,7 @@ public class MaterialShipToMappingService {
             }
             MaterialShipToMapping duplicate = existingByMaterial.get(materialKey);
             if (duplicate != null && (target == null || !duplicate.getId().equals(target.getId()))) {
-                errors.add(new ImportRowError(row.getRowNumber(), "material", "This material already has a dedicated Ship To for this Buyer"));
+                errors.add(new ImportRowError(row.getRowNumber(), "material", "This material already has a Dedicated Ship To list for this Buyer"));
             }
         }
         if (!errors.isEmpty()) return MasterDataImportResult.rejected(MASTER_DATA_NAME, ImportMode.UPSERT, totalRows, errors);
@@ -327,7 +347,7 @@ public class MaterialShipToMappingService {
                 entity = byKey.get(keyed.masterKey);
                 result.setUpdated(result.getUpdated() + 1);
             }
-            apply(entity, buyer, keyed.request, requireActiveShipTo(buyer, keyed.request.shipToId()));
+            apply(entity, buyer, keyed.request, requireActiveShipTos(buyer, keyed.request));
             entity.setUpdatedAt(now);
             toSave.add(entity);
         }
@@ -412,7 +432,7 @@ public class MaterialShipToMappingService {
                     new MasterDataExcelSupport.HeaderRequirement(offset + 3, "MAT COLOR"),
                     new MasterDataExcelSupport.HeaderRequirement(offset + 4, "MAT UNIT"),
                     new MasterDataExcelSupport.HeaderRequirement(offset + 5, "Ship To Code"),
-                    new MasterDataExcelSupport.HeaderRequirement(offset + 6, "Ship To Name"),
+                    new MasterDataExcelSupport.HeaderRequirement(offset + 6, "Ship To Name", "Dedicated Ship To"),
                     new MasterDataExcelSupport.HeaderRequirement(offset + 7, "Active"),
                     new MasterDataExcelSupport.HeaderRequirement(offset + 8, "Remark"));
             return new DataColumns(offset + 5, offset + 6, offset + 7, offset + 8, offset + 9);
@@ -424,7 +444,7 @@ public class MaterialShipToMappingService {
                 new MasterDataExcelSupport.HeaderRequirement(offset + 2, "MAT FULL DESCRIPTION"),
                 new MasterDataExcelSupport.HeaderRequirement(offset + 3, "MAT COLOR"),
                 new MasterDataExcelSupport.HeaderRequirement(offset + 4, "MAT UNIT"),
-                new MasterDataExcelSupport.HeaderRequirement(offset + 5, "Ship To Name"),
+                new MasterDataExcelSupport.HeaderRequirement(offset + 5, "Dedicated Ship To", "Ship To Name", "Dedicated Ship To Names"),
                 new MasterDataExcelSupport.HeaderRequirement(offset + 6, "Active"),
                 new MasterDataExcelSupport.HeaderRequirement(offset + 7, "Remark"));
         return new DataColumns(-1, offset + 5, offset + 6, offset + 7, offset + 8);
@@ -444,11 +464,17 @@ public class MaterialShipToMappingService {
         String unit = excelSupport.text(row, offset + 4, evaluator);
         String shipToCode = columns.shipToCode < 0 ? null : excelSupport.text(row, columns.shipToCode, evaluator);
         String shipToName = excelSupport.text(row, columns.shipToName, evaluator);
-        ShipTo shipTo = resolveShipTo(buyer, shipToCode, shipToName);
+        List<ShipTo> shipTos = resolveShipTos(buyer, shipToCode, shipToName);
         String activeText = MasterDataTextNormalizer.upper(excelSupport.text(row, columns.active, evaluator));
         Boolean active = parseActive(activeText);
         String remark = excelSupport.text(row, columns.remark, evaluator);
-        return new MaterialShipToMappingRequest(sapCode, materialType, description, color, unit, shipTo.getId(), active, remark);
+        return new MaterialShipToMappingRequest(
+                sapCode, materialType, description, color, unit,
+                shipTos.stream().map(ShipTo::getId).collect(Collectors.toList()),
+                null,
+                active,
+                remark
+        );
     }
 
     private Boolean parseActive(String activeText) {
@@ -458,26 +484,104 @@ public class MaterialShipToMappingService {
         throw new MasterDataValidationException("Active must be TRUE/FALSE, YES/NO, 1/0 or ACTIVE/INACTIVE");
     }
 
-    private void validateIncomingDuplicates(List<ImportCandidate<MaterialShipToMappingRequest>> rows, List<ImportRowError> errors) {
-        Set<String> keys = new HashSet<>();
+    /**
+     * A Material Ship To workbook may repeat the same material on several rows
+     * solely to assign different Ship To values. Treat those rows as one mapping
+     * and merge the Ship To list instead of rejecting the upload as a duplicate.
+     */
+    private List<ImportCandidate<MaterialShipToMappingRequest>> mergeIncomingMaterialRows(
+            List<ImportCandidate<MaterialShipToMappingRequest>> rows
+    ) {
+        LinkedHashMap<String, ImportCandidate<MaterialShipToMappingRequest>> grouped = new LinkedHashMap<>();
+        List<ImportCandidate<MaterialShipToMappingRequest>> unkeyed = new ArrayList<>();
+
         for (ImportCandidate<MaterialShipToMappingRequest> row : rows) {
+            if (row == null || row.getValue() == null) continue;
             String key = safeMaterialKey(row.getValue());
-            if (key != null && !keys.add(key)) {
-                errors.add(new ImportRowError(row.getRowNumber(), "material", "Duplicate material identity inside uploaded file"));
+            if (key == null) {
+                unkeyed.add(row);
+                continue;
+            }
+            ImportCandidate<MaterialShipToMappingRequest> current = grouped.get(key);
+            if (current == null) {
+                grouped.put(key, row);
+            } else {
+                grouped.put(key, new ImportCandidate<>(
+                        current.getRowNumber(),
+                        mergeShipToRequests(current.getValue(), row.getValue())
+                ));
             }
         }
+
+        List<ImportCandidate<MaterialShipToMappingRequest>> result = new ArrayList<>(grouped.values());
+        result.addAll(unkeyed);
+        return result;
+    }
+
+    private MaterialShipToMappingRequest mergeShipToRequests(
+            MaterialShipToMappingRequest base,
+            MaterialShipToMappingRequest extra
+    ) {
+        LinkedHashSet<String> ids = new LinkedHashSet<>();
+        if (base != null && base.shipToIds() != null) ids.addAll(base.shipToIds());
+        if (extra != null && extra.shipToIds() != null) ids.addAll(extra.shipToIds());
+        String legacyBase = base == null ? null : MasterDataTextNormalizer.trimToNull(base.shipToId());
+        String legacyExtra = extra == null ? null : MasterDataTextNormalizer.trimToNull(extra.shipToId());
+        if (legacyBase != null) ids.add(legacyBase);
+        if (legacyExtra != null) ids.add(legacyExtra);
+
+        MaterialShipToMappingRequest source = base == null ? extra : base;
+        Boolean active = source == null ? Boolean.TRUE : source.active();
+        if (active == null && extra != null) active = extra.active();
+        String remark = source == null ? null : MasterDataTextNormalizer.trimToNull(source.remark());
+        if (remark == null && extra != null) remark = MasterDataTextNormalizer.trimToNull(extra.remark());
+
+        return new MaterialShipToMappingRequest(
+                source == null ? null : source.sapCode(),
+                source == null ? null : source.materialType(),
+                source == null ? null : source.matFullDescription(),
+                source == null ? null : source.matColor(),
+                source == null ? null : source.matUnit(),
+                new ArrayList<>(ids),
+                null,
+                active,
+                remark
+        );
+    }
+
+    private MaterialShipToMappingRequest mergeExistingShipTos(
+            MaterialShipToMapping entity,
+            MaterialShipToMappingRequest request
+    ) {
+        LinkedHashSet<String> ids = new LinkedHashSet<>();
+        if (entity != null && entity.getShipToIds() != null) ids.addAll(entity.getShipToIds());
+        if (entity != null && MasterDataTextNormalizer.trimToNull(entity.getShipToId()) != null) ids.add(entity.getShipToId());
+        if (request != null && request.shipToIds() != null) ids.addAll(request.shipToIds());
+        if (request != null && MasterDataTextNormalizer.trimToNull(request.shipToId()) != null) ids.add(request.shipToId());
+
+        return new MaterialShipToMappingRequest(
+                request == null ? null : request.sapCode(),
+                request == null ? null : request.materialType(),
+                request == null ? null : request.matFullDescription(),
+                request == null ? null : request.matColor(),
+                request == null ? null : request.matUnit(),
+                new ArrayList<>(ids),
+                null,
+                request == null ? Boolean.TRUE : request.active(),
+                request == null ? null : request.remark()
+        );
     }
 
     private void validateRequestForImport(String buyer, MaterialShipToMappingRequest request, int row, List<ImportRowError> errors) {
         try {
             materialKey(request);
-            requireActiveShipTo(buyer, request.shipToId());
+            requireActiveShipTos(buyer, request);
         } catch (RuntimeException ex) {
             errors.add(new ImportRowError(row, "material", cleanMessage(ex)));
         }
     }
 
-    private void apply(MaterialShipToMapping entity, String buyer, MaterialShipToMappingRequest request, ShipTo shipTo) {
+    private void apply(MaterialShipToMapping entity, String buyer, MaterialShipToMappingRequest request, List<ShipTo> shipTos) {
         if (request == null) throw new MasterDataValidationException("Material Ship To data is required");
         String sapCode = MasterDataTextNormalizer.trimToNull(request.sapCode());
         String materialType = MasterDataTextNormalizer.trimToNull(request.materialType());
@@ -492,9 +596,24 @@ public class MaterialShipToMappingService {
         entity.setMatColor(color);
         entity.setMatUnit(unit);
         entity.setMaterialKey(MaterialShipToMappingKeys.build(sapCode, materialType, description, null, color, unit));
-        entity.setShipToId(shipTo.getId());
-        entity.setShipToCode(MasterDataTextNormalizer.trimToNull(shipTo.getShipToCode()));
-        entity.setShipToName(MasterDataTextNormalizer.trimToNull(shipTo.getShipToName()));
+        List<String> shipToIds = shipTos.stream().map(ShipTo::getId).collect(Collectors.toCollection(ArrayList::new));
+        List<String> shipToCodes = shipTos.stream()
+                .map(ShipTo::getShipToCode)
+                .map(MasterDataTextNormalizer::trimToNull)
+                .collect(Collectors.toCollection(ArrayList::new));
+        List<String> shipToNames = shipTos.stream()
+                .map(ShipTo::getShipToName)
+                .map(MasterDataTextNormalizer::trimToNull)
+                .collect(Collectors.toCollection(ArrayList::new));
+        entity.setShipToIds(shipToIds);
+        entity.setShipToCodes(shipToCodes);
+        entity.setShipToNames(shipToNames);
+
+        // Keep the first value in legacy fields during the rolling migration period.
+        ShipTo first = shipTos.get(0);
+        entity.setShipToId(first.getId());
+        entity.setShipToCode(MasterDataTextNormalizer.trimToNull(first.getShipToCode()));
+        entity.setShipToName(MasterDataTextNormalizer.trimToNull(first.getShipToName()));
         entity.setActive(request.active() == null || request.active());
         entity.setRemark(MasterDataTextNormalizer.trimToNull(request.remark()));
     }
@@ -523,16 +642,63 @@ public class MaterialShipToMappingService {
         catch (RuntimeException ex) { return null; }
     }
 
-    private ShipTo requireActiveShipTo(String buyer, String id) {
-        String clean = MasterDataTextNormalizer.trimToNull(id);
-        if (clean == null) throw new MasterDataValidationException("Ship To is required");
-        ShipTo shipTo = shipToRepository.findById(clean)
-                .orElseThrow(() -> new MasterDataValidationException("Selected Ship To does not exist"));
-        if (!buyer.equals(BuyerKeys.legacyDefault(shipTo.getBuyerKey()))) {
-            throw new MasterDataValidationException("Selected Ship To does not belong to Buyer " + buyer);
+    private List<ShipTo> requireActiveShipTos(String buyer, MaterialShipToMappingRequest request) {
+        LinkedHashSet<String> requestedIds = new LinkedHashSet<>();
+        if (request != null && request.shipToIds() != null) {
+            for (String id : request.shipToIds()) {
+                String clean = MasterDataTextNormalizer.trimToNull(id);
+                if (clean != null) requestedIds.add(clean);
+            }
         }
-        if (!shipTo.isActive()) throw new MasterDataValidationException("Selected Ship To is inactive");
-        return shipTo;
+        String legacyId = request == null ? null : MasterDataTextNormalizer.trimToNull(request.shipToId());
+        if (requestedIds.isEmpty() && legacyId != null) requestedIds.add(legacyId);
+        if (requestedIds.isEmpty()) throw new MasterDataValidationException("Select at least one Dedicated Ship To");
+
+        Map<String, ShipTo> byId = shipToRepository.findAllById(requestedIds).stream()
+                .collect(Collectors.toMap(ShipTo::getId, item -> item, (a, b) -> a));
+        List<ShipTo> result = new ArrayList<>();
+        for (String id : requestedIds) {
+            ShipTo shipTo = byId.get(id);
+            if (shipTo == null) throw new MasterDataValidationException("Selected Ship To does not exist: " + id);
+            if (!buyer.equals(BuyerKeys.legacyDefault(shipTo.getBuyerKey()))) {
+                throw new MasterDataValidationException("Selected Ship To does not belong to Buyer " + buyer);
+            }
+            if (!shipTo.isActive()) {
+                throw new MasterDataValidationException("Selected Ship To is inactive: " + firstNonBlank(shipTo.getShipToCode(), shipTo.getShipToName(), id));
+            }
+            result.add(shipTo);
+        }
+        return result;
+    }
+
+    private List<ShipTo> resolveShipTos(String buyer, String codeText, String nameText) {
+        List<String> codes = splitShipToValues(codeText);
+        List<String> names = splitShipToValues(nameText);
+        if (codes.isEmpty() && names.isEmpty()) {
+            throw new MasterDataValidationException("Enter at least one Dedicated Ship To");
+        }
+        if (!codes.isEmpty() && !names.isEmpty() && codes.size() != names.size()) {
+            throw new MasterDataValidationException("Ship To Code and Ship To Name lists must contain the same number of values");
+        }
+
+        LinkedHashMap<String, ShipTo> result = new LinkedHashMap<>();
+        int count = Math.max(codes.size(), names.size());
+        for (int index = 0; index < count; index++) {
+            String code = codes.isEmpty() ? null : codes.get(index);
+            String name = names.isEmpty() ? null : names.get(index);
+            ShipTo shipTo = resolveShipTo(buyer, code, name);
+            result.putIfAbsent(shipTo.getId(), shipTo);
+        }
+        return new ArrayList<>(result.values());
+    }
+
+    private List<String> splitShipToValues(String value) {
+        String clean = MasterDataTextNormalizer.trimToNull(value);
+        if (clean == null) return List.of();
+        return java.util.Arrays.stream(clean.split(";"))
+                .map(MasterDataTextNormalizer::trimToNull)
+                .filter(item -> item != null)
+                .collect(Collectors.toList());
     }
 
     private ShipTo resolveShipTo(String buyer, String code, String name) {
@@ -549,6 +715,28 @@ public class MaterialShipToMappingService {
         }
         if (!shipTo.isActive()) throw new MasterDataValidationException("Selected Ship To is inactive");
         return shipTo;
+    }
+
+    /** Fills the new list fields from legacy one-value MongoDB documents. */
+    private boolean normalizeLegacyShipTos(MaterialShipToMapping entity) {
+        if (entity == null) return false;
+        boolean changed = false;
+        if ((entity.getShipToIds() == null || entity.getShipToIds().isEmpty())
+                && MasterDataTextNormalizer.trimToNull(entity.getShipToId()) != null) {
+            entity.setShipToIds(new ArrayList<>(List.of(entity.getShipToId().trim())));
+            changed = true;
+        }
+        if ((entity.getShipToCodes() == null || entity.getShipToCodes().isEmpty())
+                && MasterDataTextNormalizer.trimToNull(entity.getShipToCode()) != null) {
+            entity.setShipToCodes(new ArrayList<>(List.of(entity.getShipToCode().trim())));
+            changed = true;
+        }
+        if ((entity.getShipToNames() == null || entity.getShipToNames().isEmpty())
+                && MasterDataTextNormalizer.trimToNull(entity.getShipToName()) != null) {
+            entity.setShipToNames(new ArrayList<>(List.of(entity.getShipToName().trim())));
+            changed = true;
+        }
+        return changed;
     }
 
     private String buyerKey(String value) {
@@ -657,6 +845,14 @@ public class MaterialShipToMappingService {
     private String cleanMessage(Exception ex) {
         String message = MasterDataTextNormalizer.trimToNull(ex.getMessage());
         return message == null ? ex.getClass().getSimpleName() : message;
+    }
+
+    private String firstNonBlank(String... values) {
+        for (String value : values) {
+            String clean = MasterDataTextNormalizer.trimToNull(value);
+            if (clean != null) return clean;
+        }
+        return "";
     }
 
     private static class KeyedRequest {

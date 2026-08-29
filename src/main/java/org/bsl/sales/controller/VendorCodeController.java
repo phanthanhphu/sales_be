@@ -16,6 +16,8 @@ import org.springframework.web.multipart.MultipartFile;
 
 import java.util.List;
 
+import static org.bsl.sales.support.DownloadFileNames.managerExcel;
+
 @RestController
 @Validated
 @RequestMapping("/api/master-data/vendor-codes")
@@ -106,7 +108,7 @@ public class VendorCodeController {
 
     @GetMapping("/export-edit")
     public ResponseEntity<byte[]> exportForEdit(@RequestParam(defaultValue = "LLBEAN") String buyerKey) {
-        return excelResponse("vendor-code-" + buyerKey + "-edit.xlsx", vendorCodeService.exportForEdit(buyerKey));
+        return excelResponse(managerExcel(buyerKey, "VENDORCODE"), vendorCodeService.exportForEdit(buyerKey));
     }
 
     @PostMapping(value = "/upload-edited", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)

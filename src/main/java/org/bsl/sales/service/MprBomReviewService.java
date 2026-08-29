@@ -15,6 +15,7 @@ import org.bsl.sales.model.MprLine;
 import org.bsl.sales.model.ProductColorAttribute;
 import org.bsl.sales.repository.BomDocumentRepository;
 import org.bsl.sales.repository.MprDocumentRepository;
+import org.bsl.sales.support.BomMprSourceRevision;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
@@ -43,18 +44,15 @@ public class MprBomReviewService {
     private final MprDocumentRepository mprRepository;
     private final BomDocumentRepository bomRepository;
     private final BomLineStore lineStore;
-    private final ProductColorMasterService productColorMasterService;
 
     public MprBomReviewService(
             MprDocumentRepository mprRepository,
             BomDocumentRepository bomRepository,
-            BomLineStore lineStore,
-            ProductColorMasterService productColorMasterService
+            BomLineStore lineStore
     ) {
         this.mprRepository = mprRepository;
         this.bomRepository = bomRepository;
         this.lineStore = lineStore;
-        this.productColorMasterService = productColorMasterService;
     }
 
     /**
@@ -153,10 +151,16 @@ public class MprBomReviewService {
             applyChange(context.bom(), source, review, change);
         }
 
-        context.bom().setUpdatedAt(LocalDateTime.now());
-        context.bom().setUpdatedBy(RequestActor.current());
-        // Keep Product Color / Child Color master links canonical after a MAT COLOR approval.
-        productColorMasterService.synchronizeFromBom(context.bom());
+        LocalDateTime bomChangedAt = LocalDateTime.now();
+        String bomChangedBy = RequestActor.current();
+        BomMprSourceRevision.markChanged(
+                context.bom(),
+                "BOM data updated from approved MPR review",
+                bomChangedBy,
+                bomChangedAt
+        );
+        context.bom().setUpdatedAt(bomChangedAt);
+        context.bom().setUpdatedBy(bomChangedBy);
         lineStore.replaceAll(context.bom());
         lineStore.compactForStorage(context.bom());
         BomDocument savedBom = bomRepository.save(context.bom());
@@ -197,6 +201,11 @@ public class MprBomReviewService {
         BomDocument bom = getBom(bomId);
         MprDocument mpr = mprRepository.findByOrderId(bom.getOrderId())
                 .orElseThrow(() -> new OrderBomMprNotFoundException("MPR has not been created for this order"));
+        if (MprDocument.STATUS_COMPLETED.equalsIgnoreCase(mpr.getStatus())) {
+            throw new OrderBomMprValidationException(
+                    "MPR is completed and locked. Reopen it before changing BOM review data."
+            );
+        }
 
         for (MprLine line : safe(mpr.getLines())) {
             if (line == null || !Objects.equals(bomId, line.getBomId())) continue;
@@ -292,19 +301,16 @@ public class MprBomReviewService {
             throw new OrderBomMprValidationException("Selected Product Color no longer exists in BOM");
         }
 
-        String masterId = trim(productColor.getProductColorMasterId());
-        ProductColorAttribute child = blank(masterId)
-                ? null
-                : productColorMasterService.findChildColor(masterId, "", childColorValue);
-        if (!blank(masterId) && child == null) {
+        ProductColorAttribute child = findBomChildColor(productColor, childColorValue);
+        if (child == null) {
             throw new OrderBomMprValidationException(
-                    "MAT Color must be an existing Child Color of Style Color " + productColor.getColorName()
-                            + ". Add it to Product Color Master or use Recheck Sales."
+                    "MAT Color must be an existing Child Color of Product Color " + productColor.getColorName()
+                            + ". Add it in this BOM or use Recheck Sales."
             );
         }
 
-        String value = child == null ? trim(childColorValue) : trim(child.getChildColor());
-        String childId = child == null ? "" : trim(child.getId());
+        String value = trim(child.getChildColor());
+        String childId = trim(child.getId());
         List<BomLineColorValue> values = source.getProductColorValues() == null
                 ? new ArrayList<>()
                 : new ArrayList<>(source.getProductColorValues());
@@ -349,6 +355,16 @@ public class MprBomReviewService {
         }
         return "";
     }
+
+
+private ProductColorAttribute findBomChildColor(BomProductColor productColor, String value) {
+    String wanted = normalize(value);
+    if (wanted.isBlank() || productColor == null || productColor.getChildColors() == null) return null;
+    for (ProductColorAttribute child : productColor.getChildColors()) {
+        if (child != null && wanted.equals(normalize(child.getChildColor()))) return child;
+    }
+    return null;
+}
 
     private BomProductColor findProductColor(BomDocument bom, String productColorId, String styleColor) {
         for (BomProductColor item : safe(bom.getProductColors())) {

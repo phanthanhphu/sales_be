@@ -17,6 +17,10 @@ import java.util.List;
 @NoArgsConstructor
 @Document(collection = "mprs")
 public class MprDocument {
+    public static final String STATUS_NOT_STARTED = "NOT_STARTED";
+    public static final String STATUS_IN_PROGRESS = "IN_PROGRESS";
+    public static final String STATUS_COMPLETED = "COMPLETED";
+
     @Id
     private String id;
 
@@ -27,12 +31,13 @@ public class MprDocument {
     private String buyerKey;
 
     private String mprNo;
-    /** DRAFT | COMPLETED */
+    /** IN_PROGRESS | COMPLETED. NOT_STARTED is derived when no MPR document exists. */
     private String status;
     private BigDecimal poQuantity;
     private BigDecimal sampleQuantity;
     private List<MprSelection> selections = new ArrayList<>();
     private List<MprLine> lines = new ArrayList<>();
+    private List<MprReopenHistory> reopenHistory = new ArrayList<>();
 
     private String createdBy;
     private String updatedBy;

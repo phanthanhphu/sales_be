@@ -14,7 +14,7 @@ public final class AuditActionResolver {
 
     private static final List<String> ACTION_SEGMENTS = List.of(
             "upload", "upload-edited", "replace-excel", "export", "export-edit", "download",
-            "preview", "generate", "submit", "apply", "recheck", "resolve", "search",
+            "preview", "generate", "submit", "apply", "recheck", "resolve", "reopen", "search",
             "login", "logout", "reset-password", "change-password", "image", "attachments",
             "active", "current", "check-session"
     );
@@ -32,7 +32,6 @@ public final class AuditActionResolver {
         if (path.contains("/master-data/material-ship-to-mappings")) return "MATERIAL_SHIP_TO";
         if (path.contains("/master-data/loss")) return "LOSS";
         if (path.contains("/master-data/ship-tos")) return "SHIP_TO";
-        if (path.contains("/master-data/product-colors")) return "PRODUCT_COLOR";
         if (path.contains("/users")) return "USER";
         if (path.contains("/departments")) return "DEPARTMENT";
         if (path.contains("/buyers")) return "BUYER";
@@ -65,6 +64,7 @@ public final class AuditActionResolver {
                 || path.endsWith("/apply")
                 || path.endsWith("/recheck")
                 || path.endsWith("/resolve")
+                || path.endsWith("/reopen")
                 || path.endsWith("/image")) {
             return EDIT;
         }
