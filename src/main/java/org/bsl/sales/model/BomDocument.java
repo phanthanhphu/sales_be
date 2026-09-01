@@ -62,6 +62,13 @@ public class BomDocument {
     private List<Integer> deletedSourceRows = new ArrayList<>();
 
     /**
+     * Duplicate Product Color columns discarded after an explicit Continue on
+     * Excel upload. Export Original Format clears these zero-based columns so
+     * the downloaded workbook matches the single Product Color stored in BOM.
+     */
+    private List<Integer> ignoredProductColorSourceColumns = new ArrayList<>();
+
+    /**
      * Business revision used only for MPR source tracking.
      * It starts at 0 and is incremented only when BOM data that can affect
      * MPR generation changes (header/product color/packing/material rows).

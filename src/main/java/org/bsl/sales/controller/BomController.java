@@ -74,7 +74,13 @@ public class BomController {
     public BomDocument update(@PathVariable String id, @Valid @RequestBody BomCreateRequest request) { return bomService.update(id, request); }
 
     @PostMapping(value = "/boms/{id}/replace-excel", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
-    public BomDocument replaceExcel(@PathVariable String id, @RequestPart("file") MultipartFile file) { return bomService.replaceExcel(id, file); }
+    public BomDocument replaceExcel(
+            @PathVariable String id,
+            @RequestParam(defaultValue = "false") boolean keepFirstDuplicateProductColors,
+            @RequestPart("file") MultipartFile file
+    ) {
+        return bomService.replaceExcel(id, file, keepFirstDuplicateProductColors);
+    }
 
     @DeleteMapping("/boms/{id}")
     public ResponseEntity<Void> delete(@PathVariable String id) { bomService.delete(id); return ResponseEntity.noContent().build(); }
@@ -240,4 +246,3 @@ public class BomController {
         return safe.isBlank() ? "BOM.xlsx" : safe;
     }
 }
-

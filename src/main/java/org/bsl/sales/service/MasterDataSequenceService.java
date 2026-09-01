@@ -1,6 +1,7 @@
 package org.bsl.sales.service;
 
 import org.bsl.sales.model.MasterDataSequence;
+import org.bsl.sales.support.MasterDataSequentialKey;
 import org.springframework.data.mongodb.core.FindAndModifyOptions;
 import org.springframework.data.mongodb.core.MongoTemplate;
 import org.springframework.data.mongodb.core.query.Criteria;
@@ -14,7 +15,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.LongSupplier;
 
-/** Atomic, process-safe sequence allocator for VC/MI/ST master keys. */
+/** Atomic, process-safe sequence allocator for visible Order, BOM and master-data keys. */
 @Service
 public class MasterDataSequenceService {
     private final MongoTemplate mongoTemplate;
@@ -28,7 +29,21 @@ public class MasterDataSequenceService {
         return reserve(sequenceName, prefix, 1, existingMaxSupplier).get(0);
     }
 
+    public String next(String sequenceName, String prefix, int minimumDigits, LongSupplier existingMaxSupplier) {
+        return reserve(sequenceName, prefix, minimumDigits, 1, existingMaxSupplier).get(0);
+    }
+
     public List<String> reserve(String sequenceName, String prefix, int count, LongSupplier existingMaxSupplier) {
+        return reserve(sequenceName, prefix, 6, count, existingMaxSupplier);
+    }
+
+    public List<String> reserve(
+            String sequenceName,
+            String prefix,
+            int minimumDigits,
+            int count,
+            LongSupplier existingMaxSupplier
+    ) {
         if (count <= 0) return List.of();
         initialize(sequenceName, existingMaxSupplier);
         Query query = Query.query(Criteria.where("_id").is(sequenceName));
@@ -42,7 +57,7 @@ public class MasterDataSequenceService {
         long start = end - count + 1;
         List<String> keys = new ArrayList<>(count);
         for (long value = start; value <= end; value++) {
-            keys.add(prefix + String.format("%06d", value));
+            keys.add(MasterDataSequentialKey.format(prefix, value, minimumDigits));
         }
         return keys;
     }

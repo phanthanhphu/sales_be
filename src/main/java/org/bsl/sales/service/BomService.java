@@ -20,6 +20,7 @@ import org.bsl.sales.model.ProductColorAttribute;
 import org.bsl.sales.model.SalesOrder;
 import org.bsl.sales.support.BuyerKeys;
 import org.bsl.sales.support.BomMprSourceRevision;
+import org.bsl.sales.support.MasterDataSequentialKey;
 import org.bsl.sales.repository.BomDocumentRepository;
 import org.bsl.sales.repository.MprDocumentRepository;
 import org.springframework.core.io.Resource;
@@ -27,6 +28,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.math.BigDecimal;
+import java.text.Normalizer;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -39,6 +41,10 @@ import java.util.UUID;
 
 @Service
 public class BomService {
+    private static final String BOM_NO_PREFIX = "BOM";
+    private static final String BOM_SEQUENCE_PREFIX = "bom_order:";
+    private static final int BOM_NO_MINIMUM_DIGITS = 4;
+
     private final BomDocumentRepository bomRepository;
     private final MprDocumentRepository mprRepository;
     private final OrderService orderService;
@@ -47,6 +53,7 @@ public class BomService {
     private final BomImageStorageService imageStorage;
     private final BomLineStore lineStore;
     private final BomProductColorLegacyMigrationService productColorLegacyMigration;
+    private final MasterDataSequenceService sequenceService;
 
     public BomService(
             BomDocumentRepository bomRepository,
@@ -56,7 +63,8 @@ public class BomService {
             BomFileStorageService fileStorage,
             BomImageStorageService imageStorage,
             BomLineStore lineStore,
-            BomProductColorLegacyMigrationService productColorLegacyMigration
+            BomProductColorLegacyMigrationService productColorLegacyMigration,
+            MasterDataSequenceService sequenceService
     ) {
         this.bomRepository = bomRepository;
         this.mprRepository = mprRepository;
@@ -66,6 +74,7 @@ public class BomService {
         this.imageStorage = imageStorage;
         this.lineStore = lineStore;
         this.productColorLegacyMigration = productColorLegacyMigration;
+        this.sequenceService = sequenceService;
     }
 
     public List<BomDocument> listByOrder(String orderId) {
@@ -148,11 +157,10 @@ public class BomService {
         bom.setId(UUID.randomUUID().toString());
         bom.setOrderId(orderId);
         bom.setBuyerKey(BuyerKeys.legacyDefault(order.getBuyerKey()));
-        String normalizedBomNo = required(request.bomNo(), "BOM No is required");
-        ensureUniqueBomNo(orderId, normalizedBomNo, null);
-        bom.setBomNo(normalizedBomNo);
-        bom.setBomNoKey(normalize(normalizedBomNo));
         bom.setBomName(required(request.bomName(), "BOM Name is required"));
+        String generatedBomNo = nextAvailableBomNo(orderId);
+        bom.setBomNo(generatedBomNo);
+        bom.setBomNoKey(normalize(generatedBomNo));
         bom.setHeader(request.header() == null ? new org.bsl.sales.model.BomHeader() : request.header());
         bom.setStatus("DRAFT");
         bom.setCreatedAt(now);
@@ -173,21 +181,32 @@ public class BomService {
     public BomDocument update(String id, BomCreateRequest request) {
         BomDocument bom = get(id);
         ensureEditable(bom);
-        String normalizedBomNo = required(request.bomNo(), "BOM No is required");
-        ensureUniqueBomNo(bom.getOrderId(), normalizedBomNo, bom.getId());
-        bom.setBomNo(normalizedBomNo);
-        bom.setBomNoKey(normalize(normalizedBomNo));
+        // BOM No is immutable. Never trust or apply a value sent by the client.
+        // Assign a generated number only for a malformed legacy record that has none.
+        if (normalize(bom.getBomNo()).isBlank()) {
+            String generatedBomNo = nextAvailableBomNo(bom.getOrderId());
+            bom.setBomNo(generatedBomNo);
+        }
+        bom.setBomNoKey(normalize(bom.getBomNo()));
         bom.setBomName(required(request.bomName(), "BOM Name is required"));
         bom.setHeader(request.header() == null ? new org.bsl.sales.model.BomHeader() : request.header());
         return saveMprSourceChanged(bom, "BOM header updated");
     }
 
     public BomDocument replaceExcel(String id, MultipartFile file) {
+        return replaceExcel(id, file, false);
+    }
+
+    public BomDocument replaceExcel(
+            String id,
+            MultipartFile file,
+            boolean keepFirstDuplicateProductColors
+    ) {
         BomDocument bom = get(id);
         ensureEditable(bom);
         requireLlBeanImplementation(bom.getBuyerKey(), "BOM Excel replacement");
 
-        BomExcelParser.ParsedBom parsed = excelParser.parse(file);
+        BomExcelParser.ParsedBom parsed = excelParser.parse(file, keepFirstDuplicateProductColors);
         validateParsedBom(parsed);
         BomFileStorageService.StoredFile stored = fileStorage.store(file);
 
@@ -279,9 +298,7 @@ public BomDocument addProductColor(String bomId, BomProductColorRequest request)
     String season = required(request.season(), "Season is required");
     String styleNumber = required(request.styleNumber(), "Style Number is required");
     if (findProductColorByIdentity(bom, patternNumber, colorName, season, styleNumber) != null) {
-        throw new OrderBomMprValidationException(
-                "Product Color already exists in this BOM for the same Pattern Number, Color, Season and Style Number"
-        );
+        throw duplicateProductColorException(colorName, patternNumber, season, styleNumber);
     }
 
     BomProductColor productColor = new BomProductColor();
@@ -322,9 +339,7 @@ public BomDocument updateProductColor(String bomId, String productColorId, BomPr
             bom, newPatternNumber, newColorName, newSeason, newStyleNumber
     );
     if (duplicate != null && !Objects.equals(duplicate.getId(), productColor.getId())) {
-        throw new OrderBomMprValidationException(
-                "Product Color already exists in this BOM for the same Pattern Number, Color, Season and Style Number"
-        );
+        throw duplicateProductColorException(newColorName, newPatternNumber, newSeason, newStyleNumber);
     }
 
     productColor.setColorName(newColorName);
@@ -645,6 +660,7 @@ public BomDocument updateProductColor(String bomId, String productColorId, BomPr
         bom.setCoreLines(new ArrayList<>(safe(parsed.coreLines())));
         bom.setPackings(new ArrayList<>(safe(parsed.packings())));
         bom.setDeletedSourceRows(new ArrayList<>());
+        bom.setIgnoredProductColorSourceColumns(new ArrayList<>(safe(parsed.ignoredProductColorSourceColumns())));
         normalizeProductColorLinks(bom);
 
         for (BomExcelParser.ParsedAttachment imported : safe(parsed.importedAttachments())) {
@@ -761,6 +777,9 @@ public BomDocument updateProductColor(String bomId, String productColorId, BomPr
      * one oversized document containing every material line or any image bytes.
      */
     private BomDocument persistAggregate(BomDocument bom) {
+        // Last-line write guard: no mutation path is allowed to persist two
+        // Product Color records with the same four business keys.
+        validateProductColorBusinessUniqueness(ensureProductColorsList(bom));
         normalizeProductColorLinks(bom);
         lineStore.replaceAll(bom);
         lineStore.compactForStorage(bom);
@@ -919,9 +938,11 @@ public BomDocument updateProductColor(String bomId, String productColorId, BomPr
     }
 
     /**
-     * Keeps the first Product Color for an exact identity match and redirects
-     * every BOM link to it. This makes old records and imported duplicate
-     * columns self-healing instead of failing with "Duplicate Product Color".
+     * Legacy compatibility only: keeps the first Product Color for an exact
+     * four-key identity match and redirects old saved links to it.
+     *
+     * Current Add/Edit/Excel-import flows reject new duplicates before save;
+     * this repair path remains only so historical BOMs are not made unusable.
      */
     private void mergeDuplicateProductColors(BomDocument bom) {
         List<BomProductColor> source = ensureProductColorsList(bom);
@@ -993,11 +1014,69 @@ public BomDocument updateProductColor(String bomId, String productColorId, BomPr
     }
 
     private String productColorIdentityKey(BomProductColor item) {
+        return productColorIdentityKey(
+                item == null ? null : item.getColorName(),
+                item == null ? null : item.getPatternNumber(),
+                item == null ? null : item.getSeason(),
+                item == null ? null : item.getStyleNumber()
+        );
+    }
+
+    /**
+     * Business uniqueness for one BOM Product Color.
+     *
+     * productColorId remains the technical identity used by FE/BE references.
+     * These four fields only define whether two Product Color records are a
+     * duplicate from the user's business point of view.
+     */
+    private String productColorIdentityKey(
+            String colorName,
+            String patternNumber,
+            String season,
+            String styleNumber
+    ) {
         return String.join("\u001F",
-                normalize(item == null ? null : item.getPatternNumber()),
-                normalize(item == null ? null : item.getColorName()),
-                normalize(item == null ? null : item.getSeason()),
-                normalize(item == null ? null : item.getStyleNumber())
+                normalizeProductColorIdentityPart(colorName),
+                normalizeProductColorIdentityPart(patternNumber),
+                normalizeProductColorIdentityPart(season),
+                normalizeProductColorIdentityPart(styleNumber)
+        );
+    }
+
+    private String normalizeProductColorIdentityPart(String value) {
+        String normalized = Normalizer.normalize(trim(value), Normalizer.Form.NFKC)
+                .replace('\u00A0', ' ')
+                .replace('\u202F', ' ')
+                .replace('\u2007', ' ')
+                .replaceAll("\\s+", " ")
+                .trim();
+        return normalized.toUpperCase(Locale.ROOT);
+    }
+
+    private String productColorIdentityDisplay(
+            String colorName,
+            String patternNumber,
+            String season,
+            String styleNumber
+    ) {
+        return String.join(" · ",
+                trim(colorName),
+                trim(patternNumber),
+                trim(season),
+                trim(styleNumber)
+        );
+    }
+
+    private OrderBomMprValidationException duplicateProductColorException(
+            String colorName,
+            String patternNumber,
+            String season,
+            String styleNumber
+    ) {
+        return new OrderBomMprValidationException(
+                "Duplicate Product Color detected. This BOM already contains the same "
+                        + "Product / Style Color + Pattern Number + Season + Style Number: "
+                        + productColorIdentityDisplay(colorName, patternNumber, season, styleNumber)
         );
     }
 
@@ -1331,17 +1410,11 @@ private void validateLocalChildColors(BomProductColor productColor) {
             String season,
             String styleNumber
     ) {
-        String wantedPattern = normalize(patternNumber);
-        String wantedColor = normalize(colorName);
-        String wantedSeason = normalize(season);
-        String wantedStyle = normalize(styleNumber);
-        if (wantedColor.isBlank()) return null;
+        String wanted = productColorIdentityKey(colorName, patternNumber, season, styleNumber);
+        if (normalizeProductColorIdentityPart(colorName).isBlank()) return null;
         return ensureProductColorsList(bom).stream()
                 .filter(Objects::nonNull)
-                .filter(item -> wantedPattern.equals(normalize(item.getPatternNumber())))
-                .filter(item -> wantedColor.equals(normalize(item.getColorName())))
-                .filter(item -> wantedSeason.equals(normalize(item.getSeason())))
-                .filter(item -> wantedStyle.equals(normalize(item.getStyleNumber())))
+                .filter(item -> wanted.equals(productColorIdentityKey(item)))
                 .findFirst()
                 .orElse(null);
     }
@@ -1466,15 +1539,27 @@ private void validateLocalChildColors(BomProductColor productColor) {
         return result;
     }
 
-    private void ensureUniqueBomNo(String orderId, String bomNo, String excludedBomId) {
-        String key = normalize(bomNo);
-        if (key.isBlank()) throw new OrderBomMprValidationException("BOM No is required");
-        boolean duplicate = excludedBomId == null
-                ? bomRepository.existsByOrderIdAndBomNoKey(orderId, key)
-                : bomRepository.existsByOrderIdAndBomNoKeyAndIdNot(orderId, key, excludedBomId);
-        if (duplicate) {
-            throw new OrderBomMprValidationException("BOM No already exists in this Order: " + bomNo);
+    private String nextAvailableBomNo(String orderId) {
+        String sequenceName = BOM_SEQUENCE_PREFIX + orderId;
+        for (int attempt = 0; attempt < 100; attempt++) {
+            String candidate = sequenceService.next(
+                    sequenceName,
+                    BOM_NO_PREFIX,
+                    BOM_NO_MINIMUM_DIGITS,
+                    () -> maxExistingBomSequence(orderId)
+            );
+            if (!bomRepository.existsByOrderIdAndBomNoKey(orderId, normalize(candidate))) {
+                return candidate;
+            }
         }
+        throw new OrderBomMprValidationException("Unable to allocate the next BOM No. Please try again.");
+    }
+
+    private long maxExistingBomSequence(String orderId) {
+        List<String> existingBomNos = bomRepository.findByOrderIdOrderByCreatedAtDescUpdatedAtDesc(orderId).stream()
+                .map(BomDocument::getBomNo)
+                .toList();
+        return MasterDataSequentialKey.maxNumber(existingBomNos, BOM_NO_PREFIX);
     }
 
     private void validateParsedBom(BomExcelParser.ParsedBom parsed) {
@@ -1518,17 +1603,40 @@ private void validateLocalChildColors(BomProductColor productColor) {
     }
 
 
+private void validateProductColorBusinessUniqueness(List<BomProductColor> productColors) {
+    LinkedHashMap<String, BomProductColor> byBusinessIdentity = new LinkedHashMap<>();
+    for (BomProductColor color : safe(productColors)) {
+        if (color == null) continue;
+        String identity = productColorIdentityKey(color);
+        BomProductColor existing = byBusinessIdentity.putIfAbsent(identity, color);
+        if (existing != null) {
+            throw duplicateProductColorException(
+                    color.getColorName(),
+                    color.getPatternNumber(),
+                    color.getSeason(),
+                    color.getStyleNumber()
+            );
+        }
+    }
+}
+
+
 private void validateProductColors(List<BomProductColor> productColors) {
+    validateProductColorBusinessUniqueness(productColors);
+
     LinkedHashSet<String> ids = new LinkedHashSet<>();
     LinkedHashSet<Integer> sequences = new LinkedHashSet<>();
+
     for (BomProductColor color : safe(productColors)) {
         if (color == null) throw new OrderBomMprValidationException("Product Color contains an empty item");
         String name = required(color.getColorName(), "Product Color name is required");
         if (trim(color.getId()).isBlank()) color.setId(UUID.randomUUID().toString());
         color.setProductColorMasterId(null);
+
         if (!ids.add(color.getId())) {
             throw new OrderBomMprValidationException("Duplicate Product Color id: " + color.getId());
         }
+
         Integer sequence = color.getSequence();
         if (sequence == null || sequence <= 0) {
             throw new OrderBomMprValidationException("Product Color sequence must be greater than 0: " + name);

@@ -9,6 +9,7 @@ import org.apache.poi.xssf.usermodel.XSSFPictureData;
 import org.apache.poi.xssf.usermodel.XSSFShape;
 import org.apache.poi.xssf.usermodel.XSSFSheet;
 import org.bsl.sales.exception.OrderBomMprValidationException;
+import org.bsl.sales.exception.BomExcelDuplicateProductColorException;
 import org.bsl.sales.model.BomHeader;
 import org.bsl.sales.model.BomLine;
 import org.bsl.sales.model.BomLineColorValue;
@@ -23,6 +24,7 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.math.BigDecimal;
+import java.text.Normalizer;
 import java.util.*;
 
 /**
@@ -41,6 +43,23 @@ public class BomExcelParser {
     private static final int MAX_BOM_SHEETS = 20;
 
     public ParsedBom parse(MultipartFile file) {
+        return parse(file, false);
+    }
+
+    /**
+     * Parses one BOM workbook.
+     *
+     * Duplicate Product Colors are determined only by Product / Style Color,
+     * Pattern Number, Season and Style Number. Child Color/material-row values
+     * are intentionally not part of duplicate detection.
+     *
+     * The first call normally uses keepFirstDuplicateProductColors=false. When
+     * duplicates exist, parsing stops with a structured confirmation exception
+     * before any BOM data is stored. After the user explicitly continues, the
+     * caller retries with true; every duplicate column then points to the first
+     * Product Color so the persisted BOM contains exactly one record.
+     */
+    public ParsedBom parse(MultipartFile file, boolean keepFirstDuplicateProductColors) {
         if (file == null || file.isEmpty()) {
             throw new OrderBomMprValidationException("BOM Excel file is required");
         }
@@ -70,8 +89,21 @@ public class BomExcelParser {
 
             BomExcelLayout layout = BomExcelLayout.detect(sheet, headerRow, formatter, evaluator);
             BomHeader header = parseHeader(sheet, formatter, evaluator);
-            Map<Integer, BomProductColor> productColorColumns = findProductColorColumns(sheet, headerRow, layout, formatter, evaluator);
+            Map<Integer, BomProductColor> productColorColumns = findProductColorColumns(
+                    sheet,
+                    headerRow,
+                    layout,
+                    formatter,
+                    evaluator,
+                    keepFirstDuplicateProductColors
+            );
             List<BomProductColor> productColors = distinctProductColors(productColorColumns.values());
+            List<Integer> ignoredProductColorSourceColumns = productColorColumns.entrySet().stream()
+                    .filter(entry -> entry.getValue() != null
+                            && entry.getValue().getSourceColumnIndex() != null
+                            && !Objects.equals(entry.getKey(), entry.getValue().getSourceColumnIndex()))
+                    .map(Map.Entry::getKey)
+                    .toList();
 
             List<BomLine> coreLines = new ArrayList<>();
             List<BomPacking> packings = new ArrayList<>();
@@ -151,7 +183,8 @@ public class BomExcelParser {
                     productColors,
                     coreLines,
                     packings,
-                    importedAttachments
+                    importedAttachments,
+                    ignoredProductColorSourceColumns
             );
         } catch (IOException ex) {
             throw new OrderBomMprValidationException("Unable to read BOM Excel file: " + ex.getMessage());
@@ -334,10 +367,13 @@ public class BomExcelParser {
             int headerRow,
             BomExcelLayout layout,
             DataFormatter formatter,
-            FormulaEvaluator evaluator
+            FormulaEvaluator evaluator,
+            boolean keepFirstDuplicateProductColors
     ) {
         Map<Integer, BomProductColor> result = new LinkedHashMap<>();
-        Map<String, BomProductColor> canonicalByIdentity = new LinkedHashMap<>();
+        Map<String, Integer> firstColumnByIdentity = new LinkedHashMap<>();
+        Map<String, BomProductColor> firstProductColorByIdentity = new LinkedHashMap<>();
+        Map<String, List<Integer>> duplicateColumnsByIdentity = new LinkedHashMap<>();
 
         for (int column = layout.firstColorColumn(); column <= layout.lastColorColumn(); column++) {
             String colorName = text(sheet.getRow(layout.colorNameRow(headerRow)), column, formatter, evaluator);
@@ -356,17 +392,27 @@ public class BomExcelParser {
                     : integer(sheet.getRow(layout.sequenceRow(headerRow)), column, formatter, evaluator);
 
             /*
-             * A Product Color is identical only when Pattern Number, Color,
-             * Season and Style Number all match. Duplicate Excel columns reuse
-             * the first Product Color id instead of creating a second item.
-             * Columns with the same visible color but a different identity are
-             * still kept as separate Product Colors.
+             * Product Color business uniqueness is exactly these four fields:
+             * Product / Style Color + Pattern Number + Season + Style Number.
+             *
+             * Do not silently merge duplicate Excel columns. The first request
+             * returns a structured confirmation response before any BOM data is
+             * replaced. Only an explicit Continue aliases later columns to the
+             * first Product Color.
              */
-            String identity = productColorIdentityKey(patternNumber, colorName, season, styleNumber);
-            BomProductColor existing = canonicalByIdentity.get(identity);
-            if (existing != null) {
-                if (existing.getSequence() == null && sequence != null) existing.setSequence(sequence);
-                result.put(column, existing);
+            String identity = productColorIdentityKey(colorName, patternNumber, season, styleNumber);
+            Integer firstColumn = firstColumnByIdentity.putIfAbsent(identity, column);
+            if (firstColumn != null) {
+                duplicateColumnsByIdentity
+                        .computeIfAbsent(identity, ignored -> new ArrayList<>())
+                        .add(column);
+
+                // On explicit Continue, retain the first/leftmost Product
+                // Color object and alias this Excel column to its stable id.
+                // parseLine already keeps only one value per productColorId.
+                if (keepFirstDuplicateProductColors) {
+                    result.put(column, firstProductColorByIdentity.get(identity));
+                }
                 continue;
             }
 
@@ -378,8 +424,26 @@ public class BomExcelParser {
             productColor.setStyleNumber(styleNumber);
             productColor.setSequence(sequence);
             productColor.setSourceColumnIndex(column);
-            canonicalByIdentity.put(identity, productColor);
+            firstProductColorByIdentity.put(identity, productColor);
             result.put(column, productColor);
+        }
+
+        if (!duplicateColumnsByIdentity.isEmpty() && !keepFirstDuplicateProductColors) {
+            List<BomExcelDuplicateProductColorException.DuplicateProductColor> duplicates = new ArrayList<>();
+            for (Map.Entry<String, List<Integer>> duplicateEntry : duplicateColumnsByIdentity.entrySet()) {
+                String identity = duplicateEntry.getKey();
+                BomProductColor kept = firstProductColorByIdentity.get(identity);
+                Integer keptColumn = firstColumnByIdentity.get(identity);
+                duplicates.add(new BomExcelDuplicateProductColorException.DuplicateProductColor(
+                        kept == null ? "" : kept.getColorName(),
+                        kept == null ? "" : kept.getPatternNumber(),
+                        kept == null ? "" : kept.getSeason(),
+                        kept == null ? "" : kept.getStyleNumber(),
+                        excelColumn(keptColumn == null ? -1 : keptColumn),
+                        duplicateEntry.getValue().stream().map(this::excelColumn).toList()
+                ));
+            }
+            throw new BomExcelDuplicateProductColorException(duplicates);
         }
         return result;
     }
@@ -407,16 +471,40 @@ public class BomExcelParser {
     }
 
     private String productColorIdentityKey(
-            String patternNumber,
             String colorName,
+            String patternNumber,
             String season,
             String styleNumber
     ) {
         return String.join("\u001F",
-                normalize(patternNumber),
-                normalize(colorName),
-                normalize(season),
-                normalize(styleNumber)
+                normalizeProductColorIdentityPart(colorName),
+                normalizeProductColorIdentityPart(patternNumber),
+                normalizeProductColorIdentityPart(season),
+                normalizeProductColorIdentityPart(styleNumber)
+        );
+    }
+
+    private String normalizeProductColorIdentityPart(String value) {
+        String normalized = Normalizer.normalize(value == null ? "" : value.trim(), Normalizer.Form.NFKC)
+                .replace('\u00A0', ' ')
+                .replace('\u202F', ' ')
+                .replace('\u2007', ' ')
+                .replaceAll("\\s+", " ")
+                .trim();
+        return normalized.toUpperCase(Locale.ROOT);
+    }
+
+    private String productColorIdentityDisplay(
+            String colorName,
+            String patternNumber,
+            String season,
+            String styleNumber
+    ) {
+        return String.join(" · ",
+                colorName == null ? "" : colorName.trim(),
+                patternNumber == null ? "" : patternNumber.trim(),
+                season == null ? "" : season.trim(),
+                styleNumber == null ? "" : styleNumber.trim()
         );
     }
 
@@ -913,6 +1001,7 @@ public class BomExcelParser {
             List<BomProductColor> productColors,
             List<BomLine> coreLines,
             List<BomPacking> packings,
-            List<ParsedAttachment> importedAttachments
+            List<ParsedAttachment> importedAttachments,
+            List<Integer> ignoredProductColorSourceColumns
     ) { }
 }

@@ -11,5 +11,4 @@ public interface BomDocumentRepository extends MongoRepository<BomDocument, Stri
     long countByOrderId(String orderId);
     boolean existsByOrderIdAndStatusIgnoreCase(String orderId, String status);
     boolean existsByOrderIdAndBomNoKey(String orderId, String bomNoKey);
-    boolean existsByOrderIdAndBomNoKeyAndIdNot(String orderId, String bomNoKey, String id);
 }

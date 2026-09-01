@@ -9,6 +9,7 @@ import org.apache.poi.xssf.usermodel.XSSFDrawing;
 import org.apache.poi.xssf.usermodel.XSSFPicture;
 import org.apache.poi.xssf.usermodel.XSSFShape;
 import org.apache.poi.xssf.usermodel.XSSFSheet;
+import org.bsl.sales.exception.MprExcelExportIntegrityException;
 import org.bsl.sales.model.BomAttachment;
 import org.bsl.sales.model.BomDocument;
 import org.bsl.sales.model.BomHeader;
@@ -98,9 +99,14 @@ public class OrderBomMprExcelExporter {
     private static final int MPR_TOTAL_STYLE_AMOUNT_COL = 32;
 
     private final BomFileStorageService fileStorage;
+    private final MprExcelExportValidator mprExcelExportValidator;
 
-    public OrderBomMprExcelExporter(BomFileStorageService fileStorage) {
+    public OrderBomMprExcelExporter(
+            BomFileStorageService fileStorage,
+            MprExcelExportValidator mprExcelExportValidator
+    ) {
         this.fileStorage = fileStorage;
+        this.mprExcelExportValidator = mprExcelExportValidator;
     }
 
     /**
@@ -669,6 +675,7 @@ public class OrderBomMprExcelExporter {
                 List.of("REV. STAGE", "PATTERN DATE", "FACTORY PRODUCT")
         );
 
+        clearIgnoredProductColorSourceColumns(sheet, headerRow, layout, bom);
         patchProductColorHeaders(sheet, headerRow, layout, bom, colorColumns);
         normalizeOutsideBomTableArea(workbook, sheet, headerRow, layout, colorColumns);
         ensureProductColorImageSlots(workbook, sheet, headerRow, layout, colorColumns);
@@ -1207,6 +1214,69 @@ public class OrderBomMprExcelExporter {
             Integer column = productColorColumn(productColor, layout, colorColumns);
             if (column == null) continue;
             setCell(getOrCreateCell(row, column), productColorValue(line, productColor));
+        }
+    }
+
+    /**
+     * Removes duplicate Excel columns that the user explicitly discarded with
+     * Continue / Keep One. The stored MongoDB data already contains only the
+     * first Product Color; this keeps Export Original Format consistent with
+     * that data instead of exposing the ignored duplicate columns again.
+     */
+    private void clearIgnoredProductColorSourceColumns(
+            Sheet sheet,
+            int headerRow,
+            BomExcelLayout layout,
+            BomDocument bom
+    ) {
+        LinkedHashSet<Integer> ignoredColumns = new LinkedHashSet<>();
+        for (Integer column : safe(bom == null ? null : bom.getIgnoredProductColorSourceColumns())) {
+            if (column != null
+                    && column >= layout.firstColorColumn()
+                    && column <= layout.lastColorColumn()) {
+                ignoredColumns.add(column);
+            }
+        }
+        if (ignoredColumns.isEmpty()) return;
+
+        LinkedHashSet<Integer> productColorHeaderRows = new LinkedHashSet<>();
+        productColorHeaderRows.add(layout.patternNumberRow(headerRow));
+        productColorHeaderRows.add(layout.seasonRow(headerRow));
+        productColorHeaderRows.add(layout.colorNameRow(headerRow));
+        if (layout.styleNumberRow(headerRow) >= 0) productColorHeaderRows.add(layout.styleNumberRow(headerRow));
+        if (layout.sequenceRow(headerRow) >= 0) productColorHeaderRows.add(layout.sequenceRow(headerRow));
+
+        for (Integer column : ignoredColumns) {
+            for (Integer rowIndex : productColorHeaderRows) {
+                if (rowIndex == null || rowIndex < 0) continue;
+                clearCell(getOrCreateRow(sheet, rowIndex), column);
+            }
+            for (int rowIndex = layout.dataStartRow(headerRow); rowIndex <= sheet.getLastRowNum(); rowIndex++) {
+                Row row = sheet.getRow(rowIndex);
+                if (row != null) clearCell(row, column);
+            }
+        }
+
+        removePicturesAnchoredInColumns(sheet, ignoredColumns);
+    }
+
+    private void removePicturesAnchoredInColumns(Sheet sheet, Collection<Integer> columns) {
+        if (columns == null || columns.isEmpty() || !(sheet instanceof XSSFSheet xssfSheet)) return;
+        XSSFDrawing drawing = xssfSheet.getDrawingPatriarch();
+        if (drawing == null) return;
+
+        var xml = drawing.getCTDrawing();
+        for (int index = xml.sizeOfTwoCellAnchorArray() - 1; index >= 0; index--) {
+            var anchor = xml.getTwoCellAnchorArray(index);
+            if (anchor.isSetPic() && anchor.getFrom() != null && columns.contains(anchor.getFrom().getCol())) {
+                xml.removeTwoCellAnchor(index);
+            }
+        }
+        for (int index = xml.sizeOfOneCellAnchorArray() - 1; index >= 0; index--) {
+            var anchor = xml.getOneCellAnchorArray(index);
+            if (anchor.isSetPic() && anchor.getFrom() != null && columns.contains(anchor.getFrom().getCol())) {
+                xml.removeOneCellAnchor(index);
+            }
         }
     }
 
@@ -2639,16 +2709,22 @@ public class OrderBomMprExcelExporter {
             sheet.setForceFormulaRecalculation(true);
             workbook.setForceFormulaRecalculation(true);
 
-            // There are no external formulas in the exported data. Formula
-            // values are calculated once now and will also recalculate in Excel.
-            try {
-                workbook.getCreationHelper().createFormulaEvaluator().evaluateAll();
-            } catch (RuntimeException ignored) {
-                // Excel will recalculate because forceFormulaRecalculation is set.
-            }
+            // Do not use Apache POI's partial calculation engine as part of
+            // export. Excel owns the final calculation and will recalculate on
+            // open because both recalculation flags above are enabled.
 
             workbook.write(out);
-            return out.toByteArray();
+            byte[] exported = out.toByteArray();
+
+            // Validate the exact serialized bytes before they are returned to
+            // the browser. If the package/XML, sheet structure, formulas,
+            // defined names or merged regions are invalid, fail the export
+            // instead of letting the user download an Excel file that opens in
+            // Repair mode.
+            mprExcelExportValidator.validate(exported, lines.size());
+            return exported;
+        } catch (MprExcelExportIntegrityException ex) {
+            throw ex;
         } catch (Exception ex) {
             throw new IllegalStateException("Unable to export MPR from the Excel template", ex);
         }
@@ -2710,7 +2786,12 @@ public class OrderBomMprExcelExporter {
 
             String normalized = formula.toUpperCase(Locale.ROOT);
             boolean brokenReference = normalized.contains("#REF!");
-            boolean externalReference = normalized.contains("[") && normalized.contains("]!");
+            // External workbook references appear in several legal Excel forms,
+            // e.g. [5]Loss!$H$1 or '[4]BOM Details'!$A$1. Do not require
+            // the ']' and '!' characters to be adjacent.
+            boolean externalReference = normalized.contains("[")
+                    && normalized.contains("]")
+                    && normalized.contains("!");
             if (brokenReference || externalReference) {
                 workbook.removeName(name);
             }
@@ -2813,11 +2894,24 @@ public class OrderBomMprExcelExporter {
         int firstExcelDataRow = MPR_DATA_START_ROW + 1;
         int lastExcelDataRow = Math.max(firstExcelDataRow, lastDataRow + 1);
 
-        // Row 1 totals retain the original look but calculate against the new
-        // 34-column MPR layout.
-        setCellFormula(sheet, 0, MPR_PO_QTY_COL,
-                "IFERROR(SUBTOTAL(9," + excelColumn(MPR_PO_QTY_COL) + firstExcelDataRow + ":"
-                        + excelColumn(MPR_PO_QTY_COL) + lastExcelDataRow + "),0)");
+        // N1:T1 is a shared-formula range in the approved template: N1 owns
+        // the formula definition and O1:T1 only reference that shared master.
+        // Replacing N1 alone leaves O1:T1 orphaned, so Apache POI later fails
+        // with "Error evaluating cell MPR!O1". Rewrite every member as an
+        // independent formula while preserving the same totals-row layout.
+        // Clearing first is important: merely changing the formula text can
+        // retain the old OOXML shared-formula attributes on an XSSFCell.
+        Row totals = getOrCreateRow(sheet, 0);
+        for (int column = MPR_PO_QTY_COL; column <= MPR_SAP_STOCK_COL; column++) {
+            getOrCreateCell(totals, column).setBlank();
+        }
+        for (int column = MPR_PO_QTY_COL; column <= MPR_SAP_STOCK_COL; column++) {
+            String excelColumn = excelColumn(column);
+            setCellFormula(totals, column,
+                    "IFERROR(SUBTOTAL(9," + excelColumn + firstExcelDataRow + ":"
+                            + excelColumn + lastExcelDataRow + "),0)");
+        }
+
         setCellFormula(sheet, 0, MPR_PURCHASE_QTY_COL,
                 "IFERROR(SUBTOTAL(9," + excelColumn(MPR_PURCHASE_QTY_COL) + firstExcelDataRow + ":"
                         + excelColumn(MPR_PURCHASE_QTY_COL) + lastExcelDataRow + "),0)");

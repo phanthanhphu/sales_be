@@ -6,8 +6,8 @@ import jakarta.validation.constraints.Size;
 import org.bsl.sales.model.BomHeader;
 
 public record BomCreateRequest(
-        @NotBlank(message = "BOM No is required")
-        @Size(max = 100, message = "BOM No must not exceed 100 characters")
+        // Retained for backward-compatible JSON. The service always generates
+        // and preserves BOM No; any client-provided value is ignored.
         String bomNo,
         @NotBlank(message = "BOM Name is required")
         @Size(max = 200, message = "BOM Name must not exceed 200 characters")

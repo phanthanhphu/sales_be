@@ -26,6 +26,23 @@ public final class MasterDataSequentialKey {
         return format(prefix, counter.incrementAndGet());
     }
 
+    /**
+     * Formats a visible key with at least {@code minimumDigits} numeric digits.
+     * The value is not capped, so 10,000 with four digits becomes BOM10000.
+     */
+    public static String format(String prefix, long number, int minimumDigits) {
+        if (prefix == null || prefix.isBlank()) {
+            throw new IllegalArgumentException("Prefix is required");
+        }
+        if (number < 0) {
+            throw new IllegalArgumentException("Sequence number must not be negative");
+        }
+        if (minimumDigits < 1 || minimumDigits > 18) {
+            throw new IllegalArgumentException("Minimum digits must be between 1 and 18");
+        }
+        return String.format(Locale.ROOT, "%s%0" + minimumDigits + "d", prefix, number);
+    }
+
     public static void ensure(Supplier<String> getter, Consumer<String> setter, AtomicLong counter, String prefix) {
         String current = getter == null ? null : getter.get();
         if (current == null || current.trim().isEmpty()) {
@@ -59,7 +76,7 @@ public final class MasterDataSequentialKey {
         return max;
     }
 
-    private static String format(String prefix, long number) {
-        return String.format(Locale.ROOT, "%s%06d", prefix, number);
+    public static String format(String prefix, long number) {
+        return format(prefix, number, 6);
     }
 }

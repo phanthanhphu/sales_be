@@ -1,40 +1,29 @@
-# syntax=docker/dockerfile:1.7
-
 # ===== BUILD STAGE =====
-FROM node:20-alpine AS build
+FROM gradle:8.7-jdk17 AS build
 
 WORKDIR /app
 
-COPY package.json package-lock.json ./
+COPY gradlew .
+COPY gradle gradle
+COPY build.gradle .
+COPY settings.gradle .
 
-RUN --mount=type=cache,id=sales-fe-npm,target=/root/.npm \
-    npm ci --prefer-offline --no-audit --progress=false
+RUN chmod +x gradlew
 
-COPY . .
+RUN ./gradlew dependencies --no-daemon || true
 
-ARG VITE_APP_VERSION=v2.1.0
-ARG VITE_APP_BASE_NAME=/
-ARG VITE_APP_PROTOCOL=http
-ARG VITE_APP_HOST=10.232.100.69
-ARG VITE_API_PORT=8082
+COPY src src
 
-ENV VITE_APP_VERSION=$VITE_APP_VERSION
-ENV VITE_APP_BASE_NAME=$VITE_APP_BASE_NAME
-ENV VITE_APP_PROTOCOL=$VITE_APP_PROTOCOL
-ENV VITE_APP_HOST=$VITE_APP_HOST
-ENV VITE_API_PORT=$VITE_API_PORT
+RUN ./gradlew clean bootJar -x test --no-daemon
 
-RUN npm run build
 
 # ===== RUN STAGE =====
-FROM nginx:alpine
+FROM eclipse-temurin:17-jre
 
-ARG NGINX_CONF=nginx.http.conf
-ARG APP_PORT=80
+WORKDIR /app
 
-COPY ${NGINX_CONF} /etc/nginx/conf.d/default.conf
-COPY --from=build /app/dist /usr/share/nginx/html
+COPY --from=build /app/build-local/libs/*.jar app.jar
 
-EXPOSE ${APP_PORT}
+EXPOSE 8082
 
-CMD ["nginx", "-g", "daemon off;"]
+ENTRYPOINT ["java", "-jar", "app.jar"]
