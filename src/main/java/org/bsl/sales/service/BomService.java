@@ -41,7 +41,8 @@ import java.util.UUID;
 
 @Service
 public class BomService {
-    private static final String BOM_NO_PREFIX = "BOM";
+    private static final String BOM_NO_PREFIX = "B";
+    private static final String LEGACY_BOM_NO_PREFIX = "BOM";
     private static final String BOM_SEQUENCE_PREFIX = "bom_order:";
     private static final int BOM_NO_MINIMUM_DIGITS = 4;
 
@@ -288,88 +289,88 @@ public class BomService {
     }
 
 
-/** Adds a Product Color owned only by this BOM. */
-public BomDocument addProductColor(String bomId, BomProductColorRequest request) {
-    BomDocument bom = get(bomId);
-    ensureEditable(bom);
+    /** Adds a Product Color owned only by this BOM. */
+    public BomDocument addProductColor(String bomId, BomProductColorRequest request) {
+        BomDocument bom = get(bomId);
+        ensureEditable(bom);
 
-    String colorName = required(request.colorName(), "Product Color is required");
-    String patternNumber = required(request.patternNumber(), "Pattern Number is required");
-    String season = required(request.season(), "Season is required");
-    String styleNumber = required(request.styleNumber(), "Style Number is required");
-    if (findProductColorByIdentity(bom, patternNumber, colorName, season, styleNumber) != null) {
-        throw duplicateProductColorException(colorName, patternNumber, season, styleNumber);
-    }
-
-    BomProductColor productColor = new BomProductColor();
-    productColor.setId(UUID.randomUUID().toString());
-    productColor.setProductColorMasterId(null);
-    productColor.setColorName(colorName);
-    productColor.setPatternNumber(patternNumber);
-    productColor.setSeason(season);
-    productColor.setStyleNumber(styleNumber);
-    int sequence = request.sequence() == null ? nextProductColorSequence(bom) : request.sequence();
-    validateProductColorSequence(bom, null, sequence);
-    productColor.setSequence(sequence);
-    productColor.setSourceColumnIndex(null);
-    applyRequestedChildColors(bom, productColor, request.childColors());
-    ensureProductColorsList(bom).add(productColor);
-    syncLegacyColorNames(bom);
-    return saveMprSourceChanged(bom, "Product Color added");
-}
-
-/**
- * Updates the BOM-local Product Color. Material-line links keep the stable
- * Product Color/Child Color ids, so renamed Child Colors flow into the BOM
- * lines and later MPR updates without touching any other BOM.
- */
-public BomDocument updateProductColor(String bomId, String productColorId, BomProductColorRequest request) {
-    BomDocument bom = get(bomId);
-    ensureEditable(bom);
-
-    BomProductColor productColor = resolveProductColor(bom, productColorId, "");
-    String beforeSource = productColorSourceFingerprint(productColor);
-    String oldColorName = productColor.getColorName();
-    String newColorName = required(request.colorName(), "Product Color is required");
-    String newPatternNumber = required(request.patternNumber(), "Pattern Number is required");
-    String newSeason = required(request.season(), "Season is required");
-    String newStyleNumber = required(request.styleNumber(), "Style Number is required");
-
-    BomProductColor duplicate = findProductColorByIdentity(
-            bom, newPatternNumber, newColorName, newSeason, newStyleNumber
-    );
-    if (duplicate != null && !Objects.equals(duplicate.getId(), productColor.getId())) {
-        throw duplicateProductColorException(newColorName, newPatternNumber, newSeason, newStyleNumber);
-    }
-
-    productColor.setColorName(newColorName);
-    productColor.setProductColorMasterId(null);
-    productColor.setPatternNumber(newPatternNumber);
-    productColor.setSeason(newSeason);
-    productColor.setStyleNumber(newStyleNumber);
-    if (request.sequence() != null) {
-        validateProductColorSequence(bom, productColor.getId(), request.sequence());
-        productColor.setSequence(request.sequence());
-    }
-    applyRequestedChildColors(bom, productColor, request.childColors());
-    forEachLine(bom, line -> synchronizeLineProductColorValues(bom, line, false));
-
-    // Keep legacy name-keyed fields and Product Color image metadata in sync.
-    final String updatedColorName = newColorName;
-    forEachLine(bom, line -> renameLegacyColorKey(line, oldColorName, updatedColorName));
-    for (BomAttachment attachment : ensureAttachments(bom)) {
-        if ("COLOR".equalsIgnoreCase(attachment.getScope())
-                && (Objects.equals(productColor.getId(), attachment.getProductColorId())
-                || normalize(oldColorName).equals(normalize(attachment.getColorKey())))) {
-            attachment.setProductColorId(productColor.getId());
-            attachment.setColorKey(newColorName);
+        String colorName = required(request.colorName(), "Product Color is required");
+        String patternNumber = required(request.patternNumber(), "Pattern Number is required");
+        String season = required(request.season(), "Season is required");
+        String styleNumber = required(request.styleNumber(), "Style Number is required");
+        if (findProductColorByIdentity(bom, patternNumber, colorName, season, styleNumber) != null) {
+            throw duplicateProductColorException(colorName, patternNumber, season, styleNumber);
         }
+
+        BomProductColor productColor = new BomProductColor();
+        productColor.setId(UUID.randomUUID().toString());
+        productColor.setProductColorMasterId(null);
+        productColor.setColorName(colorName);
+        productColor.setPatternNumber(patternNumber);
+        productColor.setSeason(season);
+        productColor.setStyleNumber(styleNumber);
+        int sequence = request.sequence() == null ? nextProductColorSequence(bom) : request.sequence();
+        validateProductColorSequence(bom, null, sequence);
+        productColor.setSequence(sequence);
+        productColor.setSourceColumnIndex(null);
+        applyRequestedChildColors(bom, productColor, request.childColors());
+        ensureProductColorsList(bom).add(productColor);
+        syncLegacyColorNames(bom);
+        return saveMprSourceChanged(bom, "Product Color added");
     }
-    syncLegacyColorNames(bom);
-    return Objects.equals(beforeSource, productColorSourceFingerprint(productColor))
-            ? saveChanged(bom)
-            : saveMprSourceChanged(bom, "Product Color updated");
-}
+
+    /**
+     * Updates the BOM-local Product Color. Material-line links keep the stable
+     * Product Color/Child Color ids, so renamed Child Colors flow into the BOM
+     * lines and later MPR updates without touching any other BOM.
+     */
+    public BomDocument updateProductColor(String bomId, String productColorId, BomProductColorRequest request) {
+        BomDocument bom = get(bomId);
+        ensureEditable(bom);
+
+        BomProductColor productColor = resolveProductColor(bom, productColorId, "");
+        String beforeSource = productColorSourceFingerprint(productColor);
+        String oldColorName = productColor.getColorName();
+        String newColorName = required(request.colorName(), "Product Color is required");
+        String newPatternNumber = required(request.patternNumber(), "Pattern Number is required");
+        String newSeason = required(request.season(), "Season is required");
+        String newStyleNumber = required(request.styleNumber(), "Style Number is required");
+
+        BomProductColor duplicate = findProductColorByIdentity(
+                bom, newPatternNumber, newColorName, newSeason, newStyleNumber
+        );
+        if (duplicate != null && !Objects.equals(duplicate.getId(), productColor.getId())) {
+            throw duplicateProductColorException(newColorName, newPatternNumber, newSeason, newStyleNumber);
+        }
+
+        productColor.setColorName(newColorName);
+        productColor.setProductColorMasterId(null);
+        productColor.setPatternNumber(newPatternNumber);
+        productColor.setSeason(newSeason);
+        productColor.setStyleNumber(newStyleNumber);
+        if (request.sequence() != null) {
+            validateProductColorSequence(bom, productColor.getId(), request.sequence());
+            productColor.setSequence(request.sequence());
+        }
+        applyRequestedChildColors(bom, productColor, request.childColors());
+        forEachLine(bom, line -> synchronizeLineProductColorValues(bom, line, false));
+
+        // Keep legacy name-keyed fields and Product Color image metadata in sync.
+        final String updatedColorName = newColorName;
+        forEachLine(bom, line -> renameLegacyColorKey(line, oldColorName, updatedColorName));
+        for (BomAttachment attachment : ensureAttachments(bom)) {
+            if ("COLOR".equalsIgnoreCase(attachment.getScope())
+                    && (Objects.equals(productColor.getId(), attachment.getProductColorId())
+                    || normalize(oldColorName).equals(normalize(attachment.getColorKey())))) {
+                attachment.setProductColorId(productColor.getId());
+                attachment.setColorKey(newColorName);
+            }
+        }
+        syncLegacyColorNames(bom);
+        return Objects.equals(beforeSource, productColorSourceFingerprint(productColor))
+                ? saveChanged(bom)
+                : saveMprSourceChanged(bom, "Product Color updated");
+    }
 
     public BomDocument deleteProductColor(String bomId, String productColorId) {
         BomDocument bom = get(bomId);
@@ -1081,235 +1082,235 @@ public BomDocument updateProductColor(String bomId, String productColorId, BomPr
     }
 
 
-private void synchronizeLineProductColorValues(BomDocument bom, BomLine line, boolean strict) {
-    ensureProductColors(bom);
-    List<BomLineColorValue> linkedValues = line.getProductColorValues() == null ? new ArrayList<>() : line.getProductColorValues();
-    Map<String, String> legacyValues = line.getColorValues() == null ? new LinkedHashMap<>() : line.getColorValues();
+    private void synchronizeLineProductColorValues(BomDocument bom, BomLine line, boolean strict) {
+        ensureProductColors(bom);
+        List<BomLineColorValue> linkedValues = line.getProductColorValues() == null ? new ArrayList<>() : line.getProductColorValues();
+        Map<String, String> legacyValues = line.getColorValues() == null ? new LinkedHashMap<>() : line.getColorValues();
 
-    LinkedHashMap<String, String> linkedByColorName = new LinkedHashMap<>();
-    List<BomLineColorValue> cleanLinkedValues = new ArrayList<>();
-    LinkedHashSet<String> seenIds = new LinkedHashSet<>();
+        LinkedHashMap<String, String> linkedByColorName = new LinkedHashMap<>();
+        List<BomLineColorValue> cleanLinkedValues = new ArrayList<>();
+        LinkedHashSet<String> seenIds = new LinkedHashSet<>();
 
-    for (BomLineColorValue item : linkedValues) {
-        if (item == null || trim(item.getProductColorId()).isBlank()) continue;
-        String rawValue = trim(item.getValue());
-        String childColorId = trim(item.getChildColorId());
-        if (rawValue.isBlank() && childColorId.isBlank()) continue;
+        for (BomLineColorValue item : linkedValues) {
+            if (item == null || trim(item.getProductColorId()).isBlank()) continue;
+            String rawValue = trim(item.getValue());
+            String childColorId = trim(item.getChildColorId());
+            if (rawValue.isBlank() && childColorId.isBlank()) continue;
 
-        BomProductColor productColor = findProductColorById(bom, item.getProductColorId());
-        if (productColor == null) productColor = findProductColorByName(bom, item.getProductColorId());
-        if (productColor == null) {
-            if (strict) throw new OrderBomMprValidationException("Selected Product Color does not belong to this BOM");
-            continue;
-        }
-        if (!seenIds.add(productColor.getId())) {
-            if (strict) throw new OrderBomMprValidationException("A Product Color can only be selected once in the same material line");
-            continue;
-        }
+            BomProductColor productColor = findProductColorById(bom, item.getProductColorId());
+            if (productColor == null) productColor = findProductColorByName(bom, item.getProductColorId());
+            if (productColor == null) {
+                if (strict) throw new OrderBomMprValidationException("Selected Product Color does not belong to this BOM");
+                continue;
+            }
+            if (!seenIds.add(productColor.getId())) {
+                if (strict) throw new OrderBomMprValidationException("A Product Color can only be selected once in the same material line");
+                continue;
+            }
 
-        ProductColorAttribute child = findLocalChildColor(productColor, childColorId, rawValue);
-        if (child == null && !strict && !rawValue.isBlank()) {
-            child = addLocalChildColor(productColor, childColorId, rawValue);
-        }
-        if (child == null && strict) {
-            throw new OrderBomMprValidationException(
-                    "Select a Child Color belonging to Product / Style Color " + productColor.getColorName()
-            );
-        }
-        if (child != null) {
-            childColorId = trim(child.getId());
-            rawValue = trim(child.getChildColor());
-        }
-
-        if (rawValue.isBlank()) {
-            if (strict) throw new OrderBomMprValidationException("Child Color is required");
-            continue;
-        }
-
-        BomLineColorValue clean = new BomLineColorValue();
-        clean.setProductColorId(productColor.getId());
-        clean.setChildColorId(childColorId);
-        clean.setValue(rawValue);
-        cleanLinkedValues.add(clean);
-        linkedByColorName.put(productColor.getColorName(), rawValue);
-    }
-
-    // Existing APIs may still send the old { BLACK: '...' } map. Turn it
-    // into BOM-local linked items and create missing Child Colors only for
-    // import/legacy normalization (strict=false).
-    if (cleanLinkedValues.isEmpty() && !legacyValues.isEmpty()) {
-        for (Map.Entry<String, String> entry : legacyValues.entrySet()) {
-            String colorName = trim(entry.getKey());
-            String value = trim(entry.getValue());
-            if (colorName.isBlank() || value.isBlank()) continue;
-            BomProductColor productColor = findProductColorByName(bom, colorName);
-            if (productColor == null) productColor = addLegacyProductColor(bom, colorName);
-            if (!seenIds.add(productColor.getId())) continue;
-
-            ProductColorAttribute child = findLocalChildColor(productColor, "", value);
-            if (child == null && !strict) child = addLocalChildColor(productColor, "", value);
+            ProductColorAttribute child = findLocalChildColor(productColor, childColorId, rawValue);
+            if (child == null && !strict && !rawValue.isBlank()) {
+                child = addLocalChildColor(productColor, childColorId, rawValue);
+            }
             if (child == null && strict) {
                 throw new OrderBomMprValidationException(
                         "Select a Child Color belonging to Product / Style Color " + productColor.getColorName()
                 );
             }
+            if (child != null) {
+                childColorId = trim(child.getId());
+                rawValue = trim(child.getChildColor());
+            }
+
+            if (rawValue.isBlank()) {
+                if (strict) throw new OrderBomMprValidationException("Child Color is required");
+                continue;
+            }
 
             BomLineColorValue clean = new BomLineColorValue();
             clean.setProductColorId(productColor.getId());
-            clean.setChildColorId(child == null ? "" : trim(child.getId()));
-            clean.setValue(child == null ? value : trim(child.getChildColor()));
+            clean.setChildColorId(childColorId);
+            clean.setValue(rawValue);
             cleanLinkedValues.add(clean);
-            linkedByColorName.put(productColor.getColorName(), clean.getValue());
-        }
-    }
-
-    line.setProductColorValues(cleanLinkedValues);
-    line.setColorValues(linkedByColorName);
-}
-
-
-private void applyRequestedChildColors(
-        BomDocument bom,
-        BomProductColor productColor,
-        List<ProductColorAttributeRequest> requests
-) {
-    List<ProductColorAttribute> existing = new ArrayList<>(ensureLocalChildColors(productColor));
-    Map<String, ProductColorAttribute> existingById = new LinkedHashMap<>();
-    for (ProductColorAttribute item : existing) {
-        if (item != null && !trim(item.getId()).isBlank()) existingById.put(trim(item.getId()), item);
-    }
-
-    List<ProductColorAttribute> next = new ArrayList<>();
-    LinkedHashSet<String> ids = new LinkedHashSet<>();
-    LinkedHashSet<String> names = new LinkedHashSet<>();
-    for (ProductColorAttributeRequest request : safe(requests)) {
-        if (request == null) continue;
-        String childColor = trim(request.childColor());
-        if (childColor.isBlank()) continue;
-        String normalizedName = normalize(childColor);
-        if (!names.add(normalizedName)) {
-            throw new OrderBomMprValidationException("Duplicate Child Color in this Product Color: " + childColor);
+            linkedByColorName.put(productColor.getColorName(), rawValue);
         }
 
-        String requestedId = trim(request.id());
-        String id = !requestedId.isBlank() && existingById.containsKey(requestedId)
-                ? requestedId : UUID.randomUUID().toString();
-        if (!ids.add(id)) throw new OrderBomMprValidationException("Duplicate Child Color id");
+        // Existing APIs may still send the old { BLACK: '...' } map. Turn it
+        // into BOM-local linked items and create missing Child Colors only for
+        // import/legacy normalization (strict=false).
+        if (cleanLinkedValues.isEmpty() && !legacyValues.isEmpty()) {
+            for (Map.Entry<String, String> entry : legacyValues.entrySet()) {
+                String colorName = trim(entry.getKey());
+                String value = trim(entry.getValue());
+                if (colorName.isBlank() || value.isBlank()) continue;
+                BomProductColor productColor = findProductColorByName(bom, colorName);
+                if (productColor == null) productColor = addLegacyProductColor(bom, colorName);
+                if (!seenIds.add(productColor.getId())) continue;
+
+                ProductColorAttribute child = findLocalChildColor(productColor, "", value);
+                if (child == null && !strict) child = addLocalChildColor(productColor, "", value);
+                if (child == null && strict) {
+                    throw new OrderBomMprValidationException(
+                            "Select a Child Color belonging to Product / Style Color " + productColor.getColorName()
+                    );
+                }
+
+                BomLineColorValue clean = new BomLineColorValue();
+                clean.setProductColorId(productColor.getId());
+                clean.setChildColorId(child == null ? "" : trim(child.getId()));
+                clean.setValue(child == null ? value : trim(child.getChildColor()));
+                cleanLinkedValues.add(clean);
+                linkedByColorName.put(productColor.getColorName(), clean.getValue());
+            }
+        }
+
+        line.setProductColorValues(cleanLinkedValues);
+        line.setColorValues(linkedByColorName);
+    }
+
+
+    private void applyRequestedChildColors(
+            BomDocument bom,
+            BomProductColor productColor,
+            List<ProductColorAttributeRequest> requests
+    ) {
+        List<ProductColorAttribute> existing = new ArrayList<>(ensureLocalChildColors(productColor));
+        Map<String, ProductColorAttribute> existingById = new LinkedHashMap<>();
+        for (ProductColorAttribute item : existing) {
+            if (item != null && !trim(item.getId()).isBlank()) existingById.put(trim(item.getId()), item);
+        }
+
+        List<ProductColorAttribute> next = new ArrayList<>();
+        LinkedHashSet<String> ids = new LinkedHashSet<>();
+        LinkedHashSet<String> names = new LinkedHashSet<>();
+        for (ProductColorAttributeRequest request : safe(requests)) {
+            if (request == null) continue;
+            String childColor = trim(request.childColor());
+            if (childColor.isBlank()) continue;
+            String normalizedName = normalize(childColor);
+            if (!names.add(normalizedName)) {
+                throw new OrderBomMprValidationException("Duplicate Child Color in this Product Color: " + childColor);
+            }
+
+            String requestedId = trim(request.id());
+            String id = !requestedId.isBlank() && existingById.containsKey(requestedId)
+                    ? requestedId : UUID.randomUUID().toString();
+            if (!ids.add(id)) throw new OrderBomMprValidationException("Duplicate Child Color id");
+
+            ProductColorAttribute child = new ProductColorAttribute();
+            child.setId(id);
+            child.setChildColor(childColor);
+            next.add(child);
+        }
+
+        LinkedHashSet<String> retainedIds = new LinkedHashSet<>();
+        for (ProductColorAttribute child : next) retainedIds.add(trim(child.getId()));
+        for (ProductColorAttribute old : existing) {
+            String oldId = trim(old == null ? null : old.getId());
+            if (oldId.isBlank() || retainedIds.contains(oldId)) continue;
+            if (isChildColorUsed(bom, productColor.getId(), oldId, old == null ? "" : old.getChildColor())) {
+                throw new OrderBomMprValidationException(
+                        "Cannot delete Child Color " + trim(old == null ? null : old.getChildColor())
+                                + " because it is used by a BOM material line"
+                );
+            }
+        }
+        productColor.setChildColors(next);
+    }
+
+    private boolean isChildColorUsed(
+            BomDocument bom,
+            String productColorId,
+            String childColorId,
+            String childColorText
+    ) {
+        final boolean[] used = { false };
+        forEachLine(bom, line -> {
+            if (used[0]) return;
+            for (BomLineColorValue value : safe(line.getProductColorValues())) {
+                if (value == null || !Objects.equals(productColorId, value.getProductColorId())) continue;
+                if (!trim(childColorId).isBlank() && Objects.equals(trim(childColorId), trim(value.getChildColorId()))) {
+                    used[0] = true;
+                    return;
+                }
+                if (trim(value.getChildColorId()).isBlank()
+                        && !trim(childColorText).isBlank()
+                        && normalize(childColorText).equals(normalize(value.getValue()))) {
+                    used[0] = true;
+                    return;
+                }
+            }
+        });
+        return used[0];
+    }
+
+    private ProductColorAttribute findLocalChildColor(BomProductColor productColor, String childColorId, String value) {
+        String wantedId = trim(childColorId);
+        String wantedValue = normalize(value);
+        for (ProductColorAttribute child : ensureLocalChildColors(productColor)) {
+            if (child == null) continue;
+            if (!wantedId.isBlank() && wantedId.equals(trim(child.getId()))) return child;
+            if (!wantedValue.isBlank() && wantedValue.equals(normalize(child.getChildColor()))) return child;
+        }
+        return null;
+    }
+
+    private ProductColorAttribute addLocalChildColor(BomProductColor productColor, String preferredId, String value) {
+        String text = trim(value);
+        if (text.isBlank()) return null;
+        ProductColorAttribute existing = findLocalChildColor(productColor, preferredId, text);
+        if (existing != null) return existing;
 
         ProductColorAttribute child = new ProductColorAttribute();
-        child.setId(id);
-        child.setChildColor(childColor);
-        next.add(child);
+        final String candidateId = trim(preferredId);
+        boolean duplicateId = !candidateId.isBlank() && ensureLocalChildColors(productColor).stream()
+                .filter(Objects::nonNull)
+                .anyMatch(item -> candidateId.equals(trim(item.getId())));
+        String finalId = candidateId;
+        if (finalId.isBlank() || duplicateId) {
+            finalId = UUID.randomUUID().toString();
+        }
+        child.setId(finalId);
+        child.setChildColor(text);
+        ensureLocalChildColors(productColor).add(child);
+        return child;
     }
 
-    LinkedHashSet<String> retainedIds = new LinkedHashSet<>();
-    for (ProductColorAttribute child : next) retainedIds.add(trim(child.getId()));
-    for (ProductColorAttribute old : existing) {
-        String oldId = trim(old == null ? null : old.getId());
-        if (oldId.isBlank() || retainedIds.contains(oldId)) continue;
-        if (isChildColorUsed(bom, productColor.getId(), oldId, old == null ? "" : old.getChildColor())) {
-            throw new OrderBomMprValidationException(
-                    "Cannot delete Child Color " + trim(old == null ? null : old.getChildColor())
-                            + " because it is used by a BOM material line"
-            );
+    private List<ProductColorAttribute> ensureLocalChildColors(BomProductColor productColor) {
+        if (productColor.getChildColors() == null) productColor.setChildColors(new ArrayList<>());
+        return productColor.getChildColors();
+    }
+
+    private void mergeChildColorDefinitions(BomProductColor target, BomProductColor source) {
+        LinkedHashMap<String, ProductColorAttribute> byText = new LinkedHashMap<>();
+        for (ProductColorAttribute child : ensureLocalChildColors(target)) {
+            if (child == null || trim(child.getChildColor()).isBlank()) continue;
+            if (trim(child.getId()).isBlank()) child.setId(UUID.randomUUID().toString());
+            byText.putIfAbsent(normalize(child.getChildColor()), child);
+        }
+        for (ProductColorAttribute child : source == null ? List.<ProductColorAttribute>of() : safe(source.getChildColors())) {
+            if (child == null || trim(child.getChildColor()).isBlank()) continue;
+            if (byText.containsKey(normalize(child.getChildColor()))) continue;
+            ProductColorAttribute copy = new ProductColorAttribute();
+            copy.setId(trim(child.getId()).isBlank() ? UUID.randomUUID().toString() : trim(child.getId()));
+            copy.setChildColor(trim(child.getChildColor()));
+            ensureLocalChildColors(target).add(copy);
+            byText.put(normalize(copy.getChildColor()), copy);
         }
     }
-    productColor.setChildColors(next);
-}
 
-private boolean isChildColorUsed(
-        BomDocument bom,
-        String productColorId,
-        String childColorId,
-        String childColorText
-) {
-    final boolean[] used = { false };
-    forEachLine(bom, line -> {
-        if (used[0]) return;
-        for (BomLineColorValue value : safe(line.getProductColorValues())) {
-            if (value == null || !Objects.equals(productColorId, value.getProductColorId())) continue;
-            if (!trim(childColorId).isBlank() && Objects.equals(trim(childColorId), trim(value.getChildColorId()))) {
-                used[0] = true;
-                return;
-            }
-            if (trim(value.getChildColorId()).isBlank()
-                    && !trim(childColorText).isBlank()
-                    && normalize(childColorText).equals(normalize(value.getValue()))) {
-                used[0] = true;
-                return;
-            }
+    private void validateLocalChildColors(BomProductColor productColor) {
+        LinkedHashSet<String> ids = new LinkedHashSet<>();
+        LinkedHashSet<String> names = new LinkedHashSet<>();
+        for (ProductColorAttribute child : ensureLocalChildColors(productColor)) {
+            if (child == null) throw new OrderBomMprValidationException("Child Color contains an empty item");
+            String text = required(child.getChildColor(), "Child Color is required");
+            if (trim(child.getId()).isBlank()) child.setId(UUID.randomUUID().toString());
+            if (!ids.add(trim(child.getId()))) throw new OrderBomMprValidationException("Duplicate Child Color id");
+            if (!names.add(normalize(text))) throw new OrderBomMprValidationException("Duplicate Child Color: " + text);
+            limitText(text, 300, "Child Color");
         }
-    });
-    return used[0];
-}
-
-private ProductColorAttribute findLocalChildColor(BomProductColor productColor, String childColorId, String value) {
-    String wantedId = trim(childColorId);
-    String wantedValue = normalize(value);
-    for (ProductColorAttribute child : ensureLocalChildColors(productColor)) {
-        if (child == null) continue;
-        if (!wantedId.isBlank() && wantedId.equals(trim(child.getId()))) return child;
-        if (!wantedValue.isBlank() && wantedValue.equals(normalize(child.getChildColor()))) return child;
     }
-    return null;
-}
-
-private ProductColorAttribute addLocalChildColor(BomProductColor productColor, String preferredId, String value) {
-    String text = trim(value);
-    if (text.isBlank()) return null;
-    ProductColorAttribute existing = findLocalChildColor(productColor, preferredId, text);
-    if (existing != null) return existing;
-
-    ProductColorAttribute child = new ProductColorAttribute();
-    final String candidateId = trim(preferredId);
-    boolean duplicateId = !candidateId.isBlank() && ensureLocalChildColors(productColor).stream()
-            .filter(Objects::nonNull)
-            .anyMatch(item -> candidateId.equals(trim(item.getId())));
-    String finalId = candidateId;
-    if (finalId.isBlank() || duplicateId) {
-        finalId = UUID.randomUUID().toString();
-    }
-    child.setId(finalId);
-    child.setChildColor(text);
-    ensureLocalChildColors(productColor).add(child);
-    return child;
-}
-
-private List<ProductColorAttribute> ensureLocalChildColors(BomProductColor productColor) {
-    if (productColor.getChildColors() == null) productColor.setChildColors(new ArrayList<>());
-    return productColor.getChildColors();
-}
-
-private void mergeChildColorDefinitions(BomProductColor target, BomProductColor source) {
-    LinkedHashMap<String, ProductColorAttribute> byText = new LinkedHashMap<>();
-    for (ProductColorAttribute child : ensureLocalChildColors(target)) {
-        if (child == null || trim(child.getChildColor()).isBlank()) continue;
-        if (trim(child.getId()).isBlank()) child.setId(UUID.randomUUID().toString());
-        byText.putIfAbsent(normalize(child.getChildColor()), child);
-    }
-    for (ProductColorAttribute child : source == null ? List.<ProductColorAttribute>of() : safe(source.getChildColors())) {
-        if (child == null || trim(child.getChildColor()).isBlank()) continue;
-        if (byText.containsKey(normalize(child.getChildColor()))) continue;
-        ProductColorAttribute copy = new ProductColorAttribute();
-        copy.setId(trim(child.getId()).isBlank() ? UUID.randomUUID().toString() : trim(child.getId()));
-        copy.setChildColor(trim(child.getChildColor()));
-        ensureLocalChildColors(target).add(copy);
-        byText.put(normalize(copy.getChildColor()), copy);
-    }
-}
-
-private void validateLocalChildColors(BomProductColor productColor) {
-    LinkedHashSet<String> ids = new LinkedHashSet<>();
-    LinkedHashSet<String> names = new LinkedHashSet<>();
-    for (ProductColorAttribute child : ensureLocalChildColors(productColor)) {
-        if (child == null) throw new OrderBomMprValidationException("Child Color contains an empty item");
-        String text = required(child.getChildColor(), "Child Color is required");
-        if (trim(child.getId()).isBlank()) child.setId(UUID.randomUUID().toString());
-        if (!ids.add(trim(child.getId()))) throw new OrderBomMprValidationException("Duplicate Child Color id");
-        if (!names.add(normalize(text))) throw new OrderBomMprValidationException("Duplicate Child Color: " + text);
-        limitText(text, 300, "Child Color");
-    }
-}
 
     private void ensureProductColors(BomDocument bom) {
         if (bom.getProductColors() == null) bom.setProductColors(new ArrayList<>());
@@ -1559,7 +1560,10 @@ private void validateLocalChildColors(BomProductColor productColor) {
         List<String> existingBomNos = bomRepository.findByOrderIdOrderByCreatedAtDescUpdatedAtDesc(orderId).stream()
                 .map(BomDocument::getBomNo)
                 .toList();
-        return MasterDataSequentialKey.maxNumber(existingBomNos, BOM_NO_PREFIX);
+
+        long currentMax = MasterDataSequentialKey.maxNumber(existingBomNos, BOM_NO_PREFIX);
+        long legacyMax = MasterDataSequentialKey.maxNumber(existingBomNos, LEGACY_BOM_NO_PREFIX);
+        return Math.max(currentMax, legacyMax);
     }
 
     private void validateParsedBom(BomExcelParser.ParsedBom parsed) {
@@ -1603,54 +1607,54 @@ private void validateLocalChildColors(BomProductColor productColor) {
     }
 
 
-private void validateProductColorBusinessUniqueness(List<BomProductColor> productColors) {
-    LinkedHashMap<String, BomProductColor> byBusinessIdentity = new LinkedHashMap<>();
-    for (BomProductColor color : safe(productColors)) {
-        if (color == null) continue;
-        String identity = productColorIdentityKey(color);
-        BomProductColor existing = byBusinessIdentity.putIfAbsent(identity, color);
-        if (existing != null) {
-            throw duplicateProductColorException(
-                    color.getColorName(),
-                    color.getPatternNumber(),
-                    color.getSeason(),
-                    color.getStyleNumber()
-            );
+    private void validateProductColorBusinessUniqueness(List<BomProductColor> productColors) {
+        LinkedHashMap<String, BomProductColor> byBusinessIdentity = new LinkedHashMap<>();
+        for (BomProductColor color : safe(productColors)) {
+            if (color == null) continue;
+            String identity = productColorIdentityKey(color);
+            BomProductColor existing = byBusinessIdentity.putIfAbsent(identity, color);
+            if (existing != null) {
+                throw duplicateProductColorException(
+                        color.getColorName(),
+                        color.getPatternNumber(),
+                        color.getSeason(),
+                        color.getStyleNumber()
+                );
+            }
         }
     }
-}
 
 
-private void validateProductColors(List<BomProductColor> productColors) {
-    validateProductColorBusinessUniqueness(productColors);
+    private void validateProductColors(List<BomProductColor> productColors) {
+        validateProductColorBusinessUniqueness(productColors);
 
-    LinkedHashSet<String> ids = new LinkedHashSet<>();
-    LinkedHashSet<Integer> sequences = new LinkedHashSet<>();
+        LinkedHashSet<String> ids = new LinkedHashSet<>();
+        LinkedHashSet<Integer> sequences = new LinkedHashSet<>();
 
-    for (BomProductColor color : safe(productColors)) {
-        if (color == null) throw new OrderBomMprValidationException("Product Color contains an empty item");
-        String name = required(color.getColorName(), "Product Color name is required");
-        if (trim(color.getId()).isBlank()) color.setId(UUID.randomUUID().toString());
-        color.setProductColorMasterId(null);
+        for (BomProductColor color : safe(productColors)) {
+            if (color == null) throw new OrderBomMprValidationException("Product Color contains an empty item");
+            String name = required(color.getColorName(), "Product Color name is required");
+            if (trim(color.getId()).isBlank()) color.setId(UUID.randomUUID().toString());
+            color.setProductColorMasterId(null);
 
-        if (!ids.add(color.getId())) {
-            throw new OrderBomMprValidationException("Duplicate Product Color id: " + color.getId());
+            if (!ids.add(color.getId())) {
+                throw new OrderBomMprValidationException("Duplicate Product Color id: " + color.getId());
+            }
+
+            Integer sequence = color.getSequence();
+            if (sequence == null || sequence <= 0) {
+                throw new OrderBomMprValidationException("Product Color sequence must be greater than 0: " + name);
+            }
+            if (!sequences.add(sequence)) {
+                throw new OrderBomMprValidationException("Duplicate Product Color sequence: " + sequence);
+            }
+            validateLocalChildColors(color);
+            limitText(name, 100, "Product Color");
+            limitText(color.getPatternNumber(), 100, "Pattern Number");
+            limitText(color.getSeason(), 50, "Season");
+            limitText(color.getStyleNumber(), 100, "Style Number");
         }
-
-        Integer sequence = color.getSequence();
-        if (sequence == null || sequence <= 0) {
-            throw new OrderBomMprValidationException("Product Color sequence must be greater than 0: " + name);
-        }
-        if (!sequences.add(sequence)) {
-            throw new OrderBomMprValidationException("Duplicate Product Color sequence: " + sequence);
-        }
-        validateLocalChildColors(color);
-        limitText(name, 100, "Product Color");
-        limitText(color.getPatternNumber(), 100, "Pattern Number");
-        limitText(color.getSeason(), 50, "Season");
-        limitText(color.getStyleNumber(), 100, "Style Number");
     }
-}
 
     private void validatePackingCollection(List<BomPacking> packings, boolean submitting) {
         LinkedHashSet<String> names = new LinkedHashSet<>();
