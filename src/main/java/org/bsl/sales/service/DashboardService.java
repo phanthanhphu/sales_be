@@ -68,12 +68,23 @@ public class DashboardService {
                 .filter(order -> inDateRange(order.getCreatedAt(), from, to))
                 .toList();
 
-        List<String> seasons = distinctSorted(dateScopedOrders, SalesOrder::getSeason);
-        List<String> styles = distinctSorted(dateScopedOrders, SalesOrder::getStyle);
+        List<String> dateScopedOrderIds = dateScopedOrders.stream()
+                .map(SalesOrder::getId)
+                .filter(Objects::nonNull)
+                .toList();
+        List<BomDocument> dateScopedBoms = dateScopedOrderIds.isEmpty()
+                ? List.of()
+                : bomRepository.findByOrderIdIn(dateScopedOrderIds);
+
+        List<String> seasons = distinctBomValues(dateScopedBoms, true);
+        List<String> styles = distinctBomValues(dateScopedBoms, false);
+
+        Map<String, List<BomDocument>> dateScopedBomsByOrder = dateScopedBoms.stream()
+                .filter(item -> item.getOrderId() != null)
+                .collect(Collectors.groupingBy(BomDocument::getOrderId));
 
         List<SalesOrder> orders = dateScopedOrders.stream()
-                .filter(order -> seasonKey == null || seasonKey.equals(key(order.getSeason())))
-                .filter(order -> styleKey == null || styleKey.equals(key(order.getStyle())))
+                .filter(order -> matchesBomFilter(dateScopedBomsByOrder.getOrDefault(order.getId(), List.of()), seasonKey, styleKey))
                 .toList();
 
         List<String> orderIds = orders.stream().map(SalesOrder::getId).filter(Objects::nonNull).toList();
@@ -129,7 +140,7 @@ public class DashboardService {
                 BigDecimal stockValue = stockQty.multiply(priceUsd);
                 purchaseAmountUsd = purchaseAmountUsd.add(purchaseValue);
 
-                String styleName = firstNonBlank(line.getStyleDescription(), order == null ? null : order.getStyle(), "Unspecified");
+                String styleName = firstNonBlank(line.getStyleDescription(), "Unspecified");
                 purchaseByStyle.merge(styleName, purchaseValue, BigDecimal::add);
 
                 String materialType = firstNonBlank(line.getMaterialType(), "Unspecified");
@@ -231,14 +242,39 @@ public class DashboardService {
         return to == null || !value.isAfter(to);
     }
 
-    private List<String> distinctSorted(List<SalesOrder> orders, Function<SalesOrder, String> getter) {
-        return orders.stream()
-                .map(getter)
+    private List<String> distinctBomValues(List<BomDocument> boms, boolean season) {
+        return boms.stream()
+                .flatMap(bom -> bomFilterValues(bom, season).stream())
                 .filter(value -> value != null && !value.isBlank())
                 .map(String::trim)
                 .distinct()
                 .sorted(String.CASE_INSENSITIVE_ORDER)
                 .toList();
+    }
+
+    private boolean matchesBomFilter(List<BomDocument> boms, String seasonKey, String styleKey) {
+        if (seasonKey == null && styleKey == null) return true;
+        return boms.stream().anyMatch(bom -> {
+            boolean seasonMatches = seasonKey == null || bomFilterValues(bom, true).stream()
+                    .map(this::key)
+                    .anyMatch(seasonKey::equals);
+            boolean styleMatches = styleKey == null || bomFilterValues(bom, false).stream()
+                    .map(this::key)
+                    .anyMatch(styleKey::equals);
+            return seasonMatches && styleMatches;
+        });
+    }
+
+    private List<String> bomFilterValues(BomDocument bom, boolean season) {
+        List<String> values = new ArrayList<>();
+        if (bom == null) return values;
+        if (bom.getHeader() != null) {
+            values.add(season ? bom.getHeader().getSeason() : bom.getHeader().getStyleNumber());
+        }
+        safe(bom.getProductColors()).forEach(color -> {
+            if (color != null) values.add(season ? color.getSeason() : color.getStyleNumber());
+        });
+        return values;
     }
 
     private BigDecimal money(BigDecimal value) {

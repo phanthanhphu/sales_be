@@ -17,7 +17,9 @@ import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
 
+import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.time.ZoneId;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
@@ -27,6 +29,7 @@ import java.util.stream.Collectors;
 public class OrderService {
     private static final String ORDER_NO_PREFIX = "ORD";
     private static final String ORDER_SEQUENCE_PREFIX = "sales_order:";
+    private static final ZoneId BUSINESS_ZONE = ZoneId.of("Asia/Ho_Chi_Minh");
 
     private final SalesOrderRepository orderRepository;
     private final BomDocumentRepository bomRepository;
@@ -48,19 +51,16 @@ public class OrderService {
         this.sequenceService = sequenceService;
     }
 
-    public Page<SalesOrder> list(String buyerKey, String keyword, String season, String status, int page, int size, String sortBy, String sortDir) {
+    public Page<SalesOrder> list(String buyerKey, String keyword, String status, int page, int size, String sortBy, String sortDir) {
         String allowedBuyer = buyerAccess.requireBuyer(buyerKey);
         Pageable pageable = PageRequest.of(Math.max(0, page), Math.max(1, Math.min(size, 200)));
         String keywordKey = key(keyword);
-        String seasonKey = key(season);
         String statusKey = key(status);
 
         List<SalesOrder> rows = orderRepository.findByBuyerKey(allowedBuyer).stream()
                 .peek(this::normalizeLegacyMprStatus)
                 .filter(order -> keywordKey == null || contains(order.getOrderNo(), keywordKey)
-                        || contains(order.getStyle(), keywordKey)
-                        || contains(order.getCustomer(), keywordKey))
-                .filter(order -> seasonKey == null || contains(order.getSeason(), seasonKey))
+                        || contains(order.getOrderName(), keywordKey))
                 .filter(order -> statusKey == null || statusKey.equals(key(order.getStatus())))
                 .sorted(orderComparator(sortBy, sortDir))
                 .collect(Collectors.toList());
@@ -84,9 +84,9 @@ public class OrderService {
         return (left, right) -> {
             int compared = switch (field) {
                 case "orderno" -> compareText(left.getOrderNo(), right.getOrderNo(), direction);
-                case "style" -> compareText(left.getStyle(), right.getStyle(), direction);
-                case "customer" -> compareText(left.getCustomer(), right.getCustomer(), direction);
-                case "season" -> compareText(left.getSeason(), right.getSeason(), direction);
+                case "ordername" -> compareText(left.getOrderName(), right.getOrderName(), direction);
+                case "startdate" -> compareComparable(left.getStartDate(), right.getStartDate(), direction);
+                case "enddate" -> compareComparable(left.getEndDate(), right.getEndDate(), direction);
                 case "status" -> compareText(left.getStatus(), right.getStatus(), direction);
                 case "createdat" -> compareComparable(left.getCreatedAt(), right.getCreatedAt(), direction);
                 case "updatedat" -> compareComparable(left.getUpdatedAt(), right.getUpdatedAt(), direction);
@@ -143,6 +143,7 @@ public class OrderService {
         entity.setBuyerKey(buyerKey);
         entity.setOrderNo(orderNo);
         entity.setOrderNoKey(orderNoKey);
+        entity.setStartDate(LocalDate.now(BUSINESS_ZONE));
         apply(entity, request);
         entity.setStatus("DRAFT");
         entity.setCreatedAt(now);
@@ -157,9 +158,10 @@ public class OrderService {
         String requestedBuyer = request.buyerKey() == null || request.buyerKey().isBlank()
                 ? BuyerKeys.legacyDefault(entity.getBuyerKey())
                 : buyerAccess.requireBuyer(request.buyerKey());
-        String newKey = key(required(request.orderNo(), "Order No is required"));
-        if (existsOrderNo(requestedBuyer, newKey, id)) {
-            throw new OrderBomMprValidationException("Order No already exists for this Buyer: " + request.orderNo());
+        String preservedOrderNo = required(entity.getOrderNo(), "Order No is required");
+        String preservedOrderNoKey = key(preservedOrderNo);
+        if (existsOrderNo(requestedBuyer, preservedOrderNoKey, id)) {
+            throw new OrderBomMprValidationException("Order No already exists for this Buyer: " + preservedOrderNo);
         }
         String currentBuyer = BuyerKeys.legacyDefault(entity.getBuyerKey());
         if (!currentBuyer.equals(requestedBuyer)
@@ -169,8 +171,13 @@ public class OrderService {
             );
         }
         entity.setBuyerKey(requestedBuyer);
-        entity.setOrderNo(required(request.orderNo(), "Order No is required"));
-        entity.setOrderNoKey(newKey);
+        entity.setOrderNo(preservedOrderNo);
+        entity.setOrderNoKey(preservedOrderNoKey);
+        if (entity.getStartDate() == null) {
+            entity.setStartDate(entity.getCreatedAt() == null
+                    ? LocalDate.now(BUSINESS_ZONE)
+                    : entity.getCreatedAt().toLocalDate());
+        }
         apply(entity, request);
         entity.setUpdatedAt(LocalDateTime.now());
         entity.setUpdatedBy(RequestActor.current());
@@ -303,10 +310,16 @@ public class OrderService {
     }
 
     private void apply(SalesOrder entity, OrderRequest request) {
-        entity.setStyle(required(request.style(), "Style is required"));
-        entity.setCustomer(required(request.customer(), "Customer is required"));
-        entity.setSeason(required(request.season(), "Season is required"));
-        entity.setComment(trim(request.comment()));
+        entity.setOrderName(required(request.orderName(), "Order Name is required"));
+        LocalDate endDate = request.endDate();
+        if (endDate == null) {
+            throw new OrderBomMprValidationException("End Date is required");
+        }
+        LocalDate startDate = entity.getStartDate();
+        if (startDate != null && endDate.isBefore(startDate)) {
+            throw new OrderBomMprValidationException("End Date cannot be before Start Date");
+        }
+        entity.setEndDate(endDate);
     }
 
     private String required(String value, String message) {
