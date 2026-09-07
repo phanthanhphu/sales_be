@@ -23,6 +23,7 @@ public class UserDTO {
     private List<String> buyerKeys = new ArrayList<>();
     private boolean canManageBom;
     private boolean canManageSales;
+    private boolean canManageCurrency;
     private boolean canReopenCompletedMpr;
     private boolean viewOnly;
 
@@ -63,6 +64,9 @@ public class UserDTO {
     public boolean isCanManageSales() { return canManageSales; }
     public boolean getCanManageSales() { return canManageSales; }
     public void setCanManageSales(boolean canManageSales) { this.canManageSales = canManageSales; }
+    public boolean isCanManageCurrency() { return canManageCurrency; }
+    public boolean getCanManageCurrency() { return canManageCurrency; }
+    public void setCanManageCurrency(boolean canManageCurrency) { this.canManageCurrency = canManageCurrency; }
     public boolean isCanReopenCompletedMpr() { return canReopenCompletedMpr; }
     public boolean getCanReopenCompletedMpr() { return canReopenCompletedMpr; }
     public void setCanReopenCompletedMpr(boolean canReopenCompletedMpr) { this.canReopenCompletedMpr = canReopenCompletedMpr; }

@@ -79,9 +79,24 @@ public class SecurityConfig {
                             .hasAnyAuthority("ROLE_ADMIN", "PERM_BOM", "PERM_SALES")
 
                         /*
-                         * Sales workspace mutations: orders, MPR, and all Sales master data.
-                         * This covers Vender Code, MAT Info, Ship To, Loss, Currency, Supplier,
-                         * and Product Color. BOM-only users can still GET/read these screens.
+                         * Currency has its own action permission. SALES keeps Currency access for
+                         * backward compatibility, while CURRENCY can manage only Currency without
+                         * receiving write access to the rest of Sales / MPR master data.
+                         * These specific matchers MUST stay before the generic /api/master-data/** rules.
+                         */
+                        .requestMatchers(HttpMethod.POST, "/api/master-data/currencies", "/api/master-data/currencies/**")
+                            .hasAnyAuthority("ROLE_ADMIN", "PERM_SALES", "PERM_CURRENCY")
+                        .requestMatchers(HttpMethod.PUT, "/api/master-data/currencies", "/api/master-data/currencies/**")
+                            .hasAnyAuthority("ROLE_ADMIN", "PERM_SALES", "PERM_CURRENCY")
+                        .requestMatchers(HttpMethod.PATCH, "/api/master-data/currencies", "/api/master-data/currencies/**")
+                            .hasAnyAuthority("ROLE_ADMIN", "PERM_SALES", "PERM_CURRENCY")
+                        .requestMatchers(HttpMethod.DELETE, "/api/master-data/currencies", "/api/master-data/currencies/**")
+                            .hasAnyAuthority("ROLE_ADMIN", "PERM_SALES", "PERM_CURRENCY")
+
+                        /*
+                         * Sales workspace mutations: orders, MPR, and Sales master data except the
+                         * Currency-specific action rule above. BOM-only and Currency-only users may
+                         * still GET/read these screens.
                          */
                         .requestMatchers(HttpMethod.POST, "/api/orders/*/mpr", "/api/orders/*/mpr/**", "/api/orders", "/api/orders/*", "/api/master-data/**")
                             .hasAnyAuthority("ROLE_ADMIN", "PERM_SALES")

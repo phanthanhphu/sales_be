@@ -20,6 +20,7 @@ public class User {
 
     public static final String ACCESS_BOM = "BOM";
     public static final String ACCESS_SALES = "SALES";
+    public static final String ACCESS_CURRENCY = "CURRENCY";
     public static final String ACCESS_REOPEN_COMPLETED_MPR = "REOPEN_COMPLETED_MPR";
     public static final String ACCESS_VIEW_SYSTEM = "VIEW_SYSTEM";
 
@@ -62,7 +63,7 @@ public class User {
 
     public static List<String> normalizeAccessPermissions(Collection<String> values, boolean admin) {
         if (admin) {
-            return List.of(ACCESS_BOM, ACCESS_SALES, ACCESS_REOPEN_COMPLETED_MPR);
+            return List.of(ACCESS_BOM, ACCESS_SALES, ACCESS_CURRENCY, ACCESS_REOPEN_COMPLETED_MPR);
         }
 
         Set<String> normalized = new LinkedHashSet<>();
@@ -72,6 +73,7 @@ public class User {
                 String permission = value.trim().toUpperCase(Locale.ROOT);
                 if (ACCESS_BOM.equals(permission)
                         || ACCESS_SALES.equals(permission)
+                        || ACCESS_CURRENCY.equals(permission)
                         || ACCESS_REOPEN_COMPLETED_MPR.equals(permission)
                         || ACCESS_VIEW_SYSTEM.equals(permission)) {
                     normalized.add(permission);
@@ -126,6 +128,12 @@ public class User {
 
     public boolean canManageSales() {
         return isAdminRole() || getAccessPermissions().contains(ACCESS_SALES);
+    }
+
+    public boolean canManageCurrency() {
+        return isAdminRole()
+                || getAccessPermissions().contains(ACCESS_SALES)
+                || getAccessPermissions().contains(ACCESS_CURRENCY);
     }
 
     public boolean canReopenCompletedMpr() {

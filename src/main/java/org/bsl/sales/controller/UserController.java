@@ -829,6 +829,7 @@ public class UserController {
         data.put("buyerKeys", user.getBuyerKeys());
         data.put("canManageBom", user.canManageBom());
         data.put("canManageSales", user.canManageSales());
+        data.put("canManageCurrency", user.canManageCurrency());
         data.put("canReopenCompletedMpr", user.canReopenCompletedMpr());
         data.put("viewOnly", user.isViewOnly());
 

@@ -28,6 +28,10 @@ public class AccessControl {
         return currentUser().map(user -> user.isEnabled() && user.canManageSales()).orElse(false);
     }
 
+    public boolean canManageCurrency() {
+        return currentUser().map(user -> user.isEnabled() && user.canManageCurrency()).orElse(false);
+    }
+
     public boolean canReopenCompletedMpr() {
         return currentUser().map(user -> user.isEnabled() && user.canReopenCompletedMpr()).orElse(false);
     }
