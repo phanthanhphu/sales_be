@@ -173,6 +173,12 @@ public class ShipToService {
     }
 
     public MasterDataImportResult upload(MultipartFile file, ImportMode mode, String buyerKey) {
+        // Upload New also accepts the workbook downloaded from Export/Edit.
+        // Detect it by the first header (Key) and reuse the safe keyed import flow.
+        if (isEditedWorkbook(file)) {
+            return uploadEdited(file, buyerKey);
+        }
+
         String buyer = buyerAccess.requireBuyer(buyerKey);
         backfillLegacyBuyerScope();
         ImportMode effectiveMode = mode == null ? ImportMode.CREATE_ONLY : mode;
@@ -258,6 +264,11 @@ public class ShipToService {
         }
         if (!toSave.isEmpty()) repository.saveAll(toSave);
         return result;
+    }
+
+    public byte[] template(String buyerKey) {
+        buyerAccess.requireBuyer(buyerKey);
+        return MasterDataEditWorkbookExporter.shipToTemplate();
     }
 
     public byte[] exportForEdit(String buyerKey) {
@@ -352,24 +363,48 @@ public class ShipToService {
         return result;
     }
 
+    private boolean isEditedWorkbook(MultipartFile file) {
+        try (Workbook workbook = excelSupport.openWorkbook(file)) {
+            Sheet sheet = excelSupport.requiredSheet(workbook, MASTER_DATA_NAME);
+            FormulaEvaluator evaluator = excelSupport.evaluator(workbook);
+            Row headerRow = sheet.getRow(sheet.getFirstRowNum());
+            return "KEY".equals(MasterDataTextNormalizer.upper(excelSupport.text(headerRow, 0, evaluator)));
+        } catch (Exception ignored) {
+            // Let the normal parser return the detailed workbook/header validation error.
+            return false;
+        }
+    }
+
     private List<ImportCandidate<ShipToRequest>> parseStandardWorkbook(MultipartFile file, List<ImportRowError> errors) {
         List<ImportCandidate<ShipToRequest>> rows = new ArrayList<>();
         try (Workbook workbook = excelSupport.openWorkbook(file)) {
             Sheet sheet = excelSupport.requiredSheet(workbook, MASTER_DATA_NAME);
             FormulaEvaluator evaluator = excelSupport.evaluator(workbook);
+
+            // Template / New format:
+            // Action | Ship To Code | Ship To Name | Active | Remark
             excelSupport.requireHeaders(sheet, evaluator,
-                    new MasterDataExcelSupport.HeaderRequirement(0, "Ship To Code"),
-                    new MasterDataExcelSupport.HeaderRequirement(1, "Ship To Name"),
-                    new MasterDataExcelSupport.HeaderRequirement(2, "Active"),
-                    new MasterDataExcelSupport.HeaderRequirement(3, "Remark"));
+                    new MasterDataExcelSupport.HeaderRequirement(0, "Action"),
+                    new MasterDataExcelSupport.HeaderRequirement(1, "Ship To Code"),
+                    new MasterDataExcelSupport.HeaderRequirement(2, "Ship To Name"),
+                    new MasterDataExcelSupport.HeaderRequirement(3, "Active"),
+                    new MasterDataExcelSupport.HeaderRequirement(4, "Remark"));
+
             Set<String> names = new HashSet<>();
             Set<String> codes = new HashSet<>();
             for (int rowIndex = sheet.getFirstRowNum() + 1; rowIndex <= sheet.getLastRowNum(); rowIndex++) {
                 Row row = sheet.getRow(rowIndex);
-                if (excelSupport.isBlank(row, 4, evaluator)) continue;
+                if (excelSupport.isBlank(row, 5, evaluator)) continue;
                 int excelRow = rowIndex + 1;
                 try {
-                    ShipToRequest request = request(row, evaluator, 0);
+                    String action = MasterDataTextNormalizer.upper(excelSupport.text(row, 0, evaluator));
+                    if (action != null && !"CREATE".equals(action)) {
+                        throw new MasterDataValidationException(
+                                "Template format only accepts CREATE in Action. To UPDATE or DELETE, upload the downloaded Edit Excel file with Key."
+                        );
+                    }
+
+                    ShipToRequest request = request(row, evaluator, 1);
                     addBeanErrors(errors, excelRow, beanValidator.validate(request));
                     String nameKey = nameKey(request.shipToName());
                     if (!names.add(nameKey)) errors.add(new ImportRowError(excelRow, "shipToName", "Duplicate Ship To name inside uploaded file"));

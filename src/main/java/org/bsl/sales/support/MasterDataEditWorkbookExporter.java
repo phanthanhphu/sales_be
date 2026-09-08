@@ -131,6 +131,26 @@ public final class MasterDataEditWorkbookExporter {
         }
     }
 
+    public static byte[] shipToTemplate() {
+        try (Workbook workbook = new XSSFWorkbook()) {
+            Sheet sheet = workbook.createSheet("SHIP TO");
+            Styles styles = new Styles(workbook);
+
+            // This is the canonical format for Ship To -> Upload New Excel.
+            writeHeader(sheet, styles.header, 0,
+                    "Action", "Ship To Code", "Ship To Name", "Active", "Remark");
+            sheet.createFreezePane(0, 1);
+            setWidths(sheet, 12, 20, 36, 12, 40);
+
+            int lastInputRow = 5000;
+            addCreateOnlyActionValidation(sheet, 0, lastInputRow);
+            addActiveValidation(sheet, 3, lastInputRow);
+            return toBytes(workbook);
+        } catch (IOException ex) {
+            throw new IllegalStateException("Cannot export Ship To template", ex);
+        }
+    }
+
     public static byte[] shipTos(List<ShipTo> rows) {
         try (Workbook workbook = new XSSFWorkbook()) {
             Sheet sheet = workbook.createSheet("SHIP TO");
@@ -268,6 +288,19 @@ public final class MasterDataEditWorkbookExporter {
         } catch (IOException ex) {
             throw new IllegalStateException("Cannot export Loss edit workbook", ex);
         }
+    }
+
+    private static void addCreateOnlyActionValidation(Sheet sheet, int actionColumn, int lastRow) {
+        addExplicitListValidation(
+                sheet,
+                actionColumn,
+                lastRow,
+                new String[]{"CREATE"},
+                "Select Action",
+                "Choose CREATE for new Ship To rows.",
+                "Invalid Action",
+                "Upload New Excel only accepts CREATE."
+        );
     }
 
     private static void addActionValidation(Sheet sheet, int actionColumn, int lastRow) {

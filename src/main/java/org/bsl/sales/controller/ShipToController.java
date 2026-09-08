@@ -16,6 +16,7 @@ import org.springframework.web.multipart.MultipartFile;
 import java.util.List;
 
 import static org.bsl.sales.support.DownloadFileNames.managerExcel;
+import static org.bsl.sales.support.DownloadFileNames.managerTemplateExcel;
 
 @RestController
 @RequestMapping("/api/master-data/ship-tos")
@@ -72,6 +73,14 @@ public class ShipToController {
     ) {
         MasterDataImportResult result = service.upload(file, mode, buyerKey);
         return result.isApplied() ? ResponseEntity.ok(result) : ResponseEntity.badRequest().body(result);
+    }
+
+    @GetMapping("/template")
+    public ResponseEntity<byte[]> template(@RequestParam(defaultValue = "LLBEAN") String buyerKey) {
+        return ResponseEntity.ok()
+                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + managerTemplateExcel(buyerKey, "SHIPTO") + "\"")
+                .contentType(MediaType.parseMediaType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"))
+                .body(service.template(buyerKey));
     }
 
     @GetMapping("/export-edit")
