@@ -373,6 +373,14 @@ public class CurrencyMasterService {
         String code = codeKey(currency.getCurrencyCode());
 
         for (MatInfo item : matInfoRepository.findAll()) {
+            // MAT_INFO uses soft delete. An inactive row is no longer an
+            // active business reference and must not keep Currency locked.
+            // MatInfo#isActive() intentionally treats legacy null values as
+            // active, so old live records are still protected.
+            if (item == null || !item.isActive()) {
+                continue;
+            }
+
             if (id != null && id.equals(item.getCurrencyMasterId())) {
                 return "MAT_INFO";
             }
