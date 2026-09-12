@@ -17,9 +17,9 @@ public class OpenApiConfig {
     public OpenAPI customOpenAPI() {
         return new OpenAPI()
                 .info(new Info()
-                        .title("BSL Portal API")
+                        .title("BOM & MPR Software")
                         .version("1.0")
-                        .description("BSL Portal API with JWT Bearer Authentication"))
+                        .description("BOM & MPR Software API with JWT Bearer Authentication"))
                 .addSecurityItem(new SecurityRequirement()
                         .addList(SECURITY_SCHEME_NAME))
                 .components(new Components()
